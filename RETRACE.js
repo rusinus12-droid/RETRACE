@@ -4,6 +4,7 @@
 //@version 1.9.0
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
+//@update-url https://raw.githubusercontent.com/rusinus12-droid/RETRACE/refs/heads/main/RETRACE.js
 //@description LIBRA, HAYAKU, and Flashback continuity analysis and next-session handoff bridge
 //@author Hayaku
 

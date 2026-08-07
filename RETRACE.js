@@ -1,7 +1,7 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.0
+//@version 1.9.1
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/RETRACE/refs/heads/main/RETRACE.js
@@ -12,7 +12,7 @@
   'use strict';
 
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.0';
+  const PLUGIN_VERSION = '1.9.1';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v1';
   const LIBRA_SESSION_HANDOFF_SCHEMA = 'libra-session-handoff-v2';
   const LIBRA_CONTAINER_SCHEMA = 'libra.lore.category_container.v2';
@@ -65,7 +65,10 @@
   const HAYAKU_BACKUP_CATALOG_PREFIX = 'memory_session_bridge:hayaku_ledger_backup_catalog:';
   const HAYAKU_BACKUP_CATALOG_SCHEMA = 'memory-session-bridge-hayaku-ledger-backup-catalog-v1';
   const COLD_START_CHUNK_CHARS = 9000;
-  const HAYAKU_PACKET_MAX_CHARS = 24000;
+  // Keep the legacy 24,000-character contract as the fallback for older HAYAKU
+  // builds. Patched/current HAYAKU advertises its actual capacity at runtime.
+  const HAYAKU_PACKET_FALLBACK_MAX_CHARS = 24000;
+  const HAYAKU_PACKET_MAX_CHARS = HAYAKU_PACKET_FALLBACK_MAX_CHARS; // compatibility alias
   const HAYAKU_ANALYSIS_MAX_OUTPUT_TOKENS = 8192;
   const HAYAKU_ANALYSIS_RECOVERY_POLICY = 'libra_pair_boundary_repair_v1';
   const HAYAKU_PACKET_AUTHORING_PROFILE_SCHEMA = 'hayaku-packet-authoring-profile-v1';
@@ -123,6 +126,49 @@
   const clone = (value, fallback = null) => {
     try { return JSON.parse(JSON.stringify(value)); } catch (_) { return fallback; }
   };
+  const normalizedHayakuPacketMaxChars = value => {
+    const number = Math.floor(Number(value));
+    return Number.isFinite(number) && number >= HAYAKU_PACKET_FALLBACK_MAX_CHARS
+      ? number
+      : 0;
+  };
+  const hayakuPacketMaxCharsFrom = value => {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return 0;
+    const candidates = [
+      value.maxPacketChars,
+      value.storageLimits?.maxPacketChars,
+      value.storage?.maxPacketChars,
+      value.runtime?.storageLimits?.maxPacketChars,
+      value.runtime?.storage?.maxPacketChars,
+      value.ledger?.storageLimits?.maxPacketChars,
+      value.ledger?.storage?.maxPacketChars,
+      value.hayaku?.storageLimits?.maxPacketChars,
+      value.hayaku?.storage?.maxPacketChars
+    ];
+    for (const candidate of candidates) {
+      const normalized = normalizedHayakuPacketMaxChars(candidate);
+      if (normalized) return normalized;
+    }
+    return 0;
+  };
+  const effectiveHayakuPacketMaxChars = (...sources) => {
+    for (const source of sources) {
+      const advertised = hayakuPacketMaxCharsFrom(source);
+      if (advertised) return advertised;
+    }
+    try {
+      const runtime = globalThis?.HAYAKU
+        || globalThis?.__pluginApis__?.HAYAKU
+        || globalThis?.__pluginApis__?.hayaku;
+      const direct = hayakuPacketMaxCharsFrom(runtime);
+      if (direct) return direct;
+      const snapshot = typeof runtime?.runtime === 'function' ? runtime.runtime() : null;
+      const advertised = hayakuPacketMaxCharsFrom(snapshot);
+      if (advertised) return advertised;
+    } catch (_) {}
+    return HAYAKU_PACKET_FALLBACK_MAX_CHARS;
+  };
+
   const delay = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
   const parseJson = (value, fallback = null) => {
     if (value && typeof value === 'object') return value;
@@ -2212,6 +2258,7 @@
       scope,
       ledger,
       readSource,
+      storageLimits: clone(ledger?.storageLimits || ledger?.storage || {}, {}),
       packetAuthoring: normalizeHayakuPacketAuthoringProfile(
         packetAuthoring || ledger?.packetAuthoring,
         readSource
@@ -2232,7 +2279,15 @@
         const ipcLedger = {
           ...clone(inspectedLedger, {}),
           version: text(inspectedLedger.version || inspected?.version || '').trim(),
-          scopeKey: text(inspectedLedger.scopeKey || inspected?.scopeKey || '').trim()
+          scopeKey: text(inspectedLedger.scopeKey || inspected?.scopeKey || '').trim(),
+          storageLimits: clone(
+            inspected?.storageLimits
+            || inspectedLedger?.storageLimits
+            || inspected?.runtime?.storageLimits
+            || inspected?.runtime?.storage
+            || {},
+            {}
+          )
         };
         const result = hayakuSourceResult(
           ipcLedger,
@@ -2274,7 +2329,15 @@
               || runtimeSnapshot?.packetAuthoring
               || (typeof runtime?.packet?.authoringProfile === 'function'
                 ? runtime.packet.authoringProfile()
-                : null)
+                : null),
+            storageLimits: clone(
+              inspected?.storageLimits
+              || inspectedLedger?.storageLimits
+              || runtimeSnapshot?.storageLimits
+              || runtimeSnapshot?.storage
+              || {},
+              {}
+            )
           };
           const result = hayakuSourceResult(
             runtimeLedger,
@@ -3906,8 +3969,9 @@
       if (!packet[key] || typeof packet[key] !== 'object' || Array.isArray(packet[key])) throw new Error(`콜드스타트 패킷 ${key} 형식이 올바르지 않습니다.`);
     }
     const serialized = JSON.stringify(packet);
-    if (serialized.length > HAYAKU_PACKET_MAX_CHARS) {
-      throw new Error(`콜드스타트 패킷이 HAYAKU 수용 한도(${HAYAKU_PACKET_MAX_CHARS.toLocaleString()}자)를 초과했습니다.`);
+    const maxPacketChars = effectiveHayakuPacketMaxChars(context);
+    if (serialized.length > maxPacketChars) {
+      throw new Error(`콜드스타트 패킷이 HAYAKU 수용 한도(${maxPacketChars.toLocaleString()}자)를 초과했습니다.`);
     }
     return serialized;
   };
@@ -4060,8 +4124,9 @@
       }
     }
     const serialized = JSON.stringify(packet);
-    if (serialized.length > HAYAKU_PACKET_MAX_CHARS) {
-      throw new Error(`증분 재분석 패킷이 HAYAKU 수용 한도(${HAYAKU_PACKET_MAX_CHARS.toLocaleString()}자)를 초과했습니다.`);
+    const maxPacketChars = effectiveHayakuPacketMaxChars(context);
+    if (serialized.length > maxPacketChars) {
+      throw new Error(`증분 재분석 패킷이 HAYAKU 수용 한도(${maxPacketChars.toLocaleString()}자)를 초과했습니다.`);
     }
     return serialized;
   };
@@ -4340,6 +4405,7 @@
     const identity = contextIdentity(context);
     const scope = hayakuScopeFor(context);
     if (!scope.available) throw new Error('HAYAKU 스코프를 계산하지 못했습니다.');
+    const maxPacketChars = effectiveHayakuPacketMaxChars(inspection.hayaku);
     const configHash = coldStartConfigHash(settings, promptSet);
     const runStorageKey = `${COLD_START_RUN_PREFIX}${scope.scopeKey}`;
     const previousRun = inspection.stagedRun.available ? inspection.stagedRun.run : null;
@@ -4377,7 +4443,9 @@
         error: ''
       }))
     };
+    run.maxPacketChars = maxPacketChars;
     const reportProgress = event => reportAnalysisRun(onProgress, 'cold_start', run, {
+      maxPacketChars,
       reusedChunkCount: run.chunks.filter(chunk => chunk?.status === 'verified').length,
       ...event
     });
@@ -4424,7 +4492,8 @@
           context: {
             sourceHash: evidence.sourceHash,
             ordinal: index + 1,
-            authoringProfile: promptSet.profile
+            authoringProfile: promptSet.profile,
+            maxPacketChars
           },
           profile,
           primaryPrompt: promptSet.primary,
@@ -4725,6 +4794,7 @@
     const identity = contextIdentity(context);
     const scope = hayakuScopeFor(context);
     if (!scope.available) throw new Error('HAYAKU 스코프를 계산하지 못했습니다.');
+    const maxPacketChars = effectiveHayakuPacketMaxChars(inspection.hayaku);
     const configHash = incrementalRecoveryConfigHash(settings, promptSet);
     const runStorageKey = `${INCREMENTAL_RECOVERY_RUN_PREFIX}${scope.scopeKey}`;
     const previousRun = inspection.stagedRun.available ? inspection.stagedRun.run : null;
@@ -4768,7 +4838,9 @@
         error: ''
       }))
     };
+    run.maxPacketChars = maxPacketChars;
     const reportProgress = event => reportAnalysisRun(onProgress, 'incremental_recovery', run, {
+      maxPacketChars,
       reusedChunkCount: run.chunks.filter(chunk => chunk?.status === 'verified').length,
       ...event
     });
@@ -4814,7 +4886,8 @@
           context: {
             sourceHash: evidence.sourceHash,
             ordinal: index + 1,
-            authoringProfile: promptSet.profile
+            authoringProfile: promptSet.profile,
+            maxPacketChars
           },
           profile,
           primaryPrompt: promptSet.primary,
@@ -7041,7 +7114,9 @@
       coldStartChunkHash, coldStartConfigHash, incrementalRecoveryConfigHash,
       analysisProgressSnapshot, analysisIsRunning, startBackgroundAnalysisTask,
       hayakuAdoptionDiagnosticText,
-      HAYAKU_PACKET_MAX_CHARS, HAYAKU_ANALYSIS_MAX_OUTPUT_TOKENS,
+      HAYAKU_PACKET_MAX_CHARS, HAYAKU_PACKET_FALLBACK_MAX_CHARS,
+      effectiveHayakuPacketMaxChars, hayakuPacketMaxCharsFrom,
+      HAYAKU_ANALYSIS_MAX_OUTPUT_TOKENS,
       readColdStartRun, readIncrementalRecoveryRun,
       normalizeReasoningPresetKey, reasoningPresetDefinition,
       effectiveReasoningFamily, reasoningState,

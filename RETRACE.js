@@ -1,7 +1,8 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.1
+//@version 1.9.4
+//@allowed-ipc libra
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/RETRACE/refs/heads/main/RETRACE.js
@@ -12,33 +13,15 @@
   'use strict';
 
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.1';
+  const PLUGIN_VERSION = '1.9.4';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v1';
-  const LIBRA_SESSION_HANDOFF_SCHEMA = 'libra-session-handoff-v2';
-  const LIBRA_CONTAINER_SCHEMA = 'libra.lore.category_container.v2';
-  const LIBRA_NATURAL_LORE_SCHEMA = 'libra.natural_lore.v1';
-  const LIBRA_NATURAL_LORE_STATE_FIELD = 'libraNaturalLoreState';
-  const LIBRA_SCENE_CONTEXT_KEY = 'LIBRA_SCENE_CONTEXT';
-  const LIBRA_INHERITED_COMMENTS = new Set([
-    'lmai_entity', 'lmai_relation', 'lmai_narrative', 'lmai_char_states',
-    'lmai_world_rules', 'lmai_world_history', 'lmai_world_states', 'lmai_memory',
-    'lmai_story_author', 'lmai_world_graph', 'lmai_entity_knowledge_vault',
-    'lmai_time_engine', 'lmai_secret_knowledge', 'lmai_natural_lore_baseline',
-    'lmai_integrated_natural_ledger', 'lmai_world_additional', 'lmai_user_dlc'
-  ]);
-  const LIBRA_SCOPED_STATE_COMMENTS = new Set([
-    'lmai_entity_knowledge_vault', 'lmai_time_engine',
-    'lmai_secret_knowledge', 'lmai_integrated_natural_ledger'
-  ]);
-  const LIBRA_REQUIRED_JSON_COMMENTS = new Set([
-    ...LIBRA_SCOPED_STATE_COMMENTS,
-    'lmai_natural_lore_baseline', 'lmai_world_additional', 'lmai_user_dlc'
-  ]);
-  const LIBRA_RETIRED_EXTERNAL_COMMENTS = new Set([
-    'lmai_character_lore_cues', 'lmai_source_reflection_state',
-    'lmai_hypa_v3_source', 'lmai_user_identity', 'lmai_user',
-    'lmai_director', 'lmai_director_audit_v1', 'lmai_consistency_repair_queue_v1'
-  ]);
+  const LIBRA_PLUGIN_ID = 'libra';
+  const LIBRA_IPC_SCHEMA = 'libra-retrace-ipc-v1';
+  const LIBRA_IPC_REQUEST_CHANNEL = 'libra_memory_bridge_request_v1';
+  const LIBRA_IPC_RESPONSE_CHANNEL = 'libra_memory_bridge_response_v1';
+  const LIBRA_INSPECT_SCHEMA = 'libra.retrace.inspect.v1';
+  const LIBRA_HANDOFF_RECEIPT_SCHEMA = 'libra.session_handoff.receipt.v1';
+  const LIBRA_CHAT_HANDOFF_MARKER_SCHEMA = 'retrace.libra_handoff_marker.v1';
   const FLASHBACK_PLUGIN_ID = 'flashback_memory';
   const FLASHBACK_IPC_SCHEMA = 'flashback-memory-bridge-ipc-v1';
   const FLASHBACK_IPC_REQUEST_CHANNEL = 'flashback_memory_bridge_request_v1';
@@ -80,6 +63,7 @@
   ]);
   const FLASHBACK_VIEWER_MAX_RENDERED_RECORDS = 240;
   const HAYAKU_VIEWER_MAX_RENDERED_RECORDS = 240;
+  const LIBRA_VIEWER_MAX_RENDERED_RECORDS = 240;
 
   const Runtime = {
     visible: false,
@@ -105,6 +89,9 @@
     hayakuIpcRegistered: false,
     hayakuIpcPending: new Map(),
     hayakuIpcUnavailableUntil: 0,
+    libraIpcRegistered: false,
+    libraIpcPending: new Map(),
+    libraIpcUnavailableUntil: 0,
     warnings: []
   };
 
@@ -1745,6 +1732,85 @@
     });
   };
 
+  const registerLibraIpc = async () => {
+    if (Runtime.libraIpcRegistered) return true;
+    const api = liveApi(['addPluginChannelListener', 'postPluginChannelMessage']);
+    if (typeof api?.addPluginChannelListener !== 'function'
+      || typeof api?.postPluginChannelMessage !== 'function') return false;
+    await api.addPluginChannelListener(
+      LIBRA_IPC_RESPONSE_CHANNEL,
+      (message, metadata = {}) => {
+        const response = message && typeof message === 'object' && !Array.isArray(message) ? message : {};
+        if (response.schema !== LIBRA_IPC_SCHEMA || response.kind !== 'response') return;
+        const sender = text(metadata?.sender || '').trim();
+        if (sender && sender !== LIBRA_PLUGIN_ID) return;
+        const requestId = text(response.requestId || '').trim();
+        const pending = Runtime.libraIpcPending.get(requestId);
+        if (!pending) return;
+        Runtime.libraIpcPending.delete(requestId);
+        Runtime.libraIpcUnavailableUntil = 0;
+        clearTimeout(pending.timer);
+        if (response.ok === true) pending.resolve(response.result);
+        else {
+          const error = new Error(text(response.error || 'LIBRA IPC request failed.'));
+          error.code = 'LIBRA_IPC_REJECTED';
+          pending.reject(error);
+        }
+      }
+    );
+    Runtime.libraIpcRegistered = true;
+    return true;
+  };
+
+  const requestLibraIpc = async (action, payload = {}, options = {}) => {
+    if (Date.now() < Number(Runtime.libraIpcUnavailableUntil || 0)) {
+      const error = new Error('LIBRA IPC is temporarily unavailable after a recent timeout.');
+      error.code = 'LIBRA_IPC_UNAVAILABLE';
+      throw error;
+    }
+    const registered = await registerLibraIpc().catch(error => {
+      warn('LIBRA IPC listener registration failed', error);
+      return false;
+    });
+    const api = liveApi(['postPluginChannelMessage']);
+    if (!registered || typeof api?.postPluginChannelMessage !== 'function') {
+      const error = new Error('LIBRA IPC API is unavailable. LIBRA v1.0.4 or later is required.');
+      error.code = 'LIBRA_IPC_UNAVAILABLE';
+      throw error;
+    }
+    const requestId = uuid();
+    const timeoutMs = Math.max(400, Math.min(20000, Number(options.timeoutMs || 4000) || 4000));
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        Runtime.libraIpcPending.delete(requestId);
+        Runtime.libraIpcUnavailableUntil = Date.now() + 10000;
+        const error = new Error(`LIBRA IPC timed out after ${timeoutMs}ms.`);
+        error.code = 'LIBRA_IPC_TIMEOUT';
+        reject(error);
+      }, timeoutMs);
+      Runtime.libraIpcPending.set(requestId, { resolve, reject, timer, action, at: Date.now() });
+      Promise.resolve(api.postPluginChannelMessage(
+        LIBRA_PLUGIN_ID,
+        LIBRA_IPC_REQUEST_CHANNEL,
+        { schema: LIBRA_IPC_SCHEMA, kind: 'request', requestId, action: text(action || '').trim(), payload: clone(payload, {}) }
+      )).catch(error => {
+        const pending = Runtime.libraIpcPending.get(requestId);
+        if (!pending) return;
+        Runtime.libraIpcPending.delete(requestId);
+        clearTimeout(pending.timer);
+        reject(error);
+      });
+    });
+  };
+
+  const activeLibraRuntime = () => {
+    try {
+      const candidate = globalThis.__LIBRA__ || globalThis.__pluginApis__?.libra || globalThis.__pluginApis__?.LIBRA;
+      if (candidate && typeof candidate === 'object') return candidate;
+    } catch (_) {}
+    return null;
+  };
+
   const activeFlashbackRuntime = () => {
     const candidates = [];
     try {
@@ -2197,6 +2263,27 @@
       packetType
     ].join('\u0001');
   };
+  const hayakuTombstoneSuppressesRecord = (record, tombstone) => {
+    if (!record || !tombstone || tombstone?.active === false || Number(tombstone?.restoredAt || 0) > 0) return false;
+    if (text(tombstone?.slotId || '').trim() !== hayakuRecordSlotId(record)) return false;
+    const tombstoneRecordId = text(tombstone?.recordId || '').trim();
+    const tombstoneVariantHash = text(tombstone?.variantHash || '').trim();
+    const recordId = text(record?.recordId || '').trim();
+    const recordHash = text(record?.hash || '').trim();
+    if (!tombstoneRecordId && !tombstoneVariantHash) return true;
+    if (tombstoneRecordId && tombstoneRecordId === recordId) return true;
+    if (tombstoneVariantHash && tombstoneVariantHash === recordHash) return true;
+    return false;
+  };
+  const activeHayakuLedgerTombstones = ledger => (
+    Array.isArray(ledger?.tombstones) ? ledger.tombstones : []
+  ).filter(tombstone => (
+    tombstone
+    && typeof tombstone === 'object'
+    && tombstone.active !== false
+    && !(Number(tombstone.restoredAt || 0) > 0)
+    && text(tombstone.slotId || '').trim()
+  ));
   const effectiveHayakuRecords = ledger => {
     const records = Array.isArray(ledger?.records)
       ? ledger.records.filter(record => record && typeof record === 'object' && text(record.raw || '').trim())
@@ -2207,11 +2294,7 @@
       .map(value => [text(value.slotId).trim(), value]));
     const suppressed = record => {
       const tombstone = tombstones.get(hayakuRecordSlotId(record));
-      if (!tombstone) return false;
-      const tombstoneRecordId = text(tombstone.recordId || '').trim();
-      if (tombstoneRecordId) return tombstoneRecordId === text(record?.recordId || '').trim();
-      const variantHash = text(tombstone.variantHash || '').trim();
-      return !variantHash || variantHash === text(record?.hash || '').trim();
+      return hayakuTombstoneSuppressesRecord(record, tombstone);
     };
     if (!heads.length) {
       return records.filter(record => (
@@ -4303,6 +4386,136 @@
     promptSet?.repair || HAYAKU_INCREMENTAL_RECOVERY_REPAIR_PROMPT
   ].join('\u0001'));
 
+
+  // Incremental recovery checkpoints are salvaged per evidence chunk instead of
+  // invalidating the whole run when transport metadata, provider settings, or
+  // unrelated chunks change. A verified checkpoint is reusable only when its
+  // evidence hash and serialized recovery packet are still structurally valid.
+  const incrementalRecoveryCheckpointBodyReusable = (entry, chunk, maxPacketChars = HAYAKU_PACKET_FALLBACK_MAX_CHARS) => {
+    if (!entry || text(entry.status).trim() !== 'verified') return false;
+    const expectedChunkHash = coldStartChunkHash(chunk);
+    if (!expectedChunkHash || text(entry.chunkHash).trim() !== expectedChunkHash) return false;
+    const body = text(entry.body || '').trim();
+    if (!body) return false;
+    const limit = Math.max(
+      HAYAKU_PACKET_FALLBACK_MAX_CHARS,
+      Math.floor(Number(maxPacketChars || 0) || HAYAKU_PACKET_FALLBACK_MAX_CHARS)
+    );
+    if (body.length > limit) return false;
+    const declaredPacketHash = text(entry.packetHash || '').trim();
+    if (declaredPacketHash && declaredPacketHash !== stableHash64(body)) return false;
+    const packet = parseJson(body, null);
+    if (!packet || typeof packet !== 'object' || Array.isArray(packet)) return false;
+    const meta = objectValue(packet.meta);
+    if (text(meta.schema).trim() !== 'hayaku_packet_v1') return false;
+    if (text(meta.packet_type || meta.packetType).trim().toLowerCase() !== 'recovery_snapshot') return false;
+    if (Number(meta.packet_schema_rev ?? meta.packetSchemaRev) !== 2) return false;
+    const range = objectValue(meta.source_turn_range || meta.sourceTurnRange);
+    const expectedStart = Math.max(1, Number(chunk?.startTurn || 0) || 1);
+    const expectedEnd = Math.max(expectedStart, Number(chunk?.endTurn || expectedStart) || expectedStart);
+    const actualStart = Math.max(0, Number(range.start || range.start_turn || 0) || 0);
+    const actualEnd = Math.max(0, Number(range.end || range.end_turn || 0) || 0);
+    if (actualStart !== expectedStart || actualEnd !== expectedEnd) return false;
+    for (const key of ['meta', 'entity', 'world', 'narrative', 'planner', 'importance']) {
+      if (!packet[key] || typeof packet[key] !== 'object' || Array.isArray(packet[key])) return false;
+    }
+    return true;
+  };
+
+  const incrementalRecoveryCheckpointPlan = (previousRun, evidence, maxPacketChars = HAYAKU_PACKET_FALLBACK_MAX_CHARS) => {
+    const currentChunks = Array.isArray(evidence?.chunks) ? evidence.chunks : [];
+    const previousChunks = Array.isArray(previousRun?.chunks) ? previousRun.chunks : [];
+    const buckets = new Map();
+    previousChunks.forEach((entry, index) => {
+      const chunkHash = text(entry?.chunkHash || '').trim();
+      if (!chunkHash) return;
+      const bucket = buckets.get(chunkHash) || [];
+      bucket.push({ entry, index });
+      buckets.set(chunkHash, bucket);
+    });
+    const usedPrevious = new Set();
+    let reusedVerifiedCount = 0;
+    let retryCheckpointCount = 0;
+    let newOrChangedCount = 0;
+    const chunks = currentChunks.map((chunk, index) => {
+      const chunkHash = coldStartChunkHash(chunk);
+      const candidates = (buckets.get(chunkHash) || []).filter(candidate => !usedPrevious.has(candidate.index));
+      const reusableCandidate = candidates.find(candidate => (
+        incrementalRecoveryCheckpointBodyReusable(candidate.entry, chunk, maxPacketChars)
+      )) || null;
+      const matchedCandidate = reusableCandidate || candidates[0] || null;
+      if (matchedCandidate) usedPrevious.add(matchedCandidate.index);
+      const common = {
+        ordinal: index + 1,
+        startTurn: chunk.startTurn,
+        endTurn: chunk.endTurn,
+        targetPairIndex: chunk.endTurn,
+        chunkHash
+      };
+      if (reusableCandidate) {
+        reusedVerifiedCount += 1;
+        return {
+          ...clone(reusableCandidate.entry, {}),
+          ...common,
+          status: 'verified',
+          body: text(reusableCandidate.entry.body || '').trim(),
+          packetHash: text(reusableCandidate.entry.packetHash || '').trim() || stableHash64(text(reusableCandidate.entry.body || '').trim()),
+          error: '',
+          checkpointReused: true,
+          reusedFromOrdinal: Math.max(1, Number(reusableCandidate.entry.ordinal || reusableCandidate.index + 1) || 1)
+        };
+      }
+      if (matchedCandidate) {
+        retryCheckpointCount += 1;
+        return {
+          ...common,
+          status: 'pending',
+          attempts: Math.max(0, Number(matchedCandidate.entry?.attempts || 0) || 0),
+          lastAttemptAt: Math.max(0, Number(matchedCandidate.entry?.lastAttemptAt || 0) || 0),
+          recoveryMode: '',
+          fallbackReason: '',
+          body: '',
+          packetHash: '',
+          error: compact(matchedCandidate.entry?.error || '', 320),
+          checkpointReused: false,
+          retryingCheckpoint: true,
+          reusedFromOrdinal: Math.max(1, Number(matchedCandidate.entry?.ordinal || matchedCandidate.index + 1) || 1)
+        };
+      }
+      newOrChangedCount += 1;
+      return {
+        ...common,
+        status: 'pending',
+        attempts: 0,
+        lastAttemptAt: 0,
+        recoveryMode: '',
+        fallbackReason: '',
+        body: '',
+        packetHash: '',
+        error: '',
+        checkpointReused: false,
+        retryingCheckpoint: false,
+        reusedFromOrdinal: 0
+      };
+    });
+    const previousVerifiedCount = previousChunks.filter(entry => text(entry?.status).trim() === 'verified').length;
+    const matchedCheckpointCount = usedPrevious.size;
+    return {
+      available: Boolean(previousRun && previousChunks.length),
+      sourceHashMatch: Boolean(previousRun && text(previousRun?.sourceHash || '') === text(evidence?.sourceHash || '')),
+      totalChunkCount: currentChunks.length,
+      previousChunkCount: previousChunks.length,
+      previousVerifiedCount,
+      matchedCheckpointCount,
+      reusedVerifiedCount,
+      retryCheckpointCount,
+      newOrChangedCount,
+      discardedVerifiedCount: Math.max(0, previousVerifiedCount - reusedVerifiedCount),
+      pendingChunkCount: Math.max(0, currentChunks.length - reusedVerifiedCount),
+      chunks
+    };
+  };
+
   const inspectColdStart = async () => {
     const context = await getCurrentContext();
     const evidence = collectColdStartEvidence(context.chat);
@@ -4705,9 +4918,20 @@
       && !pendingMatchesEvidence;
     const capsuleNeedsAdoption = !targeted && pendingMatchesEvidence
       && !pendingAlreadyAdopted;
-    const resumableRun = !targeted && stagedRun.available
-      && stagedRun.run?.sourceHash === evidence.sourceHash
-      && stagedRun.run?.chunks?.some(chunk => ['pending', 'running', 'failed'].includes(chunk?.status));
+    const maxPacketChars = effectiveHayakuPacketMaxChars(hayaku);
+    const checkpointPlan = !targeted && stagedRun.available
+      ? incrementalRecoveryCheckpointPlan(stagedRun.run, evidence, maxPacketChars)
+      : incrementalRecoveryCheckpointPlan(null, evidence, maxPacketChars);
+    const stagedHasUnfinishedWork = stagedRun.available
+      && stagedRun.run?.chunks?.some(chunk => ['pending', 'running', 'failed'].includes(text(chunk?.status).trim()));
+    const stagedNeedsFinalization = stagedRun.available
+      && ['building', 'partial', 'failed', 'verified'].includes(text(stagedRun.run?.state || '').trim())
+      && checkpointPlan.totalChunkCount > 0
+      && checkpointPlan.reusedVerifiedCount === checkpointPlan.totalChunkCount;
+    const resumableRun = !targeted
+      && (stagedHasUnfinishedWork || stagedNeedsFinalization)
+      && checkpointPlan.matchedCheckpointCount > 0
+      && (checkpointPlan.pendingChunkCount > 0 || stagedNeedsFinalization);
     const eligible = hasHayakuHistory
       && evidence.recoveryTurns.length > 0
       && evidence.chunks.length > 0;
@@ -4718,6 +4942,7 @@
       pendingCapsule,
       pendingAdoptionVerification,
       evidence,
+      checkpointPlan,
       hasHayakuHistory,
       eligible: eligible || capsuleNeedsAdoption || resumableRun,
       canReadopt: capsuleNeedsAdoption,
@@ -4798,16 +5023,48 @@
     const configHash = incrementalRecoveryConfigHash(settings, promptSet);
     const runStorageKey = `${INCREMENTAL_RECOVERY_RUN_PREFIX}${scope.scopeKey}`;
     const previousRun = inspection.stagedRun.available ? inspection.stagedRun.run : null;
-    const reusable = requestedMode === 'resume'
-      && previousRun?.sourceHash === evidence.sourceHash
-      && previousRun?.configHash === configHash
-      && previousRun?.chunks?.length === evidence.chunks.length
-      && previousRun.chunks.every((entry, index) => entry.chunkHash === coldStartChunkHash(evidence.chunks[index]));
-    const createdAt = reusable ? Number(previousRun.createdAt || Date.now()) : Date.now();
-    const runId = reusable
+    const resumePlan = requestedMode === 'resume' && previousRun
+      ? incrementalRecoveryCheckpointPlan(previousRun, evidence, maxPacketChars)
+      : incrementalRecoveryCheckpointPlan(null, evidence, maxPacketChars);
+    const resumeFromPrevious = requestedMode === 'resume'
+      && Boolean(previousRun)
+      && resumePlan.matchedCheckpointCount > 0;
+    if (requestedMode === 'resume' && !resumeFromPrevious) {
+      throw new Error('기존 증분 재분석 체크포인트와 현재 누락 턴 증거가 일치하지 않습니다. 자동으로 전체 재분석하지 않았습니다. 누락 다시 확인 후 새 증분 분석을 명시적으로 시작하세요.');
+    }
+    const exactRunIdentity = resumeFromPrevious
+      && text(previousRun?.sourceHash || '') === text(evidence.sourceHash)
+      && text(previousRun?.configHash || '') === text(configHash);
+    const createdAt = resumeFromPrevious
+      ? Number(previousRun?.createdAt || Date.now())
+      : Date.now();
+    const runId = exactRunIdentity && text(previousRun?.runId || '').trim()
       ? text(previousRun.runId)
-      : `bridge-recovery-run-${stableHash64(`${scope.scopeKey}|${evidence.sourceHash}|${configHash}|${createdAt}`)}`;
-    const run = reusable ? clone(previousRun, {}) : {
+      : `bridge-recovery-run-${stableHash64(`${scope.scopeKey}|${evidence.sourceHash}|${configHash}|${createdAt}|${text(previousRun?.runId || '')}`)}`;
+    const effectiveReplacementRecordIds = replacementRecordIds.length
+      ? replacementRecordIds
+      : resumeFromPrevious && Array.isArray(previousRun?.replacementRecordIds)
+        ? [...new Set(previousRun.replacementRecordIds.map(value => text(value).trim()).filter(Boolean))]
+        : [];
+    const freshChunks = evidence.chunks.map((chunk, index) => ({
+      ordinal: index + 1,
+      startTurn: chunk.startTurn,
+      endTurn: chunk.endTurn,
+      targetPairIndex: chunk.endTurn,
+      chunkHash: coldStartChunkHash(chunk),
+      status: 'pending',
+      attempts: 0,
+      lastAttemptAt: 0,
+      recoveryMode: '',
+      fallbackReason: '',
+      body: '',
+      packetHash: '',
+      error: '',
+      checkpointReused: false,
+      retryingCheckpoint: false,
+      reusedFromOrdinal: 0
+    }));
+    const run = {
       schema: INCREMENTAL_RECOVERY_RUN_SCHEMA,
       runId,
       scopeKey: scope.scopeKey,
@@ -4815,28 +5072,27 @@
       sourceHash: evidence.sourceHash,
       coverageHash: evidence.coverage.coverageHash,
       missingTurns: evidence.recoveryTurns,
-      replacementRecordIds,
+      replacementRecordIds: effectiveReplacementRecordIds,
       configHash,
       packetAuthoring: clone(promptSet.profile, {}),
       packetAuthoringContractHash: promptSet.contractHash,
+      resumedFromRunId: resumeFromPrevious ? text(previousRun?.runId || '') : '',
+      checkpointSalvage: resumeFromPrevious ? {
+        sourceHashMatch: resumePlan.sourceHashMatch,
+        previousChunkCount: resumePlan.previousChunkCount,
+        previousVerifiedCount: resumePlan.previousVerifiedCount,
+        matchedCheckpointCount: resumePlan.matchedCheckpointCount,
+        reusedVerifiedCount: resumePlan.reusedVerifiedCount,
+        retryCheckpointCount: resumePlan.retryCheckpointCount,
+        newOrChangedCount: resumePlan.newOrChangedCount,
+        discardedVerifiedCount: resumePlan.discardedVerifiedCount,
+        pendingChunkCount: resumePlan.pendingChunkCount,
+        configHashMatch: text(previousRun?.configHash || '') === text(configHash)
+      } : null,
       createdAt,
-      updatedAt: createdAt,
+      updatedAt: Date.now(),
       state: 'building',
-      chunks: evidence.chunks.map((chunk, index) => ({
-        ordinal: index + 1,
-        startTurn: chunk.startTurn,
-        endTurn: chunk.endTurn,
-        targetPairIndex: chunk.endTurn,
-        chunkHash: coldStartChunkHash(chunk),
-        status: 'pending',
-        attempts: 0,
-        lastAttemptAt: 0,
-        recoveryMode: '',
-        fallbackReason: '',
-        body: '',
-        packetHash: '',
-        error: ''
-      }))
+      chunks: resumeFromPrevious ? resumePlan.chunks : freshChunks
     };
     run.maxPacketChars = maxPacketChars;
     const reportProgress = event => reportAnalysisRun(onProgress, 'incremental_recovery', run, {
@@ -4849,12 +5105,14 @@
     if (!await storageSet(runStorageKey, JSON.stringify(run))) {
       throw new Error('증분 재분석 실행 상태를 저장하지 못했습니다.');
     }
+    const readyReusedChunks = run.chunks.filter(chunk => chunk?.status === 'verified').length;
+    const readyPendingChunks = Math.max(0, run.chunks.length - readyReusedChunks);
     reportProgress({
       type: 'run_ready',
       state: 'running',
       phase: '청크 분석 준비',
       runId,
-      message: `누락 턴 분석 청크 ${run.chunks.length}개 · 동시 처리 최대 3개 · 재사용 ${run.chunks.filter(chunk => chunk?.status === 'verified').length}개`
+      message: `누락 턴 분석 전체 ${run.chunks.length}개 · 재사용 ${readyReusedChunks}개 · 실제 처리 ${readyPendingChunks}개 · 동시 처리 최대 3개`
     });
     let checkpointQueue = Promise.resolve(true);
     const checkpoint = () => {
@@ -4974,7 +5232,7 @@
       completedTurnCount: evidence.completedTurns,
       coveredTurns: evidence.coverage.coveredTurns,
       missingTurns: evidence.recoveryTurns,
-      replacementRecordIds,
+      replacementRecordIds: effectiveReplacementRecordIds,
       profile,
       packetCount: run.chunks.length,
       packets: run.chunks.map(state => ({
@@ -5024,19 +5282,21 @@
       capsuleVerified: true,
       reflected: adoptionVerified,
       pendingAdoption: !adoptionVerified,
-      mode: reusable ? 'resume' : 'incremental',
+      mode: resumeFromPrevious ? 'resume' : 'incremental',
       recoveryId,
       runId,
       scopeKey: scope.scopeKey,
       packetCount: run.chunks.length,
       chunkCount: evidence.chunks.length,
       reusedChunkCount: run.chunks.length - work.length,
+      retriedChunkCount: work.length,
+      checkpointSalvage: clone(run.checkpointSalvage, null),
       repairChunkCount: run.chunks.filter(chunk => chunk.recoveryMode === 'repair').length,
       sourceFallbackChunkCount: run.chunks.filter(chunk => chunk.recoveryMode === 'source_fallback').length,
       completedTurnCount: evidence.completedTurns,
       coveredTurns: evidence.coverage.coveredTurns,
       recoveredTurns: evidence.recoveryTurns,
-      replacementRecordIds,
+      replacementRecordIds: effectiveReplacementRecordIds,
       appendedMessageCount: sourceCompatibility.appendedMessageCount,
       packetAuthoring: clone(promptSet.profile, {}),
       packetAuthoringContractHash: promptSet.contractHash,
@@ -5088,6 +5348,49 @@
     )) || null;
   };
 
+  const verifyHayakuRecordDeletion = async (context, record, deletionResult = null) => {
+    const slotId = text(deletionResult?.slotId || hayakuRecordSlotId(record)).trim();
+    const recordId = text(deletionResult?.recordId || record?.recordId || '').trim();
+    const variantHash = text(deletionResult?.variantHash || record?.hash || '').trim();
+    let last = null;
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const refreshed = await readHayakuSource(context);
+      const tombstones = activeHayakuLedgerTombstones(refreshed?.ledger);
+      const tombstone = tombstones.find(value => {
+        if (text(value?.slotId || '').trim() !== slotId) return false;
+        const valueRecordId = text(value?.recordId || '').trim();
+        const valueHash = text(value?.variantHash || '').trim();
+        return Boolean(
+          (!valueRecordId && !valueHash)
+          || (recordId && valueRecordId === recordId)
+          || (variantHash && valueHash === variantHash)
+        );
+      }) || null;
+      const stillEffective = (Array.isArray(refreshed?.records) ? refreshed.records : []).some(candidate => {
+        if (hayakuRecordSlotId(candidate) !== slotId) return false;
+        const candidateRecordId = text(candidate?.recordId || '').trim();
+        const candidateHash = text(candidate?.hash || '').trim();
+        return Boolean(
+          (recordId && candidateRecordId === recordId)
+          || (variantHash && candidateHash === variantHash)
+        );
+      });
+      last = {
+        verified: Boolean(tombstone) && !stillEffective,
+        available: refreshed?.available === true || Boolean(refreshed?.ledger),
+        slotId,
+        recordId,
+        variantHash,
+        tombstone: tombstone ? clone(tombstone, tombstone) : null,
+        stillEffective,
+        readSource: refreshed?.readSource || ''
+      };
+      if (last.verified) return last;
+      if (attempt < 4) await delay(70 * attempt);
+    }
+    return last || { verified: false, slotId, recordId, variantHash, stillEffective: true };
+  };
+
   const deleteHayakuRecord = async target => {
     const context = await getCurrentContext();
     const hayaku = await readHayakuSource(context);
@@ -5097,17 +5400,19 @@
       throw new Error('Permanent session history is protected from deletion.');
     }
     if (text(record.recordState).toLowerCase() === 'tombstoned') {
-      return { ok: true, forgotten: false, reason: 'already_tombstoned', recoverable: true };
+      return { ok: true, forgotten: false, reason: 'already_tombstoned', recoverable: true, verified: true };
     }
     const runtime = activeHayakuRuntime('forget');
     if (!runtime) throw new Error('HAYAKU ledger deletion API is unavailable.');
     const result = await runtime.ledger.forget({
       recordId: text(record.recordId),
       variantHash: text(record.hash),
+      slotId: hayakuRecordSlotId(record),
+      targetPairIndex: Math.max(0, Number(record?.targetPairIndex || 0) || 0),
       reason: 'bridge_packet_viewer_delete',
       intent: 'user_suppressed'
     });
-    if (result?.ok !== true) {
+    if (result?.ok !== true || result?.durable === false) {
       throw new Error(`${text(result?.reason || 'HAYAKU packet deletion failed.')}: ${JSON.stringify({
         recordId: text(record.recordId),
         variantHash: text(record.hash),
@@ -5115,7 +5420,18 @@
         slotRecordIds: Array.isArray(result?.slotRecordIds) ? result.slotRecordIds : []
       })}`);
     }
-    return clone(result, result);
+    const verification = await verifyHayakuRecordDeletion(context, record, result);
+    if (verification?.verified !== true) {
+      throw new Error(`deletion_not_durable: ${JSON.stringify({
+        slotId: verification?.slotId || result?.slotId || '',
+        recordId: verification?.recordId || text(record.recordId),
+        variantHash: verification?.variantHash || text(record.hash),
+        tombstoneFound: Boolean(verification?.tombstone),
+        stillEffective: verification?.stillEffective === true,
+        readSource: verification?.readSource || ''
+      })}`);
+    }
+    return clone({ ...result, verified: true, verification }, result);
   };
 
   const regenerateHayakuRecord = async target => {
@@ -5151,467 +5467,166 @@
     return result;
   };
 
-  const libraStableHash = value => {
-    const source = text(value);
-    let hash = 0;
-    for (let index = 0; index < source.length; index += 1) {
-      hash = ((hash << 5) - hash) + source.charCodeAt(index);
-      hash |= 0;
-    }
-    return Math.abs(hash).toString(36);
-  };
-  const libraScopeKey = (chat, character) => {
-    const chatId = text(chat?.id || '').trim();
-    const characterId = text(character?.id || character?.chaId || '').trim();
-    if (chatId) return characterId
-      ? `character:${characterId}::chat:${chatId}`
-      : `chat:${chatId}`;
-    return '';
-  };
-  const libraContainerEntry = entry => {
-    if (!entry || typeof entry !== 'object') return false;
-    if (text(entry.memo).trim() === 'LIBRA_CONTAINER') return true;
-    return text(entry.key).startsWith('LIBRA_DATA_') && typeof entry.content === 'string';
-  };
-  const unpackLibraLore = lore => {
-    const entries = [];
-    const errors = [];
-    let containers = 0;
-    const visit = (entry, path = 'root') => {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return;
-      if (libraContainerEntry(entry)) {
-        const parsed = parseJson(entry.content, null);
-        if (!parsed || !Array.isArray(parsed.entries)) {
-          errors.push({ reason: 'libra_container_invalid', path, key: text(entry.key), comment: text(entry.comment) });
-          return;
-        }
-        containers += 1;
-        parsed.entries.forEach((child, index) => visit(child, `${path}.${index}`));
-        return;
-      }
-      const hydrated = clone(entry, null);
-      if (!hydrated) return;
-      const naturalState = hydrated[LIBRA_NATURAL_LORE_STATE_FIELD];
-      if (naturalState?.schema === LIBRA_NATURAL_LORE_SCHEMA && typeof naturalState.content === 'string') {
-        hydrated.__lihaflNaturalLore = {
-          visibleContent: text(hydrated.content),
-          state: clone(naturalState, {})
-        };
-        hydrated.content = naturalState.content;
-      }
-      entries.push(hydrated);
-    };
-    (Array.isArray(lore) ? lore : []).forEach((entry, index) => visit(entry, `root.${index}`));
-    return { entries, errors, containers };
-  };
-  const libraLoreSources = (value, seen = new WeakSet()) => {
-    if (Array.isArray(value)) return unpackLibraLore(value);
-    if (!value || typeof value !== 'object' || seen.has(value)) return { entries: [], errors: [], containers: 0 };
-    seen.add(value);
-    const result = { entries: [], errors: [], containers: 0 };
-    for (const key of ['entries', 'lorebook', 'loreBook', 'lore', 'globalLore', 'localLore', 'data']) {
-      const child = value[key];
-      if (!child) continue;
-      const read = libraLoreSources(child, seen);
-      result.entries.push(...read.entries);
-      result.errors.push(...read.errors);
-      result.containers += read.containers;
-    }
-    return result;
-  };
-  const dedupeLibraLore = entries => {
-    const out = [];
-    const seen = new Set();
-    for (const entry of Array.isArray(entries) ? entries : []) {
-      if (!entry || typeof entry !== 'object') continue;
-      const comment = text(entry.comment).trim();
-      const signature = `${comment}::${text(entry.key || entry.memo).trim() || libraStableHash(entry.content)}`;
-      if (seen.has(signature)) continue;
-      seen.add(signature);
-      out.push(entry);
-    }
-    return out;
-  };
-  const effectiveLibraLore = context => {
-    const character = context?.character || {};
-    const chat = context?.chat || {};
-    const globalRead = { entries: [], errors: [], containers: 0 };
-    for (const source of [
-      character.globalLore, character.lorebook, character.loreBook, character.lore,
-      character.characterLore, character.rawCharacterLore, character.data, character.card, character.spec
-    ]) {
-      const read = libraLoreSources(source);
-      globalRead.entries.push(...read.entries);
-      globalRead.errors.push(...read.errors);
-      globalRead.containers += read.containers;
-    }
-    const localRead = { entries: [], errors: [], containers: 0 };
-    for (const source of [chat.localLore, chat.lorebook, chat.loreBook, chat.lore]) {
-      const read = libraLoreSources(source);
-      localRead.entries.push(...read.entries);
-      localRead.errors.push(...read.errors);
-      localRead.containers += read.containers;
-    }
-    const managed = entries => dedupeLibraLore(entries).filter(entry => {
-      const comment = text(entry.comment).trim();
-      return comment.startsWith('lmai_') && !LIBRA_RETIRED_EXTERNAL_COMMENTS.has(comment);
-    });
-    const globalEntries = managed(globalRead.entries);
-    const localEntries = managed(localRead.entries);
-    const localOverride = new Set(localEntries
-      .map(entry => `${text(entry.comment).trim()}::${text(entry.key).trim()}`)
-      .filter(signature => !signature.endsWith('::')));
-    return {
-      entries: dedupeLibraLore([
-        ...globalEntries.filter(entry => !localOverride.has(`${text(entry.comment).trim()}::${text(entry.key).trim()}`)),
-        ...localEntries
+  const normalizeLibraInspection = (inspection, identity = {}, readSource = 'libra_plugin_ipc') => {
+    const source = inspection && typeof inspection === 'object' && !Array.isArray(inspection) ? inspection : {};
+    const memories = Array.isArray(source.memories) ? source.memories.filter(Boolean) : [];
+    const worldAdditional = Array.isArray(source.worldAdditional) ? source.worldAdditional.filter(Boolean) : [];
+    const scope = source.scope && typeof source.scope === 'object' ? source.scope : {};
+    const chatId = text(scope.chatId || '').trim();
+    const requestedChatId = text(identity?.chatId || '').trim();
+    const scopeMatches = !requestedChatId || !chatId || requestedChatId === chatId;
+    const schemaOk = source.schema === LIBRA_INSPECT_SCHEMA;
+    const integrityOk = schemaOk && scopeMatches && source?.integrity?.ok !== false;
+    const liveCount = Math.max(0, Number(source?.counts?.liveMemories ?? memories.filter(memory => memory?.inheritedSessionHistory !== true && Number(memory?.sessionEpoch || 0) >= 0).length) || 0);
+    const inheritedCount = Math.max(0, Number(source?.counts?.inheritedMemories ?? memories.length - liveCount) || 0);
+    const partialCount = Math.max(0, Number(source?.counts?.partialMemories ?? memories.filter(memory => memory?.pipeline?.status === 'partial').length) || 0);
+    const snapshotHash = stableHash64(JSON.stringify({
+      scopeKey: text(scope.scopeKey || ''),
+      memories: memories.map(memory => [
+        text(memory.memoryId || ''), Number(memory.revision || 0), text(memory.sourceDigest || ''),
+        Number(memory.sessionEpoch || 0), text(memory.status || ''), stableHash64(text(memory.text || memory.summary || ''))
       ]),
-      errors: [...globalRead.errors, ...localRead.errors],
-      containers: globalRead.containers + localRead.containers
-    };
-  };
-  const splitLibraMemoryMeta = content => {
-    const raw = text(content);
-    const marker = raw.indexOf('[META:');
-    const start = marker >= 0 ? raw.indexOf('{', marker + 6) : -1;
-    if (start < 0) return { meta: null, body: raw.trim(), hadMeta: false };
-    let depth = 0;
-    let quoted = false;
-    let escaped = false;
-    let end = -1;
-    for (let index = start; index < raw.length; index += 1) {
-      const token = raw[index];
-      if (quoted) {
-        if (escaped) escaped = false;
-        else if (token === '\\') escaped = true;
-        else if (token === '"') quoted = false;
-        continue;
-      }
-      if (token === '"') quoted = true;
-      else if (token === '{') depth += 1;
-      else if (token === '}' && --depth === 0) { end = index; break; }
-    }
-    if (end < 0) return { meta: null, body: raw.trim(), hadMeta: false };
-    const close = raw.indexOf(']', end + 1);
-    const meta = parseJson(raw.slice(start, end + 1), null);
+      worldAdditional: worldAdditional.map(item => [text(item.itemId || ''), text(item.status || ''), stableHash64(text(item.content || ''))])
+    }));
     return {
-      meta: meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : null,
-      body: (close >= 0 ? raw.slice(close + 1) : raw.slice(end + 1)).trim(),
-      hadMeta: close >= 0
-    };
-  };
-  const validateLibraHandoffEntries = (entries, inheritedErrors = []) => {
-    const errors = Array.isArray(inheritedErrors) ? inheritedErrors.map(error => ({ ...error })) : [];
-    for (const entry of Array.isArray(entries) ? entries : []) {
-      const comment = text(entry.comment).trim();
-      if (comment === 'lmai_memory') {
-        const split = splitLibraMemoryMeta(entry.content);
-        if (!split.hadMeta || !split.meta || !split.body) {
-          errors.push({ reason: 'libra_handoff_memory_invalid', comment, key: text(entry.key) });
-        }
-      } else if (LIBRA_REQUIRED_JSON_COMMENTS.has(comment)) {
-        const parsed = parseJson(entry.content, null);
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-          errors.push({ reason: 'libra_handoff_structural_data_invalid', comment, key: text(entry.key) });
-        }
-      }
-    }
-    return { valid: errors.length === 0, errors };
-  };
-  const readLibraSource = context => {
-    const effective = effectiveLibraLore(context);
-    const entries = effective.entries.filter(entry => (
-      LIBRA_INHERITED_COMMENTS.has(text(entry.comment).trim())
-      && !['lmai_hayaku_cold_start', 'lmai_hayaku_session_handoff'].includes(text(entry.comment).trim())
-      && text(entry.key).trim() !== LIBRA_SCENE_CONTEXT_KEY
-    ));
-    const validation = validateLibraHandoffEntries(entries, effective.errors);
-    const previousHandoff = context?.chat?.libraSessionHandoff;
-    const available = entries.length > 0 || previousHandoff?.schema === LIBRA_SESSION_HANDOFF_SCHEMA;
-    return {
-      available,
-      integrityOk: validation.valid,
-      reason: !available ? 'libra_data_unavailable' : validation.valid ? 'loaded' : 'libra_integrity_failed',
-      sourceScopeKey: libraScopeKey(context?.chat, context?.character),
-      sourceLoreDigest: libraStableHash(JSON.stringify(entries.map(entry => [
-        text(entry.comment), text(entry.key), libraStableHash(entry.content)
-      ]))),
-      entries,
-      recordCount: entries.length,
-      containerCount: effective.containers,
-      errors: validation.errors
+      available: schemaOk && scopeMatches && memories.length > 0,
+      pluginAvailable: schemaOk,
+      integrityOk,
+      reason: !schemaOk ? 'libra_ipc_contract_unavailable'
+        : !scopeMatches ? 'libra_scope_mismatch'
+          : !integrityOk ? 'libra_integrity_failed'
+            : memories.length ? 'loaded' : 'empty',
+      readSource,
+      pluginVersion: text(source.pluginVersion || ''),
+      scope,
+      manifest: clone(source.manifest, {}),
+      integrity: clone(source.integrity, { ok: integrityOk }),
+      memories,
+      worldAdditional,
+      recordCount: memories.length,
+      liveRecordCount: liveCount,
+      inheritedRecordCount: inheritedCount,
+      partialRecordCount: partialCount,
+      worldAdditionalCount: worldAdditional.length,
+      snapshotHash,
+      inspectedAt: source.inspectedAt || ''
     };
   };
 
-  const inheritLibraProjection = projection => {
-    if (!projection || typeof projection !== 'object' || Array.isArray(projection)) return projection;
-    const predecessorLineage = {
-      turnNodeId: text(projection.turnNodeId).trim(),
-      logicalTurnId: text(projection.logicalTurnId).trim(),
-      variantId: text(projection.variantId).trim(),
-      branchId: text(projection.branchId).trim(),
-      sourceRevision: Math.max(0, Number(projection.sourceRevision || 0) || 0)
-    };
-    return {
-      ...projection,
-      authorityClass: 'permanent_predecessor',
-      sourceKind: 'session_handoff_predecessor',
-      predecessorLineage,
-      turnNodeId: '',
-      logicalTurnId: '',
-      variantId: '',
-      parentTurnNodeId: '',
-      branchId: '',
-      sourceRevision: 0,
-      lifecycleState: 'active',
-      rollbackState: 'active',
-      hiddenFromPrompt: false,
-      needsReanalysis: false,
-      history: (Array.isArray(projection.history) ? projection.history : []).map(inheritLibraProjection)
-    };
-  };
-  const transformLibraHandoffEntry = (entry, options = {}) => {
-    const targetScopeKey = text(options.targetScopeKey).trim();
-    const targetChatId = text(options.targetChatId).trim();
-    const comment = text(entry?.comment).trim();
-    const next = clone(entry, null);
-    if (!next) throw new Error('LIBRA handoff entry could not be cloned.');
-    if (comment === 'lmai_memory') {
-      const split = splitLibraMemoryMeta(next.content);
-      if (!split.meta || !split.body) throw new Error(`LIBRA memory metadata is invalid: ${text(next.key)}`);
-      const meta = { ...split.meta };
-      meta.predecessorLineage = {
-        canonicalMemoryId: text(meta.canonicalMemoryId).trim(),
-        turnNodeId: text(meta.turnNodeId).trim(),
-        logicalTurnId: text(meta.logicalTurnId).trim(),
-        variantId: text(meta.variantId).trim(),
-        parentTurnNodeId: text(meta.parentTurnNodeId).trim(),
-        branchId: text(meta.branchId).trim(),
-        sourceRevision: Math.max(0, Number(meta.sourceRevision || 0) || 0)
-      };
-      Object.assign(meta, {
-        authorityClass: 'permanent_predecessor',
-        sourceKind: 'session_handoff_predecessor',
-        s_id: 'baseline',
-        scopeKey: targetScopeKey,
-        chatId: targetChatId,
-        turnNodeId: '',
-        logicalTurnId: '',
-        variantId: '',
-        parentTurnNodeId: '',
-        branchId: '',
-        sourceRevision: 0,
-        lifecycleState: 'active',
-        rollbackState: 'active',
-        hiddenFromPrompt: false,
-        needsReanalysis: false
-      });
-      next.content = `[META:${JSON.stringify(meta)}]\n${split.body}\n`;
-      return next;
-    }
-
-    const parsed = parseJson(next.content, null);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      if (LIBRA_REQUIRED_JSON_COMMENTS.has(comment)) {
-        throw new Error(`LIBRA structural handoff data is invalid: ${comment}:${text(next.key)}`);
-      }
-      return next;
-    }
-    if (parsed.meta && typeof parsed.meta === 'object') parsed.meta.s_id = 'baseline';
-    if (LIBRA_SCOPED_STATE_COMMENTS.has(comment)) {
-      parsed.scopeKey = targetScopeKey;
-      parsed.chatId = targetChatId;
-      if (parsed.engineState && typeof parsed.engineState === 'object') {
-        parsed.engineState.scopeKey = targetScopeKey;
-        parsed.engineState.chatId = targetChatId;
-      }
-      next.key = `${comment}::${libraStableHash(targetScopeKey)}`;
-    }
-    if (comment === 'lmai_natural_lore_baseline') {
-      parsed.scopeKey = targetScopeKey;
-      parsed.chatId = targetChatId;
-      parsed.sourceOfTruth = 'inherited_predecessor_session';
-    }
-    if (comment === 'lmai_integrated_natural_ledger') {
-      parsed.projections = parsed.projections && typeof parsed.projections === 'object'
-        ? parsed.projections : {};
-      for (const axis of ['entity', 'world', 'narrative']) {
-        parsed.projections[axis] = (Array.isArray(parsed.projections[axis]) ? parsed.projections[axis] : [])
-          .map(inheritLibraProjection);
-      }
-    }
-    if (comment === 'lmai_world_additional') {
-      Object.assign(parsed, {
-        scopeKey: targetScopeKey,
-        chatId: targetChatId,
-        manifestationLog: [],
-        handoffLog: [],
-        lastInjectedIds: [],
-        lastTurn: 0,
-        lastUpdated: Date.now()
-      });
-    }
-    if (comment === 'lmai_user_dlc') {
-      Object.assign(parsed, {
-        scopeKey: targetScopeKey,
-        chatId: targetChatId,
-        analysisLog: [],
-        lastTurn: 0,
-        lastUpdated: Date.now()
-      });
-      parsed.targetAnalyses = (Array.isArray(parsed.targetAnalyses) ? parsed.targetAnalyses : []).map(item => ({
-        ...item,
-        updatedTurn: 0,
-        history: []
-      }));
-      parsed.entityTrackers = (Array.isArray(parsed.entityTrackers) ? parsed.entityTrackers : []).map(item => ({
-        ...item,
-        initialStateAuthority: 'predecessor_baseline',
-        createdTurn: 0,
-        lastEvaluatedTurn: 0,
-        lastChangedTurn: 0,
-        eventLedger: [],
-        history: [],
-        runtimeHistory: []
-      }));
-    }
-    next.content = JSON.stringify(parsed);
-    return next;
-  };
-  const libraStorageEntry = entry => {
-    const next = clone(entry, null);
-    if (!next) return null;
-    const natural = next.__lihaflNaturalLore;
-    delete next.__lihaflNaturalLore;
-    if (natural?.state?.schema === LIBRA_NATURAL_LORE_SCHEMA) {
-      const internalContent = text(next.content);
-      const visibleContent = text(natural.visibleContent);
-      next.content = visibleContent;
-      next[LIBRA_NATURAL_LORE_STATE_FIELD] = {
-        ...natural.state,
-        content: internalContent,
-        contentHash: libraStableHash(internalContent),
-        naturalHash: libraStableHash(visibleContent)
-      };
-    }
-    return next;
-  };
-  const packLibraLore = entries => {
-    const groups = new Map();
-    const slots = [];
-    for (const raw of Array.isArray(entries) ? entries : []) {
-      const entry = libraStorageEntry(raw);
-      if (!entry) continue;
-      const comment = text(entry.comment).trim() || 'lmai_unknown';
-      const standalone = entry.alwaysActive === true
-        || text(entry.memo).trim() === 'LIBRA_PROJECTION'
-        || ['lmai_projection_active_state', 'lmai_projection_boundary_guard', 'lmai_projection_recall_bundle'].includes(comment);
-      if (standalone) {
-        slots.push({ type: 'entry', entry });
-        continue;
-      }
-      if (!groups.has(comment)) {
-        groups.set(comment, []);
-        slots.push({ type: 'category', comment });
-      }
-      groups.get(comment).push(entry);
-    }
-    return slots.map(slot => {
-      if (slot.type === 'entry') return slot.entry;
-      const categoryEntries = groups.get(slot.comment) || [];
-      const insertOrders = categoryEntries.map(entry => Number(entry.insertorder)).filter(Number.isFinite);
-      const suffix = slot.comment.replace(/^lmai_/, '').replace(/[^a-zA-Z0-9_]+/g, '_')
-        .replace(/^_+|_+$/g, '').toUpperCase() || 'UNKNOWN';
-      return {
-        key: `LIBRA_DATA_${suffix}_${libraStableHash(slot.comment)}`,
-        comment: slot.comment,
-        memo: 'LIBRA_CONTAINER',
-        content: JSON.stringify({
-          schema: LIBRA_CONTAINER_SCHEMA,
-          version: 2,
-          category: slot.comment,
-          entryCount: categoryEntries.length,
-          entries: categoryEntries
-        }),
-        mode: 'normal',
-        insertorder: insertOrders.length ? Math.min(...insertOrders) : 100,
-        alwaysActive: false,
-        selective: false,
-        useRegex: false,
-        secondkey: '',
-        depth: 0
-      };
-    });
-  };
-  const buildLibraInheritedLore = (libra, options = {}) => {
-    if (!libra?.integrityOk) throw new Error(`LIBRA handoff integrity failed: ${JSON.stringify(libra?.errors || [])}`);
-    const targetChatId = text(options.targetChatId).trim();
-    const targetScopeKey = text(options.targetScopeKey).trim();
-    const transformed = libra.entries.map(entry => transformLibraHandoffEntry(entry, { targetChatId, targetScopeKey }));
-    const validation = validateLibraHandoffEntries(transformed);
-    if (!validation.valid) throw new Error(`LIBRA inherited lore validation failed: ${JSON.stringify(validation.errors)}`);
-    return {
-      localLore: packLibraLore(transformed),
-      entries: transformed,
-      recordCount: transformed.length,
-      targetChatId,
-      targetScopeKey,
-      sourceLoreDigest: libra.sourceLoreDigest
-    };
-  };
-  const verifyDurableLibraSessionHandoff = async options => {
-    const targetChatId = text(options?.targetChatId).trim();
-    const transferId = text(options?.transferId).trim();
-    const targetScopeKey = text(options?.targetScopeKey).trim();
-    const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
-    if (!options?.included) {
-      return { ok: true, verified: true, durable: true, adopted: false, records: 0, reason: 'no_libra_data' };
-    }
+  const readLibraSource = async context => {
+    const identity = contextIdentity(context || await getCurrentContext());
     try {
-      const latest = await getCurrentContext();
-      const target = (Array.isArray(latest?.character?.chats) ? latest.character.chats : [])
-        .find(chat => text(chat?.id).trim() === targetChatId);
-      const marker = target?.libraSessionHandoff;
-      const unpacked = unpackLibraLore(target?.localLore);
-      const entries = unpacked.entries.filter(entry => LIBRA_INHERITED_COMMENTS.has(text(entry.comment).trim()));
-      const validation = validateLibraHandoffEntries(entries, unpacked.errors);
-      const memoryScoped = entries.filter(entry => text(entry.comment).trim() === 'lmai_memory').every(entry => {
-        const split = splitLibraMemoryMeta(entry.content);
-        return split.meta?.authorityClass === 'permanent_predecessor'
-          && split.meta?.sourceKind === 'session_handoff_predecessor'
-          && text(split.meta?.scopeKey).trim() === targetScopeKey
-          && text(split.meta?.chatId).trim() === targetChatId;
-      });
-      const verified = Boolean(target)
-        && marker?.schema === LIBRA_SESSION_HANDOFF_SCHEMA
-        && text(marker.transferId).trim() === transferId
-        && text(marker.targetChatId).trim() === targetChatId
-        && text(marker.targetScopeKey).trim() === targetScopeKey
-        && entries.length === expectedRecords
-        && validation.valid
-        && memoryScoped;
-      return {
-        ok: verified,
-        verified,
-        durable: verified,
-        adopted: verified,
-        records: entries.length,
-        expectedRecords,
-        targetChatId,
-        targetScopeKey,
-        reason: verified ? 'libra_handoff_durable' : 'libra_handoff_readback_mismatch',
-        diagnostics: { marker, errors: validation.errors, memoryScoped }
-      };
+      const inspected = await requestLibraIpc('inspect', {}, { timeoutMs: 3500 });
+      return normalizeLibraInspection(inspected, identity, 'libra_plugin_ipc');
     } catch (error) {
+      if (!['LIBRA_IPC_UNAVAILABLE', 'LIBRA_IPC_TIMEOUT'].includes(text(error?.code))) {
+        warn('LIBRA IPC inspection failed', error);
+      }
+    }
+    const runtime = activeLibraRuntime();
+    if (runtime && typeof runtime.inspectForRetrace === 'function') {
+      try {
+        const inspected = await runtime.inspectForRetrace();
+        return normalizeLibraInspection(inspected, identity, 'libra_runtime_api');
+      } catch (error) {
+        warn('LIBRA runtime inspection failed', error);
+      }
+    }
+    return {
+      available: false,
+      pluginAvailable: false,
+      integrityOk: false,
+      reason: 'libra_ipc_unavailable',
+      readSource: 'none',
+      pluginVersion: '', scope: {}, manifest: {}, integrity: { ok: false },
+      memories: [], worldAdditional: [], recordCount: 0, liveRecordCount: 0,
+      inheritedRecordCount: 0, partialRecordCount: 0, worldAdditionalCount: 0,
+      snapshotHash: '', errors: ['LIBRA v1.0.4 or later IPC contract is required.']
+    };
+  };
+
+  const prepareLibraSessionHandoff = async options => {
+    const runtime = activeLibraRuntime();
+    try {
+      const result = await requestLibraIpc('prepare_session_handoff', options || {}, { timeoutMs: 6000 });
+      if (result?.schema !== LIBRA_HANDOFF_RECEIPT_SCHEMA || result?.prepared !== true) throw new Error('LIBRA handoff preparation receipt is invalid.');
+      return { ...result, transport: 'libra_plugin_ipc' };
+    } catch (error) {
+      if (runtime && typeof runtime.prepareSessionHandoff === 'function') {
+        const result = await runtime.prepareSessionHandoff(options || {});
+        return { ...result, transport: 'libra_runtime_api' };
+      }
+      throw error;
+    }
+  };
+
+  const adoptLibraSessionHandoff = async options => {
+    const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
+    const runtime = activeLibraRuntime();
+    try {
+      const result = await requestLibraIpc('adopt_session_handoff', options || {}, { timeoutMs: 12000 });
+      return { ...result, transport: 'libra_plugin_ipc' };
+    } catch (error) {
+      if (runtime && typeof runtime.adoptSessionHandoff === 'function') {
+        try {
+          const result = await runtime.adoptSessionHandoff(options || {});
+          return { ...result, transport: 'libra_runtime_api' };
+        } catch (runtimeError) {
+          error = runtimeError;
+        }
+      }
       return {
-        ok: false,
-        verified: false,
-        durable: false,
-        adopted: false,
-        records: 0,
-        expectedRecords,
-        targetChatId,
-        targetScopeKey,
+        schema: LIBRA_HANDOFF_RECEIPT_SCHEMA,
+        action: 'adopted', adopted: false, verified: false, durable: false,
+        records: 0, expectedRecords, targetChatId: text(options?.targetChatId || ''),
+        transferId: text(options?.transferId || ''), transport: 'unavailable',
+        reason: text(error?.message || error || 'libra_handoff_adoption_failed')
+      };
+    }
+  };
+
+  const adoptLibraSessionHandoffDurable = async options => {
+    const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
+    let last = null;
+    const maxAttempts = 4;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      last = await adoptLibraSessionHandoff(options || {});
+      const records = Math.max(0, Number(last?.records || 0) || 0);
+      if (last?.verified === true && last?.durable !== false && records === expectedRecords) {
+        return { ...last, attempts: attempt };
+      }
+      if (attempt < maxAttempts) await delay(Math.min(1200, 220 * attempt));
+    }
+    return { ...(last || {}), attempts: maxAttempts };
+  };
+
+  const verifyDurableLibraSessionHandoff = async options => {
+    if (options?.included !== true) return {
+      schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: true, durable: true,
+      adopted: false, records: 0, expectedRecords: 0, reason: 'no_libra_data'
+    };
+    const payload = {
+      transferId: text(options?.transferId || ''),
+      targetChatId: text(options?.targetChatId || ''),
+      expectedRecords: Math.max(0, Number(options?.expectedRecords || 0) || 0)
+    };
+    const runtime = activeLibraRuntime();
+    try {
+      const result = await requestLibraIpc('verify_session_handoff', payload, { timeoutMs: 6000 });
+      return { ...result, transport: 'libra_plugin_ipc' };
+    } catch (error) {
+      if (runtime && typeof runtime.verifySessionHandoff === 'function') {
+        try {
+          const result = await runtime.verifySessionHandoff(payload);
+          return { ...result, transport: 'libra_runtime_api' };
+        } catch (runtimeError) {
+          error = runtimeError;
+        }
+      }
+      return {
+        schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: false, durable: false,
+        records: 0, expectedRecords: payload.expectedRecords, targetChatId: payload.targetChatId,
+        transferId: payload.transferId, transport: 'unavailable',
         reason: text(error?.message || error || 'libra_handoff_verification_failed')
       };
     }
@@ -5619,12 +5634,12 @@
 
   const inspectTransition = async () => {
     const context = await getCurrentContext();
-    const [flashback, hayaku, pendingColdStart] = await Promise.all([
+    const [flashback, hayaku, pendingColdStart, libra] = await Promise.all([
       readFlashbackViewer(context),
       readHayakuSource(context),
-      readPendingColdStartCapsule(context)
+      readPendingColdStartCapsule(context),
+      readLibraSource(context)
     ]);
-    const libra = readLibraSource(context);
     const preview = {
       context,
       identity: contextIdentity(context),
@@ -5769,43 +5784,40 @@
         recordCountMismatch: flashback.recordCountMismatch === true
       })}`);
     }
-    if (libra.integrityOk === false) {
-      throw new Error(`LIBRA data integrity is incomplete; next-session handoff was stopped. ${JSON.stringify({
-        reason: libra.reason,
-        records: libra.recordCount,
-        errors: libra.errors
+    if (libra.pluginAvailable && libra.integrityOk === false) {
+      throw new Error(`LIBRA canonical memory integrity is incomplete; next-session handoff was stopped. ${JSON.stringify({
+        reason: libra.reason, records: libra.recordCount, integrity: libra.integrity
       })}`);
     }
     const targetChatId = uuid();
     const transferId = uuid();
     const createdAt = Date.now();
+    const libraPreparation = preview.includeLibra
+      ? await prepareLibraSessionHandoff({ transferId, expectedRecords: libra.recordCount })
+      : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, prepared: false, records: 0, reason: 'no_libra_data' };
+    if (preview.includeLibra && (libraPreparation.prepared !== true || Number(libraPreparation.records || 0) !== Number(libra.recordCount || 0))) {
+      throw new Error(`LIBRA next-session handoff preparation failed before creating the new chat: ${libraPreparation.reason || 'record_count_mismatch'}`);
+    }
+
     const nextCharacter = clone(context.character, null);
     if (!nextCharacter) throw new Error('캐릭터를 복제하지 못했습니다.');
     nextCharacter.chats = Array.isArray(nextCharacter.chats) ? nextCharacter.chats : [];
-    const targetLibraScopeKey = libraScopeKey({ id: targetChatId }, nextCharacter);
-    const libraPackage = preview.includeLibra
-      ? buildLibraInheritedLore(libra, { targetChatId, targetScopeKey: targetLibraScopeKey })
-      : { localLore: [], entries: [], recordCount: 0, targetChatId, targetScopeKey: targetLibraScopeKey };
     const newChat = {
       message: [],
       note: text(context.chat?.note || ''),
       name: `Session ${nextCharacter.chats.length + 1} (RE:TRACE)`,
-      localLore: libraPackage.localLore,
+      localLore: [],
       fmIndex: -1,
       id: targetChatId,
       copiedFromChatId: identity.chatId,
       ...(flashback.sourceScope?.scopeKey ? { copiedFromScopeKey: text(flashback.sourceScope.scopeKey) } : {}),
       ...(preview.includeLibra ? {
-        libraSessionHandoff: {
-          schema: LIBRA_SESSION_HANDOFF_SCHEMA,
-          mode: 'libra',
-          sourceChatId: identity.chatId,
-          targetChatId,
-          transferId,
-          sourceScopeKey: libra.sourceScopeKey,
-          targetScopeKey: targetLibraScopeKey,
-          sourceLoreDigest: libra.sourceLoreDigest,
-          createdAt
+        libraMemoryHandoff: {
+          schema: LIBRA_CHAT_HANDOFF_MARKER_SCHEMA,
+          transferId, sourceChatId: identity.chatId, targetChatId,
+          sourceScopeKey: text(libra.scope?.scopeKey || ''),
+          recordCount: libra.recordCount,
+          preparedAt: libraPreparation.preparedAt || new Date(createdAt).toISOString()
         }
       } : {}),
       memorySessionBridge: {
@@ -5815,15 +5827,14 @@
         sourceChatId: identity.chatId,
         sourceFlashbackScopeKey: text(flashback.sourceScope?.scopeKey || ''),
         sourceHayakuScopeKey: text(hayaku.scope?.scopeKey || ''),
-        sourceLibraScopeKey: libra.sourceScopeKey,
-        targetLibraScopeKey,
+        sourceLibraScopeKey: text(libra.scope?.scopeKey || ''),
         targetChatId,
         includeFlashback: true,
         includeHayaku: preview.includeHayaku === true,
         includeLibra: preview.includeLibra === true,
         flashbackRecordCount: Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0),
         hayakuRecordCount: preview.hayakuRecordCount,
-        libraRecordCount: libraPackage.recordCount,
+        libraRecordCount: libra.recordCount,
         createdAt
       }
     };
@@ -5839,37 +5850,28 @@
       throw new Error('전환 준비 중 활성 캐릭터 또는 채팅이 바뀌었습니다.');
     }
     if (preview.includeLibra) {
-      const latestLibra = readLibraSource(latest);
-      if (!latestLibra.integrityOk
-        || latestLibra.sourceLoreDigest !== libra.sourceLoreDigest
-        || latestLibra.recordCount !== libra.recordCount) {
-        throw new Error('LIBRA canonical data changed during handoff preparation. Run the transition again.');
+      const latestLibra = await readLibraSource(latest);
+      if (!latestLibra.integrityOk || latestLibra.snapshotHash !== libra.snapshotHash || latestLibra.recordCount !== libra.recordCount) {
+        throw new Error('LIBRA canonical memory changed during handoff preparation. Run the transition again.');
       }
     }
     const writer = await saveCharacter(nextCharacter, context.characterIndex);
     const flashbackRecords = Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0);
     const hayakuRecords = Math.max(0, Number(preview.hayakuRecordCount || 0) || 0);
-    const [flashbackAdoption, hayakuAdoption, libraAdoption] = await Promise.all([
+    const [flashbackAdoption, hayakuAdoption, libraAdoptionInitial] = await Promise.all([
       adoptFlashbackSessionHandoff({
-        targetChatId,
-        transferId,
-        sourceScopeKey: text(flashback.sourceScope?.scopeKey || ''),
-        expectedRecords: flashbackRecords
+        targetChatId, transferId, sourceScopeKey: text(flashback.sourceScope?.scopeKey || ''), expectedRecords: flashbackRecords
       }),
       adoptHayakuSessionHandoff({
-        targetChatId,
-        transferId,
-        sourceScopeKey: text(hayaku.scope?.scopeKey || ''),
-        expectedRecords: preview.includeHayaku === true ? hayakuRecords : 0
+        targetChatId, transferId, sourceScopeKey: text(hayaku.scope?.scopeKey || ''), expectedRecords: preview.includeHayaku === true ? hayakuRecords : 0
       }),
-      verifyDurableLibraSessionHandoff({
-        included: preview.includeLibra === true,
-        targetChatId,
-        transferId,
-        targetScopeKey: targetLibraScopeKey,
-        expectedRecords: libraPackage.recordCount
-      })
+      preview.includeLibra
+        ? adoptLibraSessionHandoffDurable({ targetChatId, transferId, expectedRecords: libra.recordCount })
+        : Promise.resolve({ schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, verified: true, durable: true, records: 0, reason: 'no_libra_data' })
     ]);
+    const libraAdoption = preview.includeLibra && libraAdoptionInitial?.verified !== true
+      ? await verifyDurableLibraSessionHandoff({ included: true, targetChatId, transferId, expectedRecords: libra.recordCount })
+      : libraAdoptionInitial;
     const result = {
       ok: true,
       schema: HANDOFF_SCHEMA,
@@ -5886,10 +5888,10 @@
       hayakuRecords,
       hayakuSource: hayaku.available ? 'canonical_ledger' : pendingColdStart.available ? 'pending_cold_start' : 'none',
       libraScheduled: preview.includeLibra === true && libraAdoption.verified !== true,
-      libraVerified: libraAdoption.verified === true,
+      libraVerified: libraAdoption.verified === true && libraAdoption.durable !== false,
       libraAdoption,
-      libraRecords: libraPackage.recordCount,
-      libraSource: preview.includeLibra ? 'canonical_lore' : 'none',
+      libraRecords: libra.recordCount,
+      libraSource: preview.includeLibra ? 'libra_plugin_ipc' : 'none',
       writer,
       createdAt
     };
@@ -6027,6 +6029,64 @@
     return value;
   };
 
+  const libraMemoryViewerInfo = memory => {
+    const epoch = Number(memory?.sessionEpoch || 0);
+    const inherited = memory?.inheritedSessionHistory === true || epoch < 0;
+    const turnStart = Math.max(0, Number(memory?.turnRange?.start || 0) || 0);
+    const turnEnd = Math.max(turnStart, Number(memory?.turnRange?.end || turnStart) || turnStart);
+    const sections = memory?.sections && typeof memory.sections === 'object' ? Object.keys(memory.sections).filter(key => text(memory.sections[key]).trim()) : [];
+    return {
+      title: inherited ? `이전 세션 ${Math.abs(epoch || -1)} · TURN ${turnStart}~${turnEnd}` : `현재 세션 · TURN ${turnStart}~${turnEnd}`,
+      inherited,
+      epoch,
+      partial: memory?.pipeline?.status === 'partial',
+      revision: Math.max(0, Number(memory?.revision || 0) || 0),
+      summary: text(memory?.summary || '').trim(),
+      text: text(memory?.text || '').trim(),
+      sections,
+      embedding: text(memory?.embedding?.status || ''),
+      memoryId: text(memory?.memoryId || ''),
+      updatedAt: text(memory?.updatedAt || memory?.createdAt || '')
+    };
+  };
+
+  const renderLibra = result => {
+    if (!result?.pluginAvailable) {
+      return `<div class="empty"><strong>LIBRA 연결 없음</strong><span>LIBRA v1.0.4 이상을 함께 설치해야 IPC 기억 뷰어와 다음 세션 승계를 사용할 수 있습니다.</span></div>`;
+    }
+    if (!result?.integrityOk) {
+      return `<div class="empty"><strong>LIBRA 무결성 확인 실패</strong><span>${escapeHtml(result?.reason || 'unknown')}</span></div>`;
+    }
+    const memories = Array.isArray(result.memories) ? result.memories : [];
+    const ordered = memories.slice().sort((a, b) => (
+      Number(b?.sessionEpoch || 0) - Number(a?.sessionEpoch || 0)
+      || Number(b?.turnRange?.start || 0) - Number(a?.turnRange?.start || 0)
+    ));
+    const visible = ordered.slice(0, LIBRA_VIEWER_MAX_RENDERED_RECORDS);
+    const worldAdditional = Array.isArray(result.worldAdditional) ? result.worldAdditional : [];
+    return `<div class="metrics">
+      <div><span>정본 메모리</span><strong>${formatNumber(result.recordCount || memories.length)}</strong></div>
+      <div><span>현재 / 승계</span><strong>${formatNumber(result.liveRecordCount || 0)} / ${formatNumber(result.inheritedRecordCount || 0)}</strong></div>
+      <div><span>부분 정본</span><strong>${formatNumber(result.partialRecordCount || 0)}</strong></div>
+      <div><span>월드 에디셔널</span><strong>${formatNumber(result.worldAdditionalCount || worldAdditional.length)}</strong></div>
+    </div>
+    <div class="ledger-key"><span>LIBRA IPC</span><code>${escapeHtml(result.scope?.scopeKey || '')}</code><small>v${escapeHtml(result.pluginVersion || '?')}</small></div>
+    ${ordered.length > visible.length ? `<div class="settings-callout">최신 ${formatNumber(visible.length)}개만 화면에 표시합니다. JSON 내보내기에는 ${formatNumber(ordered.length)}개 전체가 포함됩니다.</div>` : ''}
+    ${!memories.length ? '<div class="empty"><strong>아직 정본 메모리가 없습니다.</strong><span>LIBRA에서 5턴 분석이 완료되면 여기에 바로 표시됩니다.</span></div>' : ''}
+    <div class="record-list">${visible.map(memory => {
+      const info = libraMemoryViewerInfo(memory);
+      const label = info.inherited ? 'PERMANENT HISTORY' : info.partial ? 'PARTIAL CANON' : 'CANON';
+      return `<article class="record libra-record">
+        <div class="record-head"><div><strong>${escapeHtml(info.title)}</strong><span>${escapeHtml(info.memoryId)} · revision ${formatNumber(info.revision)}</span></div><em>${label}</em></div>
+        ${info.summary ? `<p>${escapeHtml(info.summary)}</p>` : ''}
+        <div class="meta"><span>embedding ${escapeHtml(info.embedding || '-')}</span>${info.sections.length ? `<span>${escapeHtml(info.sections.join(' · '))}</span>` : ''}${info.updatedAt ? `<span>${escapeHtml(info.updatedAt)}</span>` : ''}</div>
+        <details><summary>정본 메모리 전체 보기</summary><pre>${escapeHtml(info.text || '(empty)')}</pre></details>
+        <details><summary>메타데이터 JSON</summary><pre>${escapeHtml(JSON.stringify({ ...memory, text: undefined }, null, 2))}</pre></details>
+      </article>`;
+    }).join('')}</div>
+    ${worldAdditional.length ? `<div class="card"><div class="heading"><div><strong>월드 에디셔널</strong><span>아직 이야기에서 구현되기 전인 비정본 후보입니다.</span></div><em class="badge">NON-CANON</em></div><div class="record-list">${worldAdditional.map(item => `<article class="record"><div class="record-head"><div><strong>${escapeHtml(item.title || item.itemId || 'World Additional')}</strong><span>${escapeHtml(item.kind || 'world')} · ${escapeHtml(item.status || '')}</span></div></div><p>${escapeHtml(item.content || '')}</p></article>`).join('')}</div></div>` : ''}`;
+  };
+
   const renderFlashback = result => {
     if (!result?.available) {
       const reason = {
@@ -6081,7 +6141,14 @@
       }[result?.reason] || `HAYAKU 원장을 읽을 수 없습니다: ${result?.reason || 'unknown'}`;
       return `<div class="empty"><strong>HAYAKU 원장 없음</strong><span>${escapeHtml(reason)}</span></div>`;
     }
-    const records = Array.isArray(result.allRecords) ? result.allRecords : result.records;
+    const allRecords = Array.isArray(result.allRecords) ? result.allRecords : (Array.isArray(result.records) ? result.records : []);
+    const tombstones = activeHayakuLedgerTombstones(result.ledger);
+    const tombstonesBySlot = new Map(tombstones.map(value => [text(value.slotId).trim(), value]));
+    const deletedRecords = allRecords.filter(record => (
+      text(record?.recordState || '').trim().toLowerCase() === 'tombstoned'
+      || hayakuTombstoneSuppressesRecord(record, tombstonesBySlot.get(hayakuRecordSlotId(record)))
+    ));
+    const records = allRecords.filter(record => !deletedRecords.includes(record));
     const ordered = records.slice().sort((a, b) => compareHayakuTimelineRecords(b, a));
     const visible = ordered.slice(0, HAYAKU_VIEWER_MAX_RENDERED_RECORDS);
     Runtime.hayakuActionRecords = visible.map(record => clone(record, record));
@@ -6094,11 +6161,13 @@
     return `<div class="metrics">
       <div><span>저장 패킷</span><strong>${formatNumber(records.length)}</strong></div>
       <div><span>LIVE / 승계</span><strong>${formatNumber(liveRecords)} / ${formatNumber(inheritedRecords)}</strong></div>
+      <div><span>삭제됨</span><strong>${formatNumber(deletedRecords.length)}</strong></div>
       <div><span>활성 / 전체 월드라인</span><strong>${formatNumber(activeNodes)} / ${formatNumber(nodes.length)}</strong></div>
       <div><span>원장 크기</span><strong>${formatNumber(chars)} chars</strong></div>
     </div>
     <div class="ledger-key"><span>READ ONLY</span><code>${escapeHtml(result.scope.storageKey)}</code><small>갱신 ${escapeHtml(updatedAt)}</small></div>
-    ${ordered.length > visible.length ? `<div class="settings-callout">최신 ${formatNumber(visible.length)}개만 화면에 표시합니다. JSON 내보내기에는 ${formatNumber(ordered.length)}개 전체가 포함됩니다.</div>` : ''}
+    ${deletedRecords.length ? `<div class="settings-callout">사용자가 삭제한 패킷 ${formatNumber(deletedRecords.length)}개는 tombstone으로 보존되지만 활성 목록과 자동 누락 복구에서 제외됩니다.</div>` : ''}
+    ${ordered.length > visible.length ? `<div class="settings-callout">최신 ${formatNumber(visible.length)}개만 화면에 표시합니다. JSON 내보내기에는 tombstone을 포함한 원장 전체가 유지됩니다.</div>` : ''}
     <div class="record-list">${visible.map((record, actionIndex) => {
       const info = packetInfo(record);
       const inherited = record.inheritedSessionHistory === true || isPermanentSessionHistory(record);
@@ -6218,12 +6287,13 @@
       @media(max-width:560px){.bridge{height:100dvh;max-height:100dvh;border-radius:0;grid-template-columns:64px minmax(0,1fr);grid-template-rows:62px minmax(0,1fr)}.top{padding:0 10px}.brand span,.global-status{display:none}.flow,.metrics,.settings-feature-grid,.packet-sections,.analysis-console-metrics{grid-template-columns:1fr}.ledger-key small{display:none}.field-wide,.profile-actions{grid-column:1}}
     </style>
     <div class="bridge${Runtime.busy ? ' busy' : ''}">
-      <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>LIBRA GUI · Provider · HAYAKU Cold Start</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="closeBridge" class="btn">닫기</button></div></header>
+      <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>LIBRA · HAYAKU · Flashback Continuity</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="closeBridge" class="btn">닫기</button></div></header>
       <aside class="side">
         <div class="nav-group-label">Operations</div>
         <button class="nav ${Runtime.activeTab === 'session' ? 'active' : ''}" data-tab="session"><span class="ic">↪</span><span>다음 세션</span></button>
         <button class="nav ${Runtime.activeTab === 'coldstart' ? 'active' : ''}" data-tab="coldstart"><span class="ic">✦</span><span>분석 복구</span></button>
         <div class="nav-group-label">Data</div>
+        <button class="nav ${Runtime.activeTab === 'libra' ? 'active' : ''}" data-tab="libra"><span class="ic">L</span><span>LIBRA 뷰어</span></button>
         <button class="nav ${Runtime.activeTab === 'flashback' ? 'active' : ''}" data-tab="flashback"><span class="ic">F</span><span>Flashback 뷰어</span></button>
         <button class="nav ${Runtime.activeTab === 'hayaku' ? 'active' : ''}" data-tab="hayaku"><span class="ic">H</span><span>HAYAKU 뷰어</span></button>
         <div class="nav-group-label">Settings</div>
@@ -6234,8 +6304,8 @@
         <section class="panel ${Runtime.activeTab === 'session' ? 'active' : ''}" data-panel="session">
           <div class="panel-heading"><div><h2>다음 세션</h2><p>LIBRA, HAYAKU, Flashback의 정본 데이터를 새 채팅으로 함께 승계합니다.</p></div></div>
           <div class="card"><div class="heading"><div><strong>대화 이어가기</strong><span>새 채팅 저장 직후 세 시스템의 승계 계약과 영속 반영을 검증합니다.</span></div><em class="badge">원본 보존</em></div>
-            <div class="flow"><div><b>1 · LIBRA</b><small>정본·인물·관계·세계·확장 데이터를 목적 스코프로 재바인딩</small></div><div><b>2 · Flashback</b><small>이전 기억을 영구 과거로 즉시 채택·검증</small></div><div><b>3 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>4 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
-            <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">LIBRA 로어는 원래 승계 계약으로 재구성됩니다. Flashback과 HAYAKU는 각 원장의 공식 채택 경로를 사용합니다.</p>
+            <div class="flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · Flashback</b><small>이전 기억을 영구 과거로 즉시 채택·검증</small></div><div><b>3 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>4 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
+            <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">LIBRA는 World Manager/로어북 승계 계약을 사용하지 않습니다. LIBRA 공식 IPC로 pluginStorage 정본을 새 세션의 영구 이전 기억으로 채택합니다. Flashback과 HAYAKU도 각 공식 채택 경로를 사용합니다.</p>
             <div class="actions"><button id="refreshTransition" class="btn">다시 확인</button><button id="createSession" class="btn primary">다음 세션 만들기</button></div>
           </div>
         </section>
@@ -6260,6 +6330,10 @@
             <div id="analysisLog" class="analysis-log" aria-live="polite">[대기] 실시간 로그가 준비되었습니다.</div>
             <div class="actions"><button id="analysisReturnToRisu" class="btn primary" hidden>RisuAI로 돌아가기 · 백그라운드 계속</button></div>
           </div></div>
+        </section>
+        <section class="panel ${Runtime.activeTab === 'libra' ? 'active' : ''}" data-panel="libra">
+          <div class="panel-heading"><div><h2>LIBRA 정본 기억</h2><p>현재 채팅의 LIBRA pluginStorage 정본과 이전 세션 승계 기억을 공식 IPC로 읽기 전용 표시합니다.</p></div><div class="actions"><button id="exportLibra" class="btn">JSON 내보내기</button><button id="refreshLibra" class="btn primary">새로고침</button></div></div>
+          <div id="libraBody"><div class="empty"><strong>LIBRA 조회 대기</strong><span>새로고침을 누르면 LIBRA IPC로 정본 기억을 읽습니다.</span></div></div>
         </section>
         <section class="panel ${Runtime.activeTab === 'flashback' ? 'active' : ''}" data-panel="flashback">
           <div class="panel-heading"><div><h2>Flashback 기억</h2><p>현재 채팅의 manifest와 활성 shard를 읽기 전용으로 표시합니다.</p></div><div class="actions"><button id="exportFlashback" class="btn">JSON 내보내기</button><button id="refreshFlashback" class="btn primary">새로고침</button></div></div>
@@ -6381,8 +6455,8 @@
         ? `HAYAKU 패킷 ${formatNumber(preview.hayakuRecordCount)}개 자동 포함${preview.hayaku.available ? '' : ' (콜드스타트 대기 캡슐)'}`
         : `HAYAKU 제외 (${preview.hayaku.reason})`;
       const libraLine = preview.includeLibra
-        ? `LIBRA 정본 레코드 ${formatNumber(preview.libraRecordCount)}개 자동 포함`
-        : `LIBRA 제외 (${preview.libra.reason})`;
+        ? `LIBRA 정본 메모리 ${formatNumber(preview.libraRecordCount)}개 IPC 승계 준비`
+        : preview.libra.pluginAvailable ? `LIBRA 정본 없음 (${preview.libra.reason})` : 'LIBRA IPC 연결 없음 · LIBRA v1.0.4+ 필요';
       node.textContent = `${libraLine}\n${flashbackLine}\n${hayakuLine}`;
       return preview;
     } catch (error) {
@@ -6473,7 +6547,8 @@
       const reasonText = {
         cold_start_required: 'HAYAKU 기록이 없습니다. 이 세션은 증분 재분석이 아니라 콜드스타트 대상입니다.',
         incremental_recovery_readopt: '증분 재분석 캡슐은 검증됐지만 HAYAKU 원장의 영속 채택이 아직 확인되지 않았습니다.',
-        incremental_recovery_resume: '미완료 증분 재분석이 있습니다. 실패·누락 청크만 이어서 처리합니다.',
+        incremental_recovery_stale_capsule: '이전 복구 캡슐의 전체 해시는 현재 대화와 다릅니다. 일치하는 청크 체크포인트만 선별 재사용합니다.',
+        incremental_recovery_resume: '미완료 증분 재분석이 있습니다. 검증된 청크는 재사용하고 실패·누락·변경 청크만 이어서 처리합니다.',
         coverage_complete: '모든 완료 U+A 턴에 HAYAKU 커버리지가 있습니다.',
         user_suppressed_only: '사용자가 삭제한 턴만 있습니다. 자동 복구에서는 제외되며 해당 패킷 카드의 재생성 버튼으로만 복구합니다.',
         missing_turns_detected: 'HAYAKU 패킷이 없는 완료 턴을 감지했습니다.',
@@ -6487,6 +6562,10 @@
         ? ` · 사용자 삭제 ${formatNumber(coverage.userSuppressedTurns.length)}개 · 삭제 턴 ${coverage.userSuppressedTurns.join(', ')}`
         : '';
       const failedChunks = inspection.stagedRun?.run?.chunks?.filter(chunk => chunk?.status === 'failed').length || 0;
+      const checkpointPlan = inspection.checkpointPlan || {};
+      const checkpointText = inspection.recommendedMode === 'resume'
+        ? ` · 체크포인트 재사용 ${formatNumber(checkpointPlan.reusedVerifiedCount || 0)}개 · 실제 재처리 ${formatNumber(checkpointPlan.pendingChunkCount || 0)}개`
+        : '';
       const lastResultAdoption = Runtime.lastIncrementalRecovery?.recoveryId === inspection.pendingCapsule?.capsule?.recoveryId
         ? Runtime.lastIncrementalRecovery?.adoption
         : null;
@@ -6498,7 +6577,7 @@
       const adoptionText = inspection.reason === 'incremental_recovery_readopt'
         ? `\n${hayakuAdoptionDiagnosticText(adoptionReceipt)}`
         : '';
-      node.textContent = `${reasonText}${adoptionText}\n완료 턴 ${formatNumber(coverage.completedTurns)}개 · 커버 ${formatNumber(coverage.coveredTurns.length)}개 · 캡처 누락 ${formatNumber(coverage.missingTurns.length)}개${missingText}${suppressedText}${failedChunks ? ` · 실패 청크 ${formatNumber(failedChunks)}개` : ''}`;
+      node.textContent = `${reasonText}${adoptionText}\n완료 턴 ${formatNumber(coverage.completedTurns)}개 · 커버 ${formatNumber(coverage.coveredTurns.length)}개 · 캡처 누락 ${formatNumber(coverage.missingTurns.length)}개${missingText}${suppressedText}${failedChunks ? ` · 실패 청크 ${formatNumber(failedChunks)}개` : ''}${checkpointText}`;
       if (button) button.disabled = !inspection.eligible || analysisIsRunning();
       if (button) button.textContent = {
         readopt: '복구 캡슐 다시 채택',
@@ -6509,6 +6588,20 @@
     } catch (error) {
       node.textContent = `확인 실패: ${error?.message || error}`;
       if (button) button.disabled = true;
+      return null;
+    }
+  };
+
+  const refreshLibra = async () => {
+    const body = Runtime.root?.querySelector?.('#libraBody');
+    if (!body) return null;
+    body.innerHTML = '<div class="empty"><strong>LIBRA 조회 중</strong><span>공식 IPC로 현재 스코프 정본을 읽고 있습니다.</span></div>';
+    try {
+      const result = await readLibraSource(await getCurrentContext());
+      body.innerHTML = renderLibra(result);
+      return result;
+    } catch (error) {
+      body.innerHTML = `<div class="empty"><strong>조회 실패</strong><span>${escapeHtml(error?.message || error)}</span></div>`;
       return null;
     }
   };
@@ -6668,6 +6761,7 @@
           refreshColdStart();
           refreshIncrementalRecovery();
         }
+        if (Runtime.activeTab === 'libra') refreshLibra();
         if (Runtime.activeTab === 'flashback') refreshFlashback();
         if (Runtime.activeTab === 'hayaku') refreshHayaku();
       });
@@ -6675,6 +6769,7 @@
     root.querySelector('#refreshTransition')?.addEventListener('click', () => refreshTransition());
     root.querySelector('#refreshColdStart')?.addEventListener('click', () => refreshColdStart());
     root.querySelector('#refreshIncrementalRecovery')?.addEventListener('click', () => refreshIncrementalRecovery());
+    root.querySelector('#refreshLibra')?.addEventListener('click', () => refreshLibra());
     root.querySelector('#refreshFlashback')?.addEventListener('click', () => refreshFlashback());
     root.querySelector('#refreshHayaku')?.addEventListener('click', () => refreshHayaku());
     const runHayakuTurnJump = async () => {
@@ -6723,8 +6818,8 @@
         if (typeof globalThis.confirm === 'function' && !globalThis.confirm(message)) return;
         setBusy(true);
         try {
-          await deleteHayakuRecord(record);
-          globalThis.alert?.('\uD328\uD0B7\uC744 \uC0AD\uC81C\uD588\uC2B5\uB2C8\uB2E4. tombstone\uC5D0\uC11C \uBCF5\uAD6C\uD560 \uC218 \uC788\uC2B5\uB2C8\uB2E4.');
+          const deletion = await deleteHayakuRecord(record);
+          globalThis.alert?.(`패킷 삭제를 확인했습니다. 활성 원장에서 제외되었으며 tombstone으로 보존됩니다.${deletion?.suppressedRecords ? `\n동일 variant alias ${formatNumber(deletion.suppressedRecords)}개 억제` : ''}`);
           await refreshHayaku();
           await refreshIncrementalRecovery();
         } catch (error) {
@@ -6849,12 +6944,19 @@
         const inspection = await inspectIncrementalRecovery();
         if (!inspection.eligible) throw new Error(inspection.reason);
         const mode = inspection.recommendedMode;
-        const pendingChunks = inspection.stagedRun?.run?.chunks
-          ?.filter(chunk => chunk?.status !== 'verified').length || inspection.evidence.chunks.length;
+        const pendingChunks = mode === 'resume'
+          ? Math.max(0, Number(inspection.checkpointPlan?.pendingChunkCount ?? inspection.evidence.chunks.length) || 0)
+          : inspection.evidence.chunks.length;
+        const reusedChunks = mode === 'resume'
+          ? Math.max(0, Number(inspection.checkpointPlan?.reusedVerifiedCount || 0) || 0)
+          : 0;
         const confirmed = mode === 'readopt'
           ? '저장된 증분 재분석 캡슐을 HAYAKU 원장에 다시 채택합니다. 모델은 호출하지 않습니다.\n\n계속할까요?'
-          : `누락 완료 턴 ${inspection.evidence.coverage.missingTurns.join(', ')}를 ${formatNumber(pendingChunks)}개 청크로 증분 분석합니다.\n`
-            + `이미 커버된 턴과 콜드스타트 epoch는 변경하지 않습니다. Primary 프로필을 최대 ${formatNumber(pendingChunks)}회 호출할 수 있습니다.\n\n계속할까요?`;
+          : mode === 'resume'
+            ? `기존 검증 청크 ${formatNumber(reusedChunks)}개는 그대로 재사용하고 실패·누락·변경 청크 ${formatNumber(pendingChunks)}개만 다시 분석합니다.\n`
+              + `전체 누락 범위는 ${formatNumber(inspection.evidence.chunks.length)}개 청크이며, 실제 Primary 프로필 호출은 최대 ${formatNumber(pendingChunks)}회입니다.\n\n계속할까요?`
+            : `누락 완료 턴 ${inspection.evidence.coverage.missingTurns.join(', ')}를 ${formatNumber(pendingChunks)}개 청크로 증분 분석합니다.\n`
+              + `이미 커버된 턴과 콜드스타트 epoch는 변경하지 않습니다. Primary 프로필을 최대 ${formatNumber(pendingChunks)}회 호출할 수 있습니다.\n\n계속할까요?`;
         if (typeof globalThis.confirm === 'function' && !globalThis.confirm(confirmed)) return;
         const status = root.querySelector('#incrementalRecoveryStatus');
         if (status) status.textContent = mode === 'readopt'
@@ -6868,6 +6970,24 @@
         await refreshIncrementalRecovery();
       } finally {
         if (Runtime.busy) setBusy(false);
+      }
+    });
+    root.querySelector('#exportLibra')?.addEventListener('click', async () => {
+      setBusy(true);
+      try {
+        const result = await readLibraSource(await getCurrentContext());
+        if (!result.pluginAvailable) throw new Error('LIBRA IPC를 사용할 수 없습니다.');
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        if (!downloadJson(`libra-memory-${stamp}.json`, {
+          exportedAt: new Date().toISOString(), plugin: PLUGIN_NAME, pluginVersion: PLUGIN_VERSION,
+          source: result.readSource, libraVersion: result.pluginVersion, scope: result.scope,
+          manifest: result.manifest, integrity: result.integrity, memories: result.memories,
+          worldAdditional: result.worldAdditional
+        })) throw new Error('브라우저 다운로드를 시작하지 못했습니다.');
+      } catch (error) {
+        globalThis.alert?.(`LIBRA 내보내기 실패\n${error?.message || error}`);
+      } finally {
+        setBusy(false);
       }
     });
     root.querySelector('#exportFlashback')?.addEventListener('click', async () => {
@@ -7084,7 +7204,7 @@
     testProvider: () => callProfile('primary', 'Return exactly MEMORY_SESSION_BRIDGE_PROVIDER_OK.', 'Connection test.', { maxTokens: 64, temperature: 0 }),
     readFlashbackViewer: async () => readFlashbackViewer(await getCurrentContext()),
     readHayakuViewer: async () => readHayakuSource(await getCurrentContext()),
-    readLibraViewer: async () => readLibraSource(await getCurrentContext()),
+    readLibraViewer: async () => await readLibraSource(await getCurrentContext()),
     lastTransition: () => clone(Runtime.lastTransition, null),
     lastColdStart: () => clone(Runtime.lastColdStart, null),
     lastIncrementalRecovery: () => clone(Runtime.lastIncrementalRecovery, null),
@@ -7107,11 +7227,11 @@
       recordRegenerationTurns, resolveTurnNavigationTarget,
       extractJsonObject, normalizeBridgeRecallAliases, normalizeColdStartPacket, normalizeIncrementalRecoveryPacket,
       validateBridgeCapsulePacketSet, bridgePacketHasSemanticPayload, priorTurnContextForChunk,
-      libraStableHash, libraScopeKey, unpackLibraLore, effectiveLibraLore,
-      splitLibraMemoryMeta, validateLibraHandoffEntries, readLibraSource,
-      transformLibraHandoffEntry, packLibraLore, buildLibraInheritedLore,
-      verifyDurableLibraSessionHandoff,
+      requestLibraIpc, normalizeLibraInspection, readLibraSource,
+      prepareLibraSessionHandoff, adoptLibraSessionHandoff, adoptLibraSessionHandoffDurable, verifyDurableLibraSessionHandoff,
+      libraMemoryViewerInfo,
       coldStartChunkHash, coldStartConfigHash, incrementalRecoveryConfigHash,
+      incrementalRecoveryCheckpointBodyReusable, incrementalRecoveryCheckpointPlan,
       analysisProgressSnapshot, analysisIsRunning, startBackgroundAnalysisTask,
       hayakuAdoptionDiagnosticText,
       HAYAKU_PACKET_MAX_CHARS, HAYAKU_PACKET_FALLBACK_MAX_CHARS,
@@ -7132,6 +7252,7 @@
 
   await registerFlashbackIpc().catch(error => warn('Flashback IPC registration failed', error));
   await registerHayakuIpc().catch(error => warn('HAYAKU IPC registration failed', error));
+  await registerLibraIpc().catch(error => warn('LIBRA IPC registration failed', error));
   await registerUi();
   const unloadApi = liveApi(['onUnload']);
   if (typeof unloadApi?.onUnload === 'function') {
@@ -7148,6 +7269,11 @@
         pending.reject(new Error('RE:TRACE unloaded before HAYAKU IPC completed.'));
       }
       Runtime.hayakuIpcPending.clear();
+      for (const pending of Runtime.libraIpcPending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('RE:TRACE unloaded before LIBRA IPC completed.'));
+      }
+      Runtime.libraIpcPending.clear();
       try { Runtime.root?.remove?.(); } catch (_) {}
       Runtime.root = null;
       Runtime.mounted = false;

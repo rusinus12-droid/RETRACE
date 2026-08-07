@@ -1,7 +1,7 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.4
+//@version 1.9.5
 //@allowed-ipc libra
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
@@ -13,13 +13,14 @@
   'use strict';
 
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.4';
+  const PLUGIN_VERSION = '1.9.5';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v1';
   const LIBRA_PLUGIN_ID = 'libra';
   const LIBRA_IPC_SCHEMA = 'libra-retrace-ipc-v1';
   const LIBRA_IPC_REQUEST_CHANNEL = 'libra_memory_bridge_request_v1';
   const LIBRA_IPC_RESPONSE_CHANNEL = 'libra_memory_bridge_response_v1';
   const LIBRA_INSPECT_SCHEMA = 'libra.retrace.inspect.v1';
+  const LIBRA_CAPABILITIES_SCHEMA = 'libra.retrace.capabilities.v1';
   const LIBRA_HANDOFF_RECEIPT_SCHEMA = 'libra.session_handoff.receipt.v1';
   const LIBRA_CHAT_HANDOFF_MARKER_SCHEMA = 'retrace.libra_handoff_marker.v1';
   const FLASHBACK_PLUGIN_ID = 'flashback_memory';
@@ -91,7 +92,8 @@
     hayakuIpcUnavailableUntil: 0,
     libraIpcRegistered: false,
     libraIpcPending: new Map(),
-    libraIpcUnavailableUntil: 0,
+    libraIpcLastSeenAt: 0,
+    libraIpcLastError: '',
     warnings: []
   };
 
@@ -1748,12 +1750,15 @@
         const pending = Runtime.libraIpcPending.get(requestId);
         if (!pending) return;
         Runtime.libraIpcPending.delete(requestId);
-        Runtime.libraIpcUnavailableUntil = 0;
+        Runtime.libraIpcLastSeenAt = Date.now();
+        Runtime.libraIpcLastError = response.ok === true ? '' : text(response.error || 'LIBRA IPC request failed.');
         clearTimeout(pending.timer);
         if (response.ok === true) pending.resolve(response.result);
         else {
-          const error = new Error(text(response.error || 'LIBRA IPC request failed.'));
+          const error = new Error(Runtime.libraIpcLastError || 'LIBRA IPC request failed.');
           error.code = 'LIBRA_IPC_REJECTED';
+          error.remoteReachable = true;
+          error.action = pending.action;
           pending.reject(error);
         }
       }
@@ -1763,11 +1768,6 @@
   };
 
   const requestLibraIpc = async (action, payload = {}, options = {}) => {
-    if (Date.now() < Number(Runtime.libraIpcUnavailableUntil || 0)) {
-      const error = new Error('LIBRA IPC is temporarily unavailable after a recent timeout.');
-      error.code = 'LIBRA_IPC_UNAVAILABLE';
-      throw error;
-    }
     const registered = await registerLibraIpc().catch(error => {
       warn('LIBRA IPC listener registration failed', error);
       return false;
@@ -1779,16 +1779,17 @@
       throw error;
     }
     const requestId = uuid();
-    const timeoutMs = Math.max(400, Math.min(20000, Number(options.timeoutMs || 4000) || 4000));
+    const timeoutMs = Math.max(400, Math.min(30000, Number(options.timeoutMs || 4000) || 4000));
     return await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         Runtime.libraIpcPending.delete(requestId);
-        Runtime.libraIpcUnavailableUntil = Date.now() + 10000;
         const error = new Error(`LIBRA IPC timed out after ${timeoutMs}ms.`);
         error.code = 'LIBRA_IPC_TIMEOUT';
+        error.action = text(action || '').trim();
+        Runtime.libraIpcLastError = error.message;
         reject(error);
       }, timeoutMs);
-      Runtime.libraIpcPending.set(requestId, { resolve, reject, timer, action, at: Date.now() });
+      Runtime.libraIpcPending.set(requestId, { resolve, reject, timer, action: text(action || '').trim(), at: Date.now() });
       Promise.resolve(api.postPluginChannelMessage(
         LIBRA_PLUGIN_ID,
         LIBRA_IPC_REQUEST_CHANNEL,
@@ -1798,9 +1799,49 @@
         if (!pending) return;
         Runtime.libraIpcPending.delete(requestId);
         clearTimeout(pending.timer);
+        Runtime.libraIpcLastError = text(error?.message || error);
         reject(error);
       });
     });
+  };
+
+  const probeLibraIpc = async (options = {}) => {
+    const timeoutMs = Math.max(500, Math.min(5000, Number(options.timeoutMs || 1800) || 1800));
+    const attempts = Math.max(1, Math.min(3, Number(options.attempts || 2) || 2));
+    let lastError = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        const result = await requestLibraIpc('ping', {}, { timeoutMs });
+        const schemaOk = result?.schema === LIBRA_CAPABILITIES_SCHEMA;
+        return {
+          available: true,
+          reachable: true,
+          schemaOk,
+          legacy: !schemaOk,
+          pluginVersion: text(result?.pluginVersion || ''),
+          capabilities: result && typeof result === 'object' ? clone(result, {}) : {},
+          attempts: attempt,
+          reason: schemaOk ? 'libra_ping_ok' : 'libra_ping_legacy_response'
+        };
+      } catch (error) {
+        lastError = error;
+        // An explicit IPC rejection proves that LIBRA received the request. Older
+        // LIBRA builds do not know the ping action, so continue with inspect rather
+        // than misreporting the plugin as absent.
+        if (error?.remoteReachable === true || text(error?.code) === 'LIBRA_IPC_REJECTED') {
+          return {
+            available: true, reachable: true, schemaOk: false, legacy: true,
+            pluginVersion: '', capabilities: {}, attempts: attempt,
+            reason: 'libra_ping_rejected_but_reachable', error: text(error?.message || error)
+          };
+        }
+        if (attempt < attempts) await delay(120);
+      }
+    }
+    return {
+      available: false, reachable: false, schemaOk: false, legacy: false, pluginVersion: '', capabilities: {}, attempts,
+      reason: text(lastError?.code || 'libra_ipc_unavailable'), error: text(lastError?.message || lastError || '')
+    };
   };
 
   const activeLibraRuntime = () => {
@@ -5491,6 +5532,7 @@
     return {
       available: schemaOk && scopeMatches && memories.length > 0,
       pluginAvailable: schemaOk,
+      inspectionAvailable: schemaOk && scopeMatches,
       integrityOk,
       reason: !schemaOk ? 'libra_ipc_contract_unavailable'
         : !scopeMatches ? 'libra_scope_mismatch'
@@ -5515,19 +5557,44 @@
 
   const readLibraSource = async context => {
     const identity = contextIdentity(context || await getCurrentContext());
-    try {
-      const inspected = await requestLibraIpc('inspect', {}, { timeoutMs: 3500 });
-      return normalizeLibraInspection(inspected, identity, 'libra_plugin_ipc');
-    } catch (error) {
-      if (!['LIBRA_IPC_UNAVAILABLE', 'LIBRA_IPC_TIMEOUT'].includes(text(error?.code))) {
-        warn('LIBRA IPC inspection failed', error);
+    const probe = await probeLibraIpc({ timeoutMs: 1800, attempts: 2 });
+    if (probe.available) {
+      try {
+        const inspected = await requestLibraIpc('inspect', {}, { timeoutMs: 12000 });
+        const normalized = normalizeLibraInspection(inspected, identity, 'libra_plugin_ipc');
+        normalized.capabilities = clone(probe.capabilities, {});
+        normalized.probe = clone(probe, {});
+        return normalized;
+      } catch (error) {
+        const code = text(error?.code || '').trim();
+        const reason = code === 'LIBRA_IPC_TIMEOUT' ? 'libra_inspect_timeout' : 'libra_inspect_failed';
+        warn('LIBRA IPC inspection failed after successful discovery', error);
+        return {
+          available: false,
+          pluginAvailable: true,
+          inspectionAvailable: false,
+          integrityOk: false,
+          reason,
+          readSource: 'libra_plugin_ipc',
+          pluginVersion: text(probe.pluginVersion || ''),
+          scope: {}, manifest: {}, integrity: { ok: false, reason },
+          memories: [], worldAdditional: [], recordCount: 0, liveRecordCount: 0,
+          inheritedRecordCount: 0, partialRecordCount: 0, worldAdditionalCount: 0,
+          snapshotHash: '', capabilities: clone(probe.capabilities, {}), probe: clone(probe, {}),
+          errors: [text(error?.message || error || reason)]
+        };
       }
     }
+
+    // Same-realm fallback is retained for unusual hosts/tests, but API-v3 iframe
+    // isolation means official plugin IPC remains the authoritative route.
     const runtime = activeLibraRuntime();
     if (runtime && typeof runtime.inspectForRetrace === 'function') {
       try {
         const inspected = await runtime.inspectForRetrace();
-        return normalizeLibraInspection(inspected, identity, 'libra_runtime_api');
+        const normalized = normalizeLibraInspection(inspected, identity, 'libra_runtime_api');
+        normalized.probe = clone(probe, {});
+        return normalized;
       } catch (error) {
         warn('LIBRA runtime inspection failed', error);
       }
@@ -5535,13 +5602,14 @@
     return {
       available: false,
       pluginAvailable: false,
+      inspectionAvailable: false,
       integrityOk: false,
       reason: 'libra_ipc_unavailable',
       readSource: 'none',
       pluginVersion: '', scope: {}, manifest: {}, integrity: { ok: false },
       memories: [], worldAdditional: [], recordCount: 0, liveRecordCount: 0,
       inheritedRecordCount: 0, partialRecordCount: 0, worldAdditionalCount: 0,
-      snapshotHash: '', errors: ['LIBRA v1.0.4 or later IPC contract is required.']
+      snapshotHash: '', probe: clone(probe, {}), errors: [probe.error || 'LIBRA v1.0.4 or later IPC contract is required.']
     };
   };
 
@@ -5785,8 +5853,11 @@
       })}`);
     }
     if (libra.pluginAvailable && libra.integrityOk === false) {
-      throw new Error(`LIBRA canonical memory integrity is incomplete; next-session handoff was stopped. ${JSON.stringify({
-        reason: libra.reason, records: libra.recordCount, integrity: libra.integrity
+      const inspectionFailed = ['libra_inspect_timeout', 'libra_inspect_failed'].includes(text(libra.reason));
+      throw new Error(`${inspectionFailed
+        ? 'LIBRA is connected, but canonical memory inspection could not be verified; next-session handoff was stopped.'
+        : 'LIBRA canonical memory integrity is incomplete; next-session handoff was stopped.'} ${JSON.stringify({
+        reason: libra.reason, records: libra.recordCount, integrity: libra.integrity, errors: libra.errors || []
       })}`);
     }
     const targetChatId = uuid();
@@ -6055,7 +6126,12 @@
       return `<div class="empty"><strong>LIBRA 연결 없음</strong><span>LIBRA v1.0.4 이상을 함께 설치해야 IPC 기억 뷰어와 다음 세션 승계를 사용할 수 있습니다.</span></div>`;
     }
     if (!result?.integrityOk) {
-      return `<div class="empty"><strong>LIBRA 무결성 확인 실패</strong><span>${escapeHtml(result?.reason || 'unknown')}</span></div>`;
+      const inspectFailure = ['libra_inspect_timeout', 'libra_inspect_failed'].includes(text(result?.reason));
+      const title = inspectFailure ? 'LIBRA 연결됨 · 정본 조회 실패' : 'LIBRA 무결성 확인 실패';
+      const detail = Array.isArray(result?.errors) && result.errors.length
+        ? `${result.reason || 'unknown'} · ${result.errors[0]}`
+        : (result?.reason || 'unknown');
+      return `<div class="empty"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(detail)}</span></div>`;
     }
     const memories = Array.isArray(result.memories) ? result.memories : [];
     const ordered = memories.slice().sort((a, b) => (
@@ -6456,7 +6532,11 @@
         : `HAYAKU 제외 (${preview.hayaku.reason})`;
       const libraLine = preview.includeLibra
         ? `LIBRA 정본 메모리 ${formatNumber(preview.libraRecordCount)}개 IPC 승계 준비`
-        : preview.libra.pluginAvailable ? `LIBRA 정본 없음 (${preview.libra.reason})` : 'LIBRA IPC 연결 없음 · LIBRA v1.0.4+ 필요';
+        : preview.libra.pluginAvailable
+          ? ['libra_inspect_timeout', 'libra_inspect_failed'].includes(text(preview.libra.reason))
+            ? `LIBRA 연결됨 · 정본 조회 실패 (${preview.libra.reason})`
+            : `LIBRA 연결됨 · 정본 없음 (${preview.libra.reason})`
+          : 'LIBRA IPC 연결 없음 · LIBRA v1.0.4+ 필요';
       node.textContent = `${libraLine}\n${flashbackLine}\n${hayakuLine}`;
       return preview;
     } catch (error) {
@@ -6977,6 +7057,9 @@
       try {
         const result = await readLibraSource(await getCurrentContext());
         if (!result.pluginAvailable) throw new Error('LIBRA IPC를 사용할 수 없습니다.');
+        if (!result.inspectionAvailable || result.integrityOk === false) {
+          throw new Error(`LIBRA는 연결되어 있지만 정본 조회를 검증하지 못했습니다: ${result.reason || 'unknown'}${result.errors?.[0] ? ` · ${result.errors[0]}` : ''}`);
+        }
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
         if (!downloadJson(`libra-memory-${stamp}.json`, {
           exportedAt: new Date().toISOString(), plugin: PLUGIN_NAME, pluginVersion: PLUGIN_VERSION,
@@ -7227,7 +7310,7 @@
       recordRegenerationTurns, resolveTurnNavigationTarget,
       extractJsonObject, normalizeBridgeRecallAliases, normalizeColdStartPacket, normalizeIncrementalRecoveryPacket,
       validateBridgeCapsulePacketSet, bridgePacketHasSemanticPayload, priorTurnContextForChunk,
-      requestLibraIpc, normalizeLibraInspection, readLibraSource,
+      requestLibraIpc, probeLibraIpc, normalizeLibraInspection, readLibraSource,
       prepareLibraSessionHandoff, adoptLibraSessionHandoff, adoptLibraSessionHandoffDurable, verifyDurableLibraSessionHandoff,
       libraMemoryViewerInfo,
       coldStartChunkHash, coldStartConfigHash, incrementalRecoveryConfigHash,

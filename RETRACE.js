@@ -1,19 +1,20 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.5
+//@version 1.9.13
 //@allowed-ipc libra
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
+//@allowed-ipc lia_persona_linker
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/RETRACE/refs/heads/main/RETRACE.js
-//@description LIBRA, HAYAKU, and Flashback continuity analysis and next-session handoff bridge
+//@description LIBRA, HAYAKU, Flashback, and LIA Live Persona continuity analysis and next-session handoff bridge
 //@author Hayaku
 
 (async () => {
   'use strict';
 
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.5';
+  const PLUGIN_VERSION = '1.9.13';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v1';
   const LIBRA_PLUGIN_ID = 'libra';
   const LIBRA_IPC_SCHEMA = 'libra-retrace-ipc-v1';
@@ -23,6 +24,13 @@
   const LIBRA_CAPABILITIES_SCHEMA = 'libra.retrace.capabilities.v1';
   const LIBRA_HANDOFF_RECEIPT_SCHEMA = 'libra.session_handoff.receipt.v1';
   const LIBRA_CHAT_HANDOFF_MARKER_SCHEMA = 'retrace.libra_handoff_marker.v1';
+  const LIA_PLUGIN_ID = 'lia_persona_linker';
+  const LIA_IPC_SCHEMA = 'lia-persona-handoff-ipc-v1';
+  const LIA_IPC_REQUEST_CHANNEL = 'lia_persona_handoff_request_v1';
+  const LIA_IPC_RESPONSE_CHANNEL = 'lia_persona_handoff_response_v1';
+  const LIA_HANDOFF_RECEIPT_SCHEMA = 'lia.live_persona_handoff.receipt.v1';
+  const LIA_CHAT_HANDOFF_MARKER_SCHEMA = 'retrace.lia_live_persona_handoff.v1';
+  const LIA_LIVE_PERSONA_ID_PREFIX = 'lia-live-persona::';
   const FLASHBACK_PLUGIN_ID = 'flashback_memory';
   const FLASHBACK_IPC_SCHEMA = 'flashback-memory-bridge-ipc-v1';
   const FLASHBACK_IPC_REQUEST_CHANNEL = 'flashback_memory_bridge_request_v1';
@@ -31,6 +39,13 @@
   const HAYAKU_IPC_SCHEMA = 'hayaku-memory-bridge-ipc-v1';
   const HAYAKU_IPC_REQUEST_CHANNEL = 'hayaku_memory_bridge_request_v1';
   const HAYAKU_IPC_RESPONSE_CHANNEL = 'hayaku_memory_bridge_response_v1';
+  const HAYAKU_IPC_MUTATION_ACTIONS = new Set([
+    'adopt_cold_start',
+    'adopt_incremental_recovery',
+    'sync_analysis_capsules',
+    'adopt_session_handoff',
+    'forget'
+  ]);
   const FLASHBACK_REGISTRY_KEY = 'vector_rag_memory:scope_registry:v2';
   const FLASHBACK_SCOPE_PREFIX = 'vector_rag_memory:scope:';
   const HAYAKU_LEDGER_PREFIX = 'hayaku.v2.ledger.';
@@ -94,6 +109,9 @@
     libraIpcPending: new Map(),
     libraIpcLastSeenAt: 0,
     libraIpcLastError: '',
+    liaIpcRegistered: false,
+    liaIpcPending: new Map(),
+    liaIpcLastError: '',
     warnings: []
   };
 
@@ -1600,10 +1618,11 @@
           : {};
         if (response.schema !== FLASHBACK_IPC_SCHEMA || response.kind !== 'response') return;
         const sender = text(metadata?.sender || '').trim();
-        if (sender && sender !== FLASHBACK_PLUGIN_ID) return;
+        if (sender !== FLASHBACK_PLUGIN_ID) return;
         const requestId = text(response.requestId || '').trim();
         const pending = Runtime.flashbackIpcPending.get(requestId);
         if (!pending) return;
+        if (text(response.action || '').trim() !== pending.action) return;
         Runtime.flashbackIpcPending.delete(requestId);
         clearTimeout(pending.timer);
         if (response.ok === true) pending.resolve(response.result);
@@ -1672,6 +1691,10 @@
         const requestId = text(response.requestId || '').trim();
         const pending = Runtime.hayakuIpcPending.get(requestId);
         if (!pending) return;
+        if (text(response.action || '').trim() !== text(pending.action || '').trim()) return;
+        // Mutation receipts must be authenticated by the host-provided sender.
+        // Read-only compatibility probes may still accept legacy hosts that omit it.
+        if (HAYAKU_IPC_MUTATION_ACTIONS.has(pending.action) && sender !== HAYAKU_PLUGIN_ID) return;
         Runtime.hayakuIpcPending.delete(requestId);
         Runtime.hayakuIpcUnavailableUntil = 0;
         clearTimeout(pending.timer);
@@ -1745,10 +1768,11 @@
         const response = message && typeof message === 'object' && !Array.isArray(message) ? message : {};
         if (response.schema !== LIBRA_IPC_SCHEMA || response.kind !== 'response') return;
         const sender = text(metadata?.sender || '').trim();
-        if (sender && sender !== LIBRA_PLUGIN_ID) return;
+        if (sender !== LIBRA_PLUGIN_ID) return;
         const requestId = text(response.requestId || '').trim();
         const pending = Runtime.libraIpcPending.get(requestId);
         if (!pending) return;
+        if (text(response.action || '').trim() !== pending.action) return;
         Runtime.libraIpcPending.delete(requestId);
         Runtime.libraIpcLastSeenAt = Date.now();
         Runtime.libraIpcLastError = response.ok === true ? '' : text(response.error || 'LIBRA IPC request failed.');
@@ -1803,6 +1827,109 @@
         reject(error);
       });
     });
+  };
+
+
+  const registerLiaIpc = async () => {
+    if (Runtime.liaIpcRegistered) return true;
+    const api = liveApi(['addPluginChannelListener', 'postPluginChannelMessage']);
+    if (typeof api?.addPluginChannelListener !== 'function'
+      || typeof api?.postPluginChannelMessage !== 'function') return false;
+    await api.addPluginChannelListener(
+      LIA_IPC_RESPONSE_CHANNEL,
+      (message, metadata = {}) => {
+        const response = message && typeof message === 'object' && !Array.isArray(message) ? message : {};
+        if (response.schema !== LIA_IPC_SCHEMA || response.kind !== 'response') return;
+        const sender = text(metadata?.sender || '').trim();
+        if (sender !== LIA_PLUGIN_ID) return;
+        const requestId = text(response.requestId || '').trim();
+        const pending = Runtime.liaIpcPending.get(requestId);
+        if (!pending) return;
+        if (text(response.action || '').trim() !== pending.action) return;
+        Runtime.liaIpcPending.delete(requestId);
+        clearTimeout(pending.timer);
+        Runtime.liaIpcLastError = response.ok === true ? '' : text(response.error || 'LIA IPC request failed.');
+        if (response.ok === true) pending.resolve(response.result);
+        else {
+          const error = new Error(Runtime.liaIpcLastError || 'LIA IPC request failed.');
+          error.code = 'LIA_IPC_REJECTED';
+          pending.reject(error);
+        }
+      }
+    );
+    Runtime.liaIpcRegistered = true;
+    return true;
+  };
+
+  const requestLiaIpc = async (action, payload = {}, options = {}) => {
+    const registered = await registerLiaIpc().catch(error => {
+      warn('LIA IPC listener registration failed', error);
+      return false;
+    });
+    const api = liveApi(['postPluginChannelMessage']);
+    if (!registered || typeof api?.postPluginChannelMessage !== 'function') {
+      const error = new Error('LIA IPC API is unavailable.');
+      error.code = 'LIA_IPC_UNAVAILABLE';
+      throw error;
+    }
+    const requestId = uuid();
+    const timeoutMs = Math.max(500, Math.min(10000, Number(options.timeoutMs || 3500) || 3500));
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        Runtime.liaIpcPending.delete(requestId);
+        const error = new Error(`LIA IPC timed out after ${timeoutMs}ms.`);
+        error.code = 'LIA_IPC_TIMEOUT';
+        Runtime.liaIpcLastError = error.message;
+        reject(error);
+      }, timeoutMs);
+      Runtime.liaIpcPending.set(requestId, { resolve, reject, timer, action: text(action || '').trim(), at: Date.now() });
+      Promise.resolve(api.postPluginChannelMessage(
+        LIA_PLUGIN_ID,
+        LIA_IPC_REQUEST_CHANNEL,
+        { schema: LIA_IPC_SCHEMA, kind: 'request', requestId, action: text(action || '').trim(), payload: clone(payload, {}) }
+      )).catch(error => {
+        const pending = Runtime.liaIpcPending.get(requestId);
+        if (!pending) return;
+        Runtime.liaIpcPending.delete(requestId);
+        clearTimeout(pending.timer);
+        Runtime.liaIpcLastError = text(error?.message || error);
+        reject(error);
+      });
+    });
+  };
+
+  const isLiaLivePersonaId = value => text(value || '').trim().startsWith(LIA_LIVE_PERSONA_ID_PREFIX);
+
+  const adoptLiaLivePersonaHandoff = async options => {
+    const sourceLivePersonaId = text(options?.sourceLivePersonaId || '').trim();
+    const required = isLiaLivePersonaId(sourceLivePersonaId);
+    if (!required) return {
+      schema: LIA_HANDOFF_RECEIPT_SCHEMA,
+      action: 'adopted', adopted: false, verified: true, durable: true,
+      sourceChatId: text(options?.sourceChatId || ''), targetChatId: text(options?.targetChatId || ''),
+      transferId: text(options?.transferId || ''), sourceLivePersonaId: '', livePersonaId: '', reason: 'no_lia_live_persona'
+    };
+    try {
+      const result = await requestLiaIpc('adopt_chat_handoff', {
+        sourceChatId: text(options?.sourceChatId || ''),
+        targetChatId: text(options?.targetChatId || ''),
+        transferId: text(options?.transferId || ''),
+        sourceLivePersonaId,
+        mode: 'retrace'
+      }, { timeoutMs: 5000 });
+      return result && typeof result === 'object' ? result : {
+        schema: LIA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: false, durable: false,
+        sourceChatId: text(options?.sourceChatId || ''), targetChatId: text(options?.targetChatId || ''),
+        transferId: text(options?.transferId || ''), sourceLivePersonaId, livePersonaId: '', reason: 'lia_invalid_response'
+      };
+    } catch (error) {
+      return {
+        schema: LIA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: false, durable: false,
+        sourceChatId: text(options?.sourceChatId || ''), targetChatId: text(options?.targetChatId || ''),
+        transferId: text(options?.transferId || ''), sourceLivePersonaId, livePersonaId: '',
+        reason: text(error?.code || error?.message || 'lia_handoff_failed'), error: text(error?.message || error)
+      };
+    }
   };
 
   const probeLibraIpc = async (options = {}) => {
@@ -1931,15 +2058,21 @@
           transport = 'risu_plugin_ipc';
         }
         const strictReceipt = last?.schema === 'flashback_memory.session_handoff_adoption.v2';
-        const receiptMatches = last?.verified === true
-          && last?.durable !== false
-          && (!strictReceipt || (
-            text(last.targetChatId || '') === targetChatId
-            && text(last.transferId || '') === transferId
-            && text(last.sourceScopeKey || '') === sourceScopeKey
-            && Number(last.records || 0) === expectedRecords
-            && Number(last.expectedRecords || 0) === expectedRecords
-          ));
+        const identityMatches = text(last?.targetChatId || '') === targetChatId
+          && text(last?.transferId || '') === transferId
+          && text(last?.sourceScopeKey || '') === sourceScopeKey
+          && Number(last?.records || 0) === expectedRecords
+          && Number(last?.expectedRecords || 0) === expectedRecords;
+        const ownerMatches = transport !== 'risu_plugin_ipc' || (
+          text(last?.mutation || '') === 'adopt_session_handoff'
+          && text(last?.ownerPluginId || '') === FLASHBACK_PLUGIN_ID
+          && text(last?.authorizedRequester || '') === 'flashback_hayaku_bridge'
+        );
+        const receiptMatches = strictReceipt
+          && last?.verified === true
+          && last?.durable === true
+          && identityMatches
+          && ownerMatches;
         if (receiptMatches) {
           return {
             ...last,
@@ -1978,6 +2111,8 @@
   };
 
   const flashbackSourceFromInspection = (inspected, identity, readSource) => {
+    if (readSource === 'flashback_plugin_ipc'
+      && inspected?.schema !== 'flashback_memory_ledger_inspection_v1') return null;
     const sourceScope = inspected?.scope && typeof inspected.scope === 'object'
       ? inspected.scope
       : null;
@@ -2041,13 +2176,14 @@
     }
 
     try {
-      const inspected = await requestFlashbackIpc('inspect', { includeRecords: false }, { timeoutMs: 1800 });
+      const inspected = await requestFlashbackIpc('inspect', { includeRecords: true }, { timeoutMs: 1800 });
       const normalized = flashbackSourceFromInspection(inspected, identity, 'flashback_plugin_ipc');
-      if (normalized) return normalized;
-      warn('Flashback IPC ledger scope mismatch; falling back to pluginStorage', {
+      if (normalized && Array.isArray(normalized.runtimeItems)) return normalized;
+      warn('Flashback IPC ledger records or scope unavailable; falling back to legacy pluginStorage', {
         expectedChatId: identity.chatId,
         ipcChatId: text(inspected?.scope?.chatId || ''),
-        ipcScopeKey: text(inspected?.scope?.scopeKey || '')
+        ipcScopeKey: text(inspected?.scope?.scopeKey || ''),
+        recordsIncluded: inspected?.recordsIncluded === true
       });
     } catch (error) {
       if (text(error?.code || '') !== 'FLASHBACK_IPC_UNAVAILABLE') {
@@ -2184,7 +2320,7 @@
     if (!source.sourceScope?.scopeKey || !source.manifest) {
       return { ...source, items: [], loadedRecords: 0, missingShards: 0, corruptShards: 0, stats: { byType: {} } };
     }
-    if (source.readSource === 'flashback_runtime_api' && Array.isArray(source.runtimeItems)) {
+    if (Array.isArray(source.runtimeItems)) {
       const items = source.runtimeItems;
       const manifestRecords = Math.max(0, Number(source.manifest?.count || source.records || 0) || 0);
       const missingShards = Math.max(0, Number(source.missingShards || source.manifest?.missingShards || 0) || 0);
@@ -2212,18 +2348,8 @@
       };
     }
     const scopeKey = source.sourceScope.scopeKey;
-    let manifest = source.manifest;
-    let manifestKey = text(source.manifestKey || '');
-    if (source.readSource === 'flashback_plugin_ipc') {
-      const sharedManifestKey = `${FLASHBACK_SCOPE_PREFIX}${flashbackKeyHash(scopeKey)}:manifest:v2`;
-      const sharedManifest = parseJson(await storageGet(sharedManifestKey), null);
-      if (sharedManifest
-        && typeof sharedManifest === 'object'
-        && text(sharedManifest.scopeKey || '') === text(scopeKey)) {
-        manifest = sharedManifest;
-        manifestKey = sharedManifestKey;
-      }
-    }
+    const manifest = source.manifest;
+    const manifestKey = text(source.manifestKey || '');
     const shardCount = Math.max(0, Math.min(2048, Number(manifest.shardCount || 0) || 0));
     const shards = [];
     for (let offset = 0; offset < shardCount; offset += 8) {
@@ -2717,6 +2843,15 @@
     return candidates.find(candidate => typeof candidate?.ledger?.[method] === 'function') || null;
   };
 
+  const hayakuMutationReceiptMatches = (result, transport, mutation) => (
+    transport !== 'hayaku_plugin_ipc'
+    || (
+      text(result?.mutation || '') === mutation
+      && text(result?.ownerPluginId || '') === HAYAKU_PLUGIN_ID
+      && text(result?.authorizedRequester || '') === 'flashback_hayaku_bridge'
+    )
+  );
+
   const adoptHayakuSessionHandoff = async (options = {}) => {
     const targetChatId = text(options.targetChatId || '').trim();
     const transferId = text(options.transferId || '').trim();
@@ -2725,7 +2860,7 @@
     if (expectedRecords <= 0) {
       return {
         ok: true,
-        available: Boolean(activeHayakuRuntime('adoptSessionHandoff')),
+        available: true,
         attempted: false,
         verified: true,
         adopted: false,
@@ -2734,57 +2869,92 @@
         reason: 'no_hayaku_records'
       };
     }
-    const runtime = activeHayakuRuntime('adoptSessionHandoff');
-    if (!runtime) {
-      return {
-        ok: false,
-        available: false,
-        attempted: false,
-        verified: false,
-        adopted: false,
-        durable: false,
-        records: 0,
-        reason: 'hayaku_adoption_api_unavailable'
-      };
-    }
-
     let last = null;
+    let lastTransport = '';
+    let lastError = null;
+    let attempted = false;
     const attempts = Math.max(1, Math.min(10, Number(options.attempts || 8) || 8));
+    const request = { targetChatId, transferId, sourceScopeKey, expectedRecords };
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
-        last = await runtime.ledger.adoptSessionHandoff({
-          targetChatId,
-          transferId,
-          sourceScopeKey,
-          expectedRecords
-        });
-        if (last?.verified === true && last?.durable !== false) {
+        attempted = true;
+        lastTransport = 'hayaku_plugin_ipc';
+        last = await requestHayakuIpc(
+          'adopt_session_handoff',
+          clone(request, request),
+          { timeoutMs: 7000 }
+        );
+        lastError = null;
+      } catch (error) {
+        lastError = error;
+        const code = text(error?.code || '').trim();
+        const runtime = ['HAYAKU_IPC_UNAVAILABLE', 'HAYAKU_IPC_TIMEOUT'].includes(code)
+          ? activeHayakuRuntime('adoptSessionHandoff')
+          : null;
+        if (runtime) {
+          try {
+            lastTransport = 'shared_runtime_fallback';
+            last = await runtime.ledger.adoptSessionHandoff(clone(request, request));
+            lastError = null;
+          } catch (runtimeError) {
+            lastError = runtimeError;
+            last = null;
+          }
+        } else {
+          last = null;
+        }
+      }
+      const ownerReceipt = hayakuMutationReceiptMatches(
+        last,
+        lastTransport,
+        'adopt_session_handoff'
+      );
+      const identityMatches = text(last?.targetChatId || '') === targetChatId
+        && text(last?.transferId || '') === transferId
+        && text(last?.sourceScopeKey || '') === sourceScopeKey;
+      const recordsMatch = Math.max(0, Number(last?.records || 0) || 0) === expectedRecords;
+      if (last?.verified === true && last?.durable === true
+        && ownerReceipt && identityMatches && recordsMatch) {
           return {
             ...last,
             ok: true,
             available: true,
             attempted: true,
             attempts: attempt,
+            transport: lastTransport,
             verified: true,
             durable: true
           };
-        }
-      } catch (error) {
-        last = { ok: false, verified: false, durable: false, reason: text(error?.message || error) || 'hayaku_adoption_failed' };
       }
       if (attempt < attempts) await delay(100);
     }
+    const errorCode = text(lastError?.code || '').trim();
+    const errorReason = text(lastError?.message || lastError || '').trim();
     return {
       ...(last && typeof last === 'object' ? last : {}),
       ok: false,
-      available: true,
-      attempted: true,
+      available: Boolean(last) || !['HAYAKU_IPC_UNAVAILABLE', 'HAYAKU_IPC_TIMEOUT'].includes(errorCode),
+      attempted,
       attempts,
+      transport: lastTransport || 'hayaku_plugin_ipc',
       verified: false,
       adopted: false,
       durable: false,
       records: Math.max(0, Number(last?.records || 0) || 0),
-      reason: text(last?.reason || 'hayaku_adoption_not_verified')
+      reason: text(last?.reason || errorReason || 'hayaku_adoption_not_verified'),
+      diagnostics: {
+        expectedRecords,
+        observedRecords: Math.max(0, Number(last?.records || 0) || 0),
+        targetChatMatches: text(last?.targetChatId || '') === targetChatId,
+        transferMatches: text(last?.transferId || '') === transferId,
+        sourceScopeMatches: text(last?.sourceScopeKey || '') === sourceScopeKey,
+        ownerReceipt: hayakuMutationReceiptMatches(
+          last,
+          lastTransport,
+          'adopt_session_handoff'
+        ),
+        errorCode
+      }
     };
   };
 
@@ -2854,6 +3024,7 @@
       const persistent = await verifyDurableHayakuColdStart(capsule);
       const verified = result?.verified === true
         && result?.durable === true
+        && hayakuMutationReceiptMatches(result, dispatched.transport, 'adopt_cold_start')
         && persistent.verified === true;
       return {
         ok: verified,
@@ -2878,7 +3049,10 @@
         scopeKey: text(result?.scopeKey || persistent.scopeKey || ''),
         epochId: text(result?.epochId || persistent.epochId || ''),
         transferId: text(result?.transferId || persistent.transferId || ''),
-        sourceHash: text(result?.sourceHash || persistent.sourceHash || '')
+        sourceHash: text(result?.sourceHash || persistent.sourceHash || ''),
+        mutation: text(result?.mutation || ''),
+        ownerPluginId: text(result?.ownerPluginId || ''),
+        authorizedRequester: text(result?.authorizedRequester || '')
       };
     } catch (error) {
       warn('HAYAKU cold-start immediate adoption failed', error);
@@ -2939,6 +3113,7 @@
       const persistent = await verifyDurableHayakuIncrementalRecovery(capsule);
       const verified = result?.verified === true
         && result?.durable === true
+        && hayakuMutationReceiptMatches(result, dispatched.transport, 'adopt_incremental_recovery')
         && persistent.verified === true;
       return {
         ok: verified,
@@ -2960,7 +3135,10 @@
           ? persistent.recoveredTurns
           : (Array.isArray(result?.recoveredTurns) ? result.recoveredTurns : []),
         replacedRecords: Math.max(0, Number(persistent.replacedRecords || result?.replacedRecords || 0) || 0),
-        diagnostics: persistent?.diagnostics || result?.diagnostics || null
+        diagnostics: persistent?.diagnostics || result?.diagnostics || null,
+        mutation: text(result?.mutation || ''),
+        ownerPluginId: text(result?.ownerPluginId || ''),
+        authorizedRequester: text(result?.authorizedRequester || '')
       };
     } catch (error) {
       warn('HAYAKU incremental recovery immediate adoption failed', error);
@@ -5443,17 +5621,45 @@
     if (text(record.recordState).toLowerCase() === 'tombstoned') {
       return { ok: true, forgotten: false, reason: 'already_tombstoned', recoverable: true, verified: true };
     }
-    const runtime = activeHayakuRuntime('forget');
-    if (!runtime) throw new Error('HAYAKU ledger deletion API is unavailable.');
-    const result = await runtime.ledger.forget({
+    const mutationTarget = {
       recordId: text(record.recordId),
       variantHash: text(record.hash),
       slotId: hayakuRecordSlotId(record),
       targetPairIndex: Math.max(0, Number(record?.targetPairIndex || 0) || 0),
       reason: 'bridge_packet_viewer_delete',
       intent: 'user_suppressed'
-    });
-    if (result?.ok !== true || result?.durable === false) {
+    };
+    let result = null;
+    let transport = 'hayaku_plugin_ipc';
+    try {
+      result = await requestHayakuIpc(
+        'forget',
+        { target: clone(mutationTarget, mutationTarget) },
+        { timeoutMs: 7000 }
+      );
+    } catch (error) {
+      const code = text(error?.code || '').trim();
+      if (!['HAYAKU_IPC_UNAVAILABLE', 'HAYAKU_IPC_TIMEOUT'].includes(code)) throw error;
+      // Legacy/shared-realm hosts may expose HAYAKU directly. API v3 normally
+      // reaches the owner ledger through the authenticated IPC branch above.
+      const runtime = activeHayakuRuntime('forget');
+      if (!runtime) {
+        const unavailable = new Error(`HAYAKU owner-ledger deletion API is unavailable (${code || 'ipc_unavailable'}).`);
+        unavailable.code = code || 'HAYAKU_IPC_UNAVAILABLE';
+        throw unavailable;
+      }
+      transport = 'shared_runtime_fallback';
+      result = await runtime.ledger.forget(clone(mutationTarget, mutationTarget));
+    }
+    if (transport === 'hayaku_plugin_ipc'
+      && (
+        result?.mutation !== 'forget'
+        || result?.ownerPluginId !== HAYAKU_PLUGIN_ID
+        || result?.authorizedRequester !== 'flashback_hayaku_bridge'
+      )) {
+      throw new Error('HAYAKU returned an invalid owner-ledger deletion receipt.');
+    }
+    if (result?.ok !== true || result?.durable !== true) {
       throw new Error(`${text(result?.reason || 'HAYAKU packet deletion failed.')}: ${JSON.stringify({
         recordId: text(record.recordId),
         variantHash: text(record.hash),
@@ -5472,7 +5678,7 @@
         readSource: verification?.readSource || ''
       })}`);
     }
-    return clone({ ...result, verified: true, verification }, result);
+    return clone({ ...result, transport, verified: true, verification }, result);
   };
 
   const regenerateHayakuRecord = async target => {
@@ -5530,14 +5736,14 @@
       worldAdditional: worldAdditional.map(item => [text(item.itemId || ''), text(item.status || ''), stableHash64(text(item.content || ''))])
     }));
     return {
-      available: schemaOk && scopeMatches && memories.length > 0,
+      available: schemaOk && scopeMatches && (memories.length > 0 || worldAdditional.length > 0),
       pluginAvailable: schemaOk,
       inspectionAvailable: schemaOk && scopeMatches,
       integrityOk,
       reason: !schemaOk ? 'libra_ipc_contract_unavailable'
         : !scopeMatches ? 'libra_scope_mismatch'
           : !integrityOk ? 'libra_integrity_failed'
-            : memories.length ? 'loaded' : 'empty',
+            : (memories.length || worldAdditional.length) ? 'loaded' : 'empty',
       readSource,
       pluginVersion: text(source.pluginVersion || ''),
       scope,
@@ -5613,15 +5819,83 @@
     };
   };
 
+  const libraReceiptCountMatches = (receipt, field, expected) => (
+    Boolean(receipt && Object.prototype.hasOwnProperty.call(receipt, field))
+    && Number.isInteger(Number(receipt[field]))
+    && Number(receipt[field]) === expected
+  );
+
+  const libraOwnerReceiptMatches = (receipt, transport, mutation) => (
+    transport !== 'libra_plugin_ipc'
+    || (
+      text(receipt?.ownerPluginId || '') === LIBRA_PLUGIN_ID
+      && text(receipt?.authorizedRequester || '') === 'flashback_hayaku_bridge'
+      && text(receipt?.mutation || '') === mutation
+    )
+  );
+
+  const libraPreparationReceiptMatches = (receipt, options, transport) => {
+    const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
+    const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
+    return receipt?.schema === LIBRA_HANDOFF_RECEIPT_SCHEMA
+      && receipt?.action === 'prepared'
+      && receipt?.prepared === true
+      && receipt?.durable === true
+      && text(receipt?.transferId || '') === text(options?.transferId || '')
+      && libraReceiptCountMatches(receipt, 'records', expectedRecords)
+      && libraReceiptCountMatches(receipt, 'expectedRecords', expectedRecords)
+      && libraReceiptCountMatches(receipt, 'worldAdditional', expectedWorldAdditional)
+      && libraReceiptCountMatches(receipt, 'expectedWorldAdditional', expectedWorldAdditional)
+      && libraOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
+  };
+
+  const libraAdoptionReceiptMatches = (receipt, options, transport) => {
+    const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
+    const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
+    return receipt?.schema === LIBRA_HANDOFF_RECEIPT_SCHEMA
+      && receipt?.action === 'adopted'
+      && receipt?.adopted === true
+      && receipt?.verified === true
+      && receipt?.durable === true
+      && text(receipt?.targetChatId || '') === text(options?.targetChatId || '')
+      && text(receipt?.transferId || '') === text(options?.transferId || '')
+      && libraReceiptCountMatches(receipt, 'records', expectedRecords)
+      && libraReceiptCountMatches(receipt, 'expectedRecords', expectedRecords)
+      && libraReceiptCountMatches(receipt, 'worldAdditional', expectedWorldAdditional)
+      && libraReceiptCountMatches(receipt, 'expectedWorldAdditional', expectedWorldAdditional)
+      && libraOwnerReceiptMatches(receipt, transport, 'adopt_session_handoff');
+  };
+
+  const libraVerificationReceiptMatches = (receipt, options, transport) => {
+    const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
+    const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
+    return receipt?.schema === LIBRA_HANDOFF_RECEIPT_SCHEMA
+      && receipt?.action === 'verified'
+      && receipt?.verified === true
+      && receipt?.durable === true
+      && text(receipt?.targetChatId || '') === text(options?.targetChatId || '')
+      && text(receipt?.transferId || '') === text(options?.transferId || '')
+      && libraReceiptCountMatches(receipt, 'records', expectedRecords)
+      && libraReceiptCountMatches(receipt, 'expectedRecords', expectedRecords)
+      && libraReceiptCountMatches(receipt, 'worldAdditional', expectedWorldAdditional)
+      && libraReceiptCountMatches(receipt, 'expectedWorldAdditional', expectedWorldAdditional)
+      && libraOwnerReceiptMatches(receipt, transport, 'verify_session_handoff');
+  };
+
   const prepareLibraSessionHandoff = async options => {
     const runtime = activeLibraRuntime();
     try {
       const result = await requestLibraIpc('prepare_session_handoff', options || {}, { timeoutMs: 6000 });
-      if (result?.schema !== LIBRA_HANDOFF_RECEIPT_SCHEMA || result?.prepared !== true) throw new Error('LIBRA handoff preparation receipt is invalid.');
+      if (!libraPreparationReceiptMatches(result, options, 'libra_plugin_ipc')) {
+        throw new Error('LIBRA handoff preparation receipt is invalid.');
+      }
       return { ...result, transport: 'libra_plugin_ipc' };
     } catch (error) {
       if (runtime && typeof runtime.prepareSessionHandoff === 'function') {
         const result = await runtime.prepareSessionHandoff(options || {});
+        if (!libraPreparationReceiptMatches(result, options, 'libra_runtime_api')) {
+          throw new Error('LIBRA runtime handoff preparation receipt is invalid.');
+        }
         return { ...result, transport: 'libra_runtime_api' };
       }
       throw error;
@@ -5630,6 +5904,7 @@
 
   const adoptLibraSessionHandoff = async options => {
     const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
+    const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
     const runtime = activeLibraRuntime();
     try {
       const result = await requestLibraIpc('adopt_session_handoff', options || {}, { timeoutMs: 12000 });
@@ -5646,7 +5921,8 @@
       return {
         schema: LIBRA_HANDOFF_RECEIPT_SCHEMA,
         action: 'adopted', adopted: false, verified: false, durable: false,
-        records: 0, expectedRecords, targetChatId: text(options?.targetChatId || ''),
+        records: 0, expectedRecords, worldAdditional: 0, expectedWorldAdditional,
+        targetChatId: text(options?.targetChatId || ''),
         transferId: text(options?.transferId || ''), transport: 'unavailable',
         reason: text(error?.message || error || 'libra_handoff_adoption_failed')
       };
@@ -5655,17 +5931,24 @@
 
   const adoptLibraSessionHandoffDurable = async options => {
     const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
+    const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
     let last = null;
     const maxAttempts = 4;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       last = await adoptLibraSessionHandoff(options || {});
-      const records = Math.max(0, Number(last?.records || 0) || 0);
-      if (last?.verified === true && last?.durable !== false && records === expectedRecords) {
+      const receiptMatches = libraAdoptionReceiptMatches(last, options, last?.transport);
+      if (receiptMatches) {
         return { ...last, attempts: attempt };
       }
       if (attempt < maxAttempts) await delay(Math.min(1200, 220 * attempt));
     }
-    return { ...(last || {}), attempts: maxAttempts };
+    return {
+      ...(last || {}),
+      attempts: maxAttempts,
+      verified: false,
+      durable: false,
+      reason: 'libra_handoff_receipt_mismatch'
+    };
   };
 
   const verifyDurableLibraSessionHandoff = async options => {
@@ -5676,24 +5959,32 @@
     const payload = {
       transferId: text(options?.transferId || ''),
       targetChatId: text(options?.targetChatId || ''),
-      expectedRecords: Math.max(0, Number(options?.expectedRecords || 0) || 0)
+      expectedRecords: Math.max(0, Number(options?.expectedRecords || 0) || 0),
+      expectedWorldAdditional: Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0)
     };
     const runtime = activeLibraRuntime();
     try {
       const result = await requestLibraIpc('verify_session_handoff', payload, { timeoutMs: 6000 });
-      return { ...result, transport: 'libra_plugin_ipc' };
+      const receiptMatches = libraVerificationReceiptMatches(result, payload, 'libra_plugin_ipc');
+      return receiptMatches
+        ? { ...result, transport: 'libra_plugin_ipc' }
+        : { ...result, verified: false, durable: false, transport: 'libra_plugin_ipc', reason: 'libra_handoff_receipt_mismatch' };
     } catch (error) {
       if (runtime && typeof runtime.verifySessionHandoff === 'function') {
         try {
           const result = await runtime.verifySessionHandoff(payload);
-          return { ...result, transport: 'libra_runtime_api' };
+          return libraVerificationReceiptMatches(result, payload, 'libra_runtime_api')
+            ? { ...result, transport: 'libra_runtime_api' }
+            : { ...result, verified: false, durable: false, transport: 'libra_runtime_api', reason: 'libra_handoff_receipt_mismatch' };
         } catch (runtimeError) {
           error = runtimeError;
         }
       }
       return {
         schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: false, durable: false,
-        records: 0, expectedRecords: payload.expectedRecords, targetChatId: payload.targetChatId,
+        records: 0, expectedRecords: payload.expectedRecords,
+        worldAdditional: 0, expectedWorldAdditional: payload.expectedWorldAdditional,
+        targetChatId: payload.targetChatId,
         transferId: payload.transferId, transport: 'unavailable',
         reason: text(error?.message || error || 'libra_handoff_verification_failed')
       };
@@ -5838,6 +6129,13 @@
     return { writer: 'setCharacter', characterIndex };
   };
 
+  const requiredHandoffsVerified = status => (
+    (status?.flashbackRequired !== true || status?.flashbackVerified === true)
+    && (status?.hayakuRequired !== true || status?.hayakuVerified === true)
+    && (status?.libraRequired !== true || status?.libraVerified === true)
+    && (status?.liaRequired !== true || status?.liaVerified === true)
+  );
+
   const continueToNextSession = async () => {
     const preview = await inspectTransition();
     const { context, identity, flashback, hayaku, libra, pendingColdStart } = preview;
@@ -5863,10 +6161,20 @@
     const targetChatId = uuid();
     const transferId = uuid();
     const createdAt = Date.now();
+    const sourceLivePersonaId = text(identity.personaId || '').trim();
+    const liaRequired = isLiaLivePersonaId(sourceLivePersonaId);
     const libraPreparation = preview.includeLibra
-      ? await prepareLibraSessionHandoff({ transferId, expectedRecords: libra.recordCount })
-      : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, prepared: false, records: 0, reason: 'no_libra_data' };
-    if (preview.includeLibra && (libraPreparation.prepared !== true || Number(libraPreparation.records || 0) !== Number(libra.recordCount || 0))) {
+      ? await prepareLibraSessionHandoff({
+        transferId,
+        expectedRecords: libra.recordCount,
+        expectedWorldAdditional: libra.worldAdditionalCount
+      })
+      : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, prepared: false, records: 0, worldAdditional: 0, reason: 'no_libra_data' };
+    if (preview.includeLibra && (
+      libraPreparation.prepared !== true
+      || Number(libraPreparation.records || 0) !== Number(libra.recordCount || 0)
+      || Number(libraPreparation.worldAdditional || 0) !== Number(libra.worldAdditionalCount || 0)
+    )) {
       throw new Error(`LIBRA next-session handoff preparation failed before creating the new chat: ${libraPreparation.reason || 'record_count_mismatch'}`);
     }
 
@@ -5881,6 +6189,12 @@
       fmIndex: -1,
       id: targetChatId,
       copiedFromChatId: identity.chatId,
+      ...(liaRequired ? {
+        liaLivePersonaHandoff: {
+          schema: LIA_CHAT_HANDOFF_MARKER_SCHEMA,
+          transferId, sourceChatId: identity.chatId, targetChatId, sourceLivePersonaId, createdAt
+        }
+      } : {}),
       ...(flashback.sourceScope?.scopeKey ? { copiedFromScopeKey: text(flashback.sourceScope.scopeKey) } : {}),
       ...(preview.includeLibra ? {
         libraMemoryHandoff: {
@@ -5888,6 +6202,7 @@
           transferId, sourceChatId: identity.chatId, targetChatId,
           sourceScopeKey: text(libra.scope?.scopeKey || ''),
           recordCount: libra.recordCount,
+          worldAdditionalCount: libra.worldAdditionalCount,
           preparedAt: libraPreparation.preparedAt || new Date(createdAt).toISOString()
         }
       } : {}),
@@ -5903,14 +6218,22 @@
         includeFlashback: true,
         includeHayaku: preview.includeHayaku === true,
         includeLibra: preview.includeLibra === true,
+        includeLiaLivePersona: liaRequired,
+        sourceLiaLivePersonaId: liaRequired ? sourceLivePersonaId : '',
         flashbackRecordCount: Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0),
         hayakuRecordCount: preview.hayakuRecordCount,
         libraRecordCount: libra.recordCount,
+        libraWorldAdditionalCount: libra.worldAdditionalCount,
         createdAt
       }
     };
-    for (const key of ['bindedPersona', 'boundPersona', 'personaId', 'selectedPersona', 'persona']) {
-      if (Object.prototype.hasOwnProperty.call(context.chat, key)) newChat[key] = clone(context.chat[key], context.chat[key]);
+    // Never make the new chat temporarily share an LIA-managed Live Persona.
+    // LIA creates and verifies a target-chat-specific fork through IPC below.
+    // Sharing the source Live ID even briefly can race with cleanup/rebinding logic.
+    if (!liaRequired) {
+      for (const key of ['bindedPersona', 'boundPersona', 'personaId', 'selectedPersona', 'persona']) {
+        if (Object.prototype.hasOwnProperty.call(context.chat, key)) newChat[key] = clone(context.chat[key], context.chat[key]);
+      }
     }
     nextCharacter.chats.unshift(newChat);
     nextCharacter.chatPage = 0;
@@ -5922,14 +6245,17 @@
     }
     if (preview.includeLibra) {
       const latestLibra = await readLibraSource(latest);
-      if (!latestLibra.integrityOk || latestLibra.snapshotHash !== libra.snapshotHash || latestLibra.recordCount !== libra.recordCount) {
+      if (!latestLibra.integrityOk
+        || latestLibra.snapshotHash !== libra.snapshotHash
+        || latestLibra.recordCount !== libra.recordCount
+        || latestLibra.worldAdditionalCount !== libra.worldAdditionalCount) {
         throw new Error('LIBRA canonical memory changed during handoff preparation. Run the transition again.');
       }
     }
     const writer = await saveCharacter(nextCharacter, context.characterIndex);
     const flashbackRecords = Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0);
     const hayakuRecords = Math.max(0, Number(preview.hayakuRecordCount || 0) || 0);
-    const [flashbackAdoption, hayakuAdoption, libraAdoptionInitial] = await Promise.all([
+    const [flashbackAdoption, hayakuAdoption, libraAdoptionInitial, liaAdoption] = await Promise.all([
       adoptFlashbackSessionHandoff({
         targetChatId, transferId, sourceScopeKey: text(flashback.sourceScope?.scopeKey || ''), expectedRecords: flashbackRecords
       }),
@@ -5937,32 +6263,94 @@
         targetChatId, transferId, sourceScopeKey: text(hayaku.scope?.scopeKey || ''), expectedRecords: preview.includeHayaku === true ? hayakuRecords : 0
       }),
       preview.includeLibra
-        ? adoptLibraSessionHandoffDurable({ targetChatId, transferId, expectedRecords: libra.recordCount })
-        : Promise.resolve({ schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, verified: true, durable: true, records: 0, reason: 'no_libra_data' })
+        ? adoptLibraSessionHandoffDurable({
+          targetChatId,
+          transferId,
+          expectedRecords: libra.recordCount,
+          expectedWorldAdditional: libra.worldAdditionalCount
+        })
+        : Promise.resolve({
+          schema: LIBRA_HANDOFF_RECEIPT_SCHEMA,
+          verified: true,
+          durable: true,
+          records: 0,
+          expectedRecords: 0,
+          worldAdditional: 0,
+          expectedWorldAdditional: 0,
+          reason: 'no_libra_data'
+        }),
+      adoptLiaLivePersonaHandoff({ sourceChatId: identity.chatId, targetChatId, transferId, sourceLivePersonaId })
     ]);
     const libraAdoption = preview.includeLibra && libraAdoptionInitial?.verified !== true
-      ? await verifyDurableLibraSessionHandoff({ included: true, targetChatId, transferId, expectedRecords: libra.recordCount })
+      ? await verifyDurableLibraSessionHandoff({
+        included: true,
+        targetChatId,
+        transferId,
+        expectedRecords: libra.recordCount,
+        expectedWorldAdditional: libra.worldAdditionalCount
+      })
       : libraAdoptionInitial;
+    const flashbackVerified = flashbackAdoption?.verified === true
+      && flashbackAdoption?.durable === true
+      && Math.max(0, Number(flashbackAdoption?.records || 0) || 0) === flashbackRecords;
+    const flashbackRequired = flashbackRecords > 0;
+    const hayakuVerified = hayakuAdoption?.verified === true
+      && hayakuAdoption?.durable === true
+      && Math.max(0, Number(hayakuAdoption?.records || 0) || 0) === hayakuRecords;
+    const hayakuRequired = preview.includeHayaku === true && hayakuRecords > 0;
+    const libraRequired = preview.includeLibra === true;
+    const libraVerified = libraAdoption?.verified === true
+      && libraAdoption?.durable === true
+      && text(libraAdoption?.targetChatId || '') === targetChatId
+      && text(libraAdoption?.transferId || '') === transferId
+      && Number(libraAdoption?.records || 0) === Number(libra.recordCount || 0)
+      && Number(libraAdoption?.worldAdditional || 0) === Number(libra.worldAdditionalCount || 0);
+    const liaVerified = !liaRequired || (
+      liaAdoption?.schema === LIA_HANDOFF_RECEIPT_SCHEMA
+      && liaAdoption?.verified === true
+      && liaAdoption?.durable === true
+      && text(liaAdoption?.sourceChatId || '') === identity.chatId
+      && text(liaAdoption?.targetChatId || '') === targetChatId
+      && text(liaAdoption?.transferId || '') === transferId
+      && text(liaAdoption?.sourceLivePersonaId || '') === sourceLivePersonaId
+      && isLiaLivePersonaId(liaAdoption?.livePersonaId || '')
+      && text(liaAdoption?.livePersonaId || '') !== sourceLivePersonaId
+    );
     const result = {
-      ok: true,
+      ok: requiredHandoffsVerified({
+        flashbackRequired,
+        flashbackVerified,
+        hayakuRequired,
+        hayakuVerified,
+        libraRequired,
+        libraVerified,
+        liaRequired,
+        liaVerified
+      }),
       schema: HANDOFF_SCHEMA,
       transferId,
       sourceChatId: identity.chatId,
       targetChatId,
-      flashbackScheduled: flashbackRecords > 0 && flashbackAdoption.verified !== true,
-      flashbackVerified: flashbackAdoption.verified === true && flashbackAdoption.durable !== false,
+      flashbackScheduled: flashbackRequired && !flashbackVerified,
+      flashbackVerified,
       flashbackAdoption,
       flashbackRecords,
-      hayakuScheduled: preview.includeHayaku === true && hayakuAdoption.verified !== true,
-      hayakuVerified: hayakuAdoption.verified === true,
+      hayakuScheduled: hayakuRequired && !hayakuVerified,
+      hayakuVerified,
       hayakuAdoption,
       hayakuRecords,
       hayakuSource: hayaku.available ? 'canonical_ledger' : pendingColdStart.available ? 'pending_cold_start' : 'none',
-      libraScheduled: preview.includeLibra === true && libraAdoption.verified !== true,
-      libraVerified: libraAdoption.verified === true && libraAdoption.durable !== false,
+      libraScheduled: libraRequired && !libraVerified,
+      libraVerified,
       libraAdoption,
       libraRecords: libra.recordCount,
-      libraSource: preview.includeLibra ? 'libra_plugin_ipc' : 'none',
+      libraWorldAdditional: libra.worldAdditionalCount,
+      libraSource: preview.includeLibra ? text(libra.readSource || 'unknown') : 'none',
+      liaRequired,
+      liaVerified,
+      liaAdoption,
+      sourceLivePersonaId: liaRequired ? sourceLivePersonaId : '',
+      targetLivePersonaId: liaRequired ? text(liaAdoption?.livePersonaId || '') : '',
       writer,
       createdAt
     };
@@ -6352,7 +6740,7 @@
       .side{padding:14px 10px;border-right:1px solid var(--lra-line);background:var(--lra-surface-2);display:flex;flex-direction:column;gap:6px}.nav-group-label{padding:8px 10px 2px;color:var(--lra-text-3);font-size:9px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.nav{display:flex;align-items:center;gap:9px;min-height:38px;padding:7px 10px;border:0;border-radius:11px;background:transparent;color:var(--lra-text-2);font:650 12px inherit;text-align:left;cursor:pointer}.nav:hover{background:var(--lra-surface);color:var(--lra-text)}.nav.active{background:var(--lra-surface);color:var(--lra-primary);box-shadow:var(--lra-shadow-sm)}.nav .ic{width:28px;height:28px;display:grid;place-items:center;border-radius:9px;background:var(--lra-primary-soft);color:var(--lra-primary)}.scope-card{margin-top:auto;padding:11px;border:1px solid var(--lra-line);border-radius:13px;background:var(--lra-surface)}.scope-card b{display:block}.scope-card span{display:block;margin-top:3px;color:var(--lra-text-3);font-size:9px}.version{margin-top:6px;color:var(--lra-text-3);font-size:9px;text-align:center}
       .main{min-width:0;min-height:0;overflow:hidden}.panel{display:none;width:100%;height:100%;max-width:1120px;margin:0 auto;padding:20px 24px 80px;overflow-y:auto}.panel.active{display:flex;flex-direction:column;gap:13px}.panel-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:3px}.panel-heading h2{margin:0;font-size:20px}.panel-heading p{margin:4px 0 0;color:var(--lra-text-3);font-size:12px}
       .card,.settings-feature-group{padding:15px;border:1px solid var(--lra-line);border-radius:17px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.heading{display:flex;justify-content:space-between;gap:16px}.heading>div{display:grid;gap:4px}.heading strong{font-size:17px}.heading span,.muted{color:var(--lra-text-3)}.badge{padding:3px 8px;border-radius:999px;background:var(--lra-green-soft);color:var(--lra-green);font-size:10px;font-weight:800;height:max-content}
-      .flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:16px 0}.flow div{padding:13px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface-2);display:flex;flex-direction:column;gap:4px}.flow b{color:var(--lra-primary)}.flow small{color:var(--lra-text-3)}.status{padding:11px 12px;border:1px solid color-mix(in srgb,var(--lra-primary) 28%,var(--lra-line));background:var(--lra-primary-soft);color:var(--lra-primary);border-radius:10px;white-space:pre-line;font-weight:700}.note{margin:12px 0;color:var(--lra-text-2)}.actions,.profile-actions{display:flex;justify-content:flex-end;gap:7px}.btn{min-height:31px;padding:4px 10px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface);color:var(--lra-text);font:650 12px inherit;cursor:pointer}.btn:hover{background:var(--lra-surface-2)}.primary{background:var(--lra-primary);border-color:var(--lra-primary);color:#fff}.primary:hover{filter:brightness(.97)}.btn:disabled{opacity:.5;cursor:not-allowed}
+      .flow{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:16px 0}.flow div{padding:13px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface-2);display:flex;flex-direction:column;gap:4px}.flow b{color:var(--lra-primary)}.flow small{color:var(--lra-text-3)}.status{padding:11px 12px;border:1px solid color-mix(in srgb,var(--lra-primary) 28%,var(--lra-line));background:var(--lra-primary-soft);color:var(--lra-primary);border-radius:10px;white-space:pre-line;font-weight:700}.note{margin:12px 0;color:var(--lra-text-2)}.actions,.profile-actions{display:flex;justify-content:flex-end;gap:7px}.btn{min-height:31px;padding:4px 10px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface);color:var(--lra-text);font:650 12px inherit;cursor:pointer}.btn:hover{background:var(--lra-surface-2)}.primary{background:var(--lra-primary);border-color:var(--lra-primary);color:#fff}.primary:hover{filter:brightness(.97)}.btn:disabled{opacity:.5;cursor:not-allowed}
       .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metrics div{padding:13px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm);display:flex;flex-direction:column;gap:3px}.metrics span{color:var(--lra-text-3)}.metrics strong{font-size:15px}.ledger-key{display:flex;align-items:center;gap:8px;color:var(--lra-text-2)}.ledger-key span{padding:3px 7px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-weight:800;font-size:9px}.ledger-key code{min-width:0;overflow:hidden;text-overflow:ellipsis}.ledger-key small{margin-left:auto;color:var(--lra-text-3);white-space:nowrap}.record-list{display:grid;gap:9px}.record{padding:13px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.record-head{display:flex;justify-content:space-between;gap:12px}.record-head>div{display:flex;flex-direction:column}.record-head span,.meta{color:var(--lra-text-3);font-size:10px}.record-head em{font-style:normal;color:var(--lra-green);font-size:9px}.record p{color:var(--lra-text-2);white-space:pre-wrap}.meta{display:flex;gap:10px;flex-wrap:wrap}.record details{margin-top:8px}.record summary{cursor:pointer;color:var(--lra-text-2)}.record pre{max-height:340px;overflow:auto;padding:10px;border:1px solid var(--lra-line);border-radius:9px;background:var(--lra-surface-2);color:var(--lra-text-2);white-space:pre-wrap;word-break:break-word}.memory-tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.memory-tags span{padding:2px 6px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px}.packet-sections{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:10px}.packet-section{min-width:0;padding:9px 10px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface-2)}.packet-section b{display:block;margin-bottom:4px;color:var(--lra-text);font-size:10px}.packet-section span{display:block;margin-top:2px;color:var(--lra-text-2);font-size:10px;white-space:pre-wrap;overflow-wrap:anywhere}.viewer-warning{border-color:color-mix(in srgb,var(--lra-red) 28%,var(--lra-line));background:color-mix(in srgb,var(--lra-red) 7%,var(--lra-surface));color:var(--lra-red)}
       .record-actions{display:flex;justify-content:flex-end;gap:6px;margin-top:8px}.record-action{min-height:27px;padding:3px 9px;border:1px solid var(--lra-line);border-radius:8px;background:var(--lra-surface-2);color:var(--lra-text-2);font:700 10px inherit;cursor:pointer}.record-action:hover{border-color:var(--lra-primary);color:var(--lra-primary)}.record-action.danger:hover{border-color:var(--lra-red);color:var(--lra-red)}.record-action:disabled{opacity:.42;cursor:not-allowed}.record-action:disabled:hover{border-color:var(--lra-line);color:var(--lra-text-2)}
       .turn-jump{align-self:flex-start;display:flex;align-items:center;gap:9px;padding:8px 9px;border:1px solid var(--lra-line);border-radius:11px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.turn-jump>strong{font-size:11px}.turn-jump>span{color:var(--lra-text-3);font-size:9px}.turn-jump>div{display:flex;align-items:center;gap:6px}.turn-jump input{width:92px;min-height:31px;padding:4px 8px;border:1px solid var(--lra-line);border-radius:9px;background:var(--lra-surface-2);color:var(--lra-text);font:650 11px inherit}.turn-jump input:focus{outline:0;border-color:var(--lra-primary);box-shadow:inset 0 0 0 1px var(--lra-primary)}
@@ -6363,7 +6751,7 @@
       @media(max-width:560px){.bridge{height:100dvh;max-height:100dvh;border-radius:0;grid-template-columns:64px minmax(0,1fr);grid-template-rows:62px minmax(0,1fr)}.top{padding:0 10px}.brand span,.global-status{display:none}.flow,.metrics,.settings-feature-grid,.packet-sections,.analysis-console-metrics{grid-template-columns:1fr}.ledger-key small{display:none}.field-wide,.profile-actions{grid-column:1}}
     </style>
     <div class="bridge${Runtime.busy ? ' busy' : ''}">
-      <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>LIBRA · HAYAKU · Flashback Continuity</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="closeBridge" class="btn">닫기</button></div></header>
+      <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>LIBRA · HAYAKU · Flashback · LIA Continuity</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="closeBridge" class="btn">닫기</button></div></header>
       <aside class="side">
         <div class="nav-group-label">Operations</div>
         <button class="nav ${Runtime.activeTab === 'session' ? 'active' : ''}" data-tab="session"><span class="ic">↪</span><span>다음 세션</span></button>
@@ -6380,7 +6768,7 @@
         <section class="panel ${Runtime.activeTab === 'session' ? 'active' : ''}" data-panel="session">
           <div class="panel-heading"><div><h2>다음 세션</h2><p>LIBRA, HAYAKU, Flashback의 정본 데이터를 새 채팅으로 함께 승계합니다.</p></div></div>
           <div class="card"><div class="heading"><div><strong>대화 이어가기</strong><span>새 채팅 저장 직후 세 시스템의 승계 계약과 영속 반영을 검증합니다.</span></div><em class="badge">원본 보존</em></div>
-            <div class="flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · Flashback</b><small>이전 기억을 영구 과거로 즉시 채택·검증</small></div><div><b>3 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>4 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
+            <div class="flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · Flashback</b><small>이전 기억을 영구 과거로 즉시 채택·검증</small></div><div><b>3 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>4 · LIA</b><small>활성 Live Persona를 새 채팅 전용 Persona로 Fork·재바인딩</small></div><div><b>5 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
             <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">LIBRA는 World Manager/로어북 승계 계약을 사용하지 않습니다. LIBRA 공식 IPC로 pluginStorage 정본을 새 세션의 영구 이전 기억으로 채택합니다. Flashback과 HAYAKU도 각 공식 채택 경로를 사용합니다.</p>
             <div class="actions"><button id="refreshTransition" class="btn">다시 확인</button><button id="createSession" class="btn primary">다음 세션 만들기</button></div>
           </div>
@@ -7145,6 +7533,7 @@
           + (preview.includeLibra
             ? `LIBRA 정본 레코드 ${formatNumber(preview.libraRecordCount)}개\n`
             : 'LIBRA 데이터 없음\n')
+          + (isLiaLivePersonaId(preview.identity?.personaId) ? 'LIA Live Persona · 새 채팅 전용 Fork\n' : 'LIA Live Persona 없음\n')
           + `Flashback 기억 ${formatNumber(preview.flashback.records)}개\n`
           + (preview.includeHayaku
             ? `HAYAKU 패킷 ${formatNumber(preview.hayakuRecordCount)}개`
@@ -7167,9 +7556,15 @@
           : result.libraRecords > 0
             ? `LIBRA 승계 표식 저장 · 영속 검증 실패: ${result.libraAdoption?.reason || 'unknown'}`
             : 'LIBRA 데이터 없음';
+        const liaStatus = result.liaRequired
+          ? result.liaVerified
+            ? `LIA Live Persona Fork 확인: ${result.targetLivePersonaId || result.liaAdoption?.livePersonaName || 'new Live Persona'}`
+            : `LIA Live Persona Fork 검증 실패: ${result.liaAdoption?.reason || 'unknown'}`
+          : 'LIA Live Persona 없음';
         globalThis.alert?.(
           `다음 세션을 만들었습니다.\n`
           + `${libraStatus}\n`
+          + `${liaStatus}\n`
           + `${flashbackStatus}\n`
           + hayakuStatus
           + '\n\n원본 채팅과 원장은 그대로 보존됩니다.'
@@ -7311,7 +7706,9 @@
       extractJsonObject, normalizeBridgeRecallAliases, normalizeColdStartPacket, normalizeIncrementalRecoveryPacket,
       validateBridgeCapsulePacketSet, bridgePacketHasSemanticPayload, priorTurnContextForChunk,
       requestLibraIpc, probeLibraIpc, normalizeLibraInspection, readLibraSource,
+      requestLiaIpc, adoptLiaLivePersonaHandoff, isLiaLivePersonaId,
       prepareLibraSessionHandoff, adoptLibraSessionHandoff, adoptLibraSessionHandoffDurable, verifyDurableLibraSessionHandoff,
+      requiredHandoffsVerified,
       libraMemoryViewerInfo,
       coldStartChunkHash, coldStartConfigHash, incrementalRecoveryConfigHash,
       incrementalRecoveryCheckpointBodyReusable, incrementalRecoveryCheckpointPlan,
@@ -7336,6 +7733,7 @@
   await registerFlashbackIpc().catch(error => warn('Flashback IPC registration failed', error));
   await registerHayakuIpc().catch(error => warn('HAYAKU IPC registration failed', error));
   await registerLibraIpc().catch(error => warn('LIBRA IPC registration failed', error));
+  await registerLiaIpc().catch(error => warn('LIA IPC registration failed', error));
   await registerUi();
   const unloadApi = liveApi(['onUnload']);
   if (typeof unloadApi?.onUnload === 'function') {
@@ -7357,6 +7755,11 @@
         pending.reject(new Error('RE:TRACE unloaded before LIBRA IPC completed.'));
       }
       Runtime.libraIpcPending.clear();
+      for (const pending of Runtime.liaIpcPending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('RE:TRACE unloaded before LIA IPC completed.'));
+      }
+      Runtime.liaIpcPending.clear();
       try { Runtime.root?.remove?.(); } catch (_) {}
       Runtime.root = null;
       Runtime.mounted = false;

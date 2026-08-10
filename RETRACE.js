@@ -1,20 +1,21 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.13
+//@version 1.9.15
 //@allowed-ipc libra
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
 //@allowed-ipc lia_persona_linker
+//@allowed-ipc serial_gradation_agents_for_rp
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/RETRACE/refs/heads/main/RETRACE.js
-//@description LIBRA, HAYAKU, Flashback, and LIA Live Persona continuity analysis and next-session handoff bridge
+//@description LIBRA, GRADIA, HAYAKU, Flashback, and LIA Live Persona continuity analysis and next-session handoff bridge
 //@author Hayaku
 
 (async () => {
   'use strict';
 
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.13';
+  const PLUGIN_VERSION = '1.9.15';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v1';
   const LIBRA_PLUGIN_ID = 'libra';
   const LIBRA_IPC_SCHEMA = 'libra-retrace-ipc-v1';
@@ -24,6 +25,14 @@
   const LIBRA_CAPABILITIES_SCHEMA = 'libra.retrace.capabilities.v1';
   const LIBRA_HANDOFF_RECEIPT_SCHEMA = 'libra.session_handoff.receipt.v1';
   const LIBRA_CHAT_HANDOFF_MARKER_SCHEMA = 'retrace.libra_handoff_marker.v1';
+  const GRADIA_PLUGIN_ID = 'serial_gradation_agents_for_rp';
+  const GRADIA_IPC_SCHEMA = 'gradia-retrace-ipc-v1';
+  const GRADIA_IPC_REQUEST_CHANNEL = 'gradia_retrace_bridge_request_v1';
+  const GRADIA_IPC_RESPONSE_CHANNEL = 'gradia_retrace_bridge_response_v1';
+  const GRADIA_INSPECT_SCHEMA = 'gradia.retrace.inspect.v1';
+  const GRADIA_CAPABILITIES_SCHEMA = 'gradia.retrace.capabilities.v1';
+  const GRADIA_HANDOFF_RECEIPT_SCHEMA = 'gradia.session_handoff.receipt.v1';
+  const GRADIA_CHAT_HANDOFF_MARKER_SCHEMA = 'retrace.gradia_handoff_marker.v1';
   const LIA_PLUGIN_ID = 'lia_persona_linker';
   const LIA_IPC_SCHEMA = 'lia-persona-handoff-ipc-v1';
   const LIA_IPC_REQUEST_CHANNEL = 'lia_persona_handoff_request_v1';
@@ -100,6 +109,7 @@
     hayakuMaxTurn: 0,
     settings: null,
     providerHealth: new Map(),
+    providerModelLoading: new Set(),
     flashbackIpcRegistered: false,
     flashbackIpcPending: new Map(),
     hayakuIpcRegistered: false,
@@ -109,6 +119,10 @@
     libraIpcPending: new Map(),
     libraIpcLastSeenAt: 0,
     libraIpcLastError: '',
+    gradiaIpcRegistered: false,
+    gradiaIpcPending: new Map(),
+    gradiaIpcLastSeenAt: 0,
+    gradiaIpcLastError: '',
     liaIpcRegistered: false,
     liaIpcPending: new Map(),
     liaIpcLastError: '',
@@ -441,8 +455,8 @@
     const rawPath = text(endpointPath).trim();
     if (!rawBase || !rawPath) return rawBase;
     const normalizedPath = `/${rawPath.replace(/^\/+/, '')}`;
-    const current = rawBase.match(/\/(chat\/completions|responses|messages)(?:\?.*)?$/i);
-    const target = normalizedPath.match(/\/(chat\/completions|responses|messages)$/i)?.[1] || '';
+    const current = rawBase.match(/\/(chat\/completions|responses|messages|models)(?:\?.*)?$/i);
+    const target = normalizedPath.match(/\/(chat\/completions|responses|messages|models)$/i)?.[1] || '';
     if (current) {
       if (current[1].toLowerCase() === target.toLowerCase()) return rawBase;
       return joinProviderEndpoint(rawBase.slice(0, current.index), normalizedPath);
@@ -468,6 +482,107 @@
   };
   const providerMode = provider => CORE_PROVIDER_REGISTRY[normalizeProvider(provider)]?.mode || 'openai';
   const providerAllowsEmptyKey = provider => Boolean(CORE_PROVIDER_REGISTRY[normalizeProvider(provider)]?.local);
+
+  const PROVIDER_MODEL_CATALOG_BUILTINS = Object.freeze({
+    openai: Object.freeze({ label: 'OpenAI', modelsPath: '/v1/models', modelsUrl: 'https://api.openai.com/v1/models' }),
+    openrouter: Object.freeze({ label: 'OpenRouter', modelsPath: '/api/v1/models', modelsUrl: 'https://openrouter.ai/api/v1/models' }),
+    anthropic: Object.freeze({ label: 'Claude / Anthropic', modelsPath: '/v1/models', modelsUrl: 'https://api.anthropic.com/v1/models' }),
+    gemini: Object.freeze({ label: 'Gemini AI Studio', modelsPath: '/v1beta/models', modelsUrl: 'https://generativelanguage.googleapis.com/v1beta/models' }),
+    lmstudio: Object.freeze({ label: 'LM Studio', modelsPath: '/v1/models', modelsUrl: 'http://localhost:1234/v1/models' }),
+    ollama: Object.freeze({ label: 'Ollama local', nativeOllama: true }),
+    ollama_cloud: Object.freeze({ label: 'Ollama Cloud', modelsPath: '/v1/models', modelsUrl: 'https://ollama.com/v1/models' }),
+    nanogpt: Object.freeze({ label: 'NanoGPT', modelsPath: '/api/v1/models', modelsUrl: 'https://nano-gpt.com/api/v1/models' })
+  });
+  const ProviderModelCache = new Map();
+  const PROVIDER_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+  const providerCredentialCacheFingerprint = value => {
+    const source = text(value || '');
+    if (!source) return 'anonymous';
+    let hash = 2166136261;
+    for (let index = 0; index < source.length; index += 1) {
+      hash ^= source.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `credential-${(hash >>> 0).toString(36)}-${source.length}`;
+  };
+  const ollamaBaseUrl = rawUrl => {
+    let raw = text(rawUrl || defaultProviderUrl('ollama')).trim();
+    if (!raw) raw = 'http://localhost:11434';
+    raw = raw.replace(/[?#].*$/, '').replace(/\/+$/, '');
+    raw = raw
+      .replace(/\/api\/(?:chat|tags|version|show)$/i, '')
+      .replace(/\/v1\/(?:chat\/completions|models)$/i, '')
+      .replace(/\/chat\/completions$/i, '')
+      .replace(/\/(?:api|v1)$/i, '')
+      .replace(/\/+$/, '');
+    return raw || 'http://localhost:11434';
+  };
+  const ollamaApiUrl = (rawUrl, action) => `${ollamaBaseUrl(rawUrl)}/api/${text(action).replace(/^\/+/, '')}`;
+  const providerModelMetadata = (provider = '', rawUrl = '') => {
+    const key = normalizeProvider(provider);
+    const direct = DIRECT_PROVIDER_REGISTRY[key];
+    if (direct?.modelsPath) return {
+      key, label: direct.label, baseUrl: direct.baseUrl,
+      modelsUrl: joinProviderEndpoint(rawUrl || direct.baseUrl, direct.modelsPath),
+      requiresConfiguredUrl: direct.requiresConfiguredUrl === true,
+      nativeOllama: false
+    };
+    const builtin = PROVIDER_MODEL_CATALOG_BUILTINS[key];
+    if (!builtin) return null;
+    if (builtin.nativeOllama) return {
+      key, label: builtin.label, baseUrl: ollamaBaseUrl(rawUrl),
+      modelsUrl: ollamaApiUrl(rawUrl, 'tags'),
+      versionUrl: ollamaApiUrl(rawUrl, 'version'),
+      requiresConfiguredUrl: false,
+      nativeOllama: true
+    };
+    const raw = text(rawUrl).trim();
+    return {
+      key, label: builtin.label, baseUrl: defaultProviderUrl(key),
+      modelsUrl: raw ? joinProviderEndpoint(raw, builtin.modelsPath) : builtin.modelsUrl,
+      requiresConfiguredUrl: false,
+      nativeOllama: false
+    };
+  };
+  const normalizeProviderModels = (payload = {}, provider = '') => {
+    const source = Array.isArray(payload)
+      ? payload
+      : Array.isArray(payload?.data) ? payload.data
+        : Array.isArray(payload?.models) ? payload.models
+          : Array.isArray(payload?.items) ? payload.items
+            : [];
+    const seen = new Set();
+    return source.map(item => {
+      const record = typeof item === 'string' ? { id: item } : (item || {});
+      let id = text(record.id || record.model || record.slug || record.name).trim();
+      if (normalizeProvider(provider) === 'gemini') id = id.replace(/^models\//i, '');
+      if (!id || seen.has(id)) return null;
+      seen.add(id);
+      const rawLabel = text(record.display_name || record.displayName || record.label || record.name || record.model || id).trim();
+      const label = (normalizeProvider(provider) === 'gemini' ? rawLabel.replace(/^models\//i, '') : rawLabel) || id;
+      return {
+        id,
+        label,
+        contextWindow: Math.max(0, Number(record.context_length || record.context_window || record.contextWindow || 0) || 0),
+        maxOutputTokens: Math.max(0, Number(record.max_output_tokens || record.maxOutputTokens || record.max_completion_tokens || 0) || 0),
+        sizeBytes: Math.max(0, Number(record.size || record.size_bytes || record.sizeBytes || 0) || 0),
+        modifiedAt: text(record.modified_at || record.modifiedAt || record.updated_at || record.updatedAt || '')
+      };
+    }).filter(Boolean).sort((left, right) => left.id.localeCompare(right.id));
+  };
+  const providerModelCacheKey = profile => {
+    const meta = providerModelMetadata(profile?.provider, profile?.url);
+    return meta?.modelsUrl
+      ? `${meta.key}|${meta.modelsUrl}|${providerCredentialCacheFingerprint(profile?.key)}`
+      : '';
+  };
+  const cachedProviderModelEntry = profile => {
+    const key = providerModelCacheKey(profile);
+    if (!key) return null;
+    const cached = ProviderModelCache.get(key);
+    if (!cached || Date.now() - Number(cached.at || 0) >= PROVIDER_MODEL_CACHE_TTL_MS) return null;
+    return { ...cached, models: (cached.models || []).map(item => ({ ...item })) };
+  };
   const clampNumber = (value, min, max, fallback) => {
     const number = Number(value);
     return Number.isFinite(number) ? Math.max(min, Math.min(max, number)) : fallback;
@@ -648,6 +763,40 @@
       throw error;
     }
     return payload;
+  };
+
+  const listProviderModels = async (profile = {}, options = {}) => {
+    const clean = normalizeProfileSettings(profile, DEFAULT_PROFILE);
+    const meta = providerModelMetadata(clean.provider, clean.url);
+    if (!meta?.modelsUrl) {
+      throw new Error(`${providerLabel(clean.provider)}는 자동 모델 목록 조회가 등록되어 있지 않습니다. 모델 ID를 직접 입력하세요.`);
+    }
+    if (meta.requiresConfiguredUrl && /(?:PROJECT_ID|ACCOUNT_ID|GATEWAY_ID|\{[^}]+\})/i.test(meta.modelsUrl)) {
+      throw new Error(`${meta.label} 모델 목록 URL의 placeholder를 실제 값으로 바꿔 주세요.`);
+    }
+    if (!providerAllowsEmptyKey(meta.key) && !clean.key) {
+      throw new Error('모델 목록을 불러오려면 API 키가 필요합니다.');
+    }
+    const cacheKey = providerModelCacheKey(clean);
+    const cached = cacheKey ? ProviderModelCache.get(cacheKey) : null;
+    if (options.force !== true && cached && Date.now() - Number(cached.at || 0) < PROVIDER_MODEL_CACHE_TTL_MS) {
+      return (cached.models || []).map(item => ({ ...item }));
+    }
+    const headers = { Accept: 'application/json', ...extraHeaders(clean) };
+    if (clean.key && meta.key === 'gemini') headers['x-goog-api-key'] = stripBearer(clean.key);
+    else if (clean.key && meta.key === 'anthropic') {
+      headers['x-api-key'] = stripBearer(clean.key);
+      headers['anthropic-version'] ||= '2023-06-01';
+    } else if (clean.key) {
+      headers.authorization ||= `Bearer ${stripBearer(clean.key)}`;
+    }
+    applyOpenAiHeaders(headers, meta.key);
+    const timeoutMs = Math.max(5000, Math.min(60000, Number(clean.timeoutMs || 20000) || 20000));
+    const response = await providerFetch(meta.modelsUrl, { method: 'GET', headers }, timeoutMs);
+    const payload = await responseJson(response);
+    const models = normalizeProviderModels(payload, meta.key);
+    if (cacheKey) ProviderModelCache.set(cacheKey, { at: Date.now(), models: models.map(item => ({ ...item })), meta: { ...meta } });
+    return models;
   };
 
   const extractTextParts = value => {
@@ -1253,11 +1402,7 @@
     body = withExtraBody(body, profile);
     const headers = { 'content-type': 'application/json', ...extraHeaders(profile) };
     if (profile.key) headers.authorization = `Bearer ${stripBearer(profile.key)}`;
-    let endpoint = text(profile.url || defaultProviderUrl('ollama')).trim().replace(/\/+$/, '');
-    if (!/\/api\/chat(?:\?|$)/i.test(endpoint)) {
-      endpoint = endpoint.replace(/\/(?:v\d+\/)?chat\/completions(?:\?.*)?$/i, '').replace(/\/api$/i, '');
-      endpoint = `${endpoint}/api/chat`;
-    }
+    const endpoint = ollamaApiUrl(profile.url || defaultProviderUrl('ollama'), 'chat');
     const response = await providerFetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body) }, profile.timeoutMs);
     const result = await readProviderResult(response, profile.stream);
     if (!text(result.content).trim()) throw new Error('Ollama가 빈 응답을 반환했습니다.');
@@ -1829,6 +1974,344 @@
     });
   };
 
+
+  const registerGradiaIpc = async () => {
+    if (Runtime.gradiaIpcRegistered) return true;
+    const api = liveApi(['addPluginChannelListener', 'postPluginChannelMessage']);
+    if (typeof api?.addPluginChannelListener !== 'function'
+      || typeof api?.postPluginChannelMessage !== 'function') return false;
+    await api.addPluginChannelListener(
+      GRADIA_IPC_RESPONSE_CHANNEL,
+      (message, metadata = {}) => {
+        const response = message && typeof message === 'object' && !Array.isArray(message) ? message : {};
+        if (response.schema !== GRADIA_IPC_SCHEMA || response.kind !== 'response') return;
+        const sender = text(metadata?.sender || '').trim();
+        if (sender !== GRADIA_PLUGIN_ID) return;
+        const requestId = text(response.requestId || '').trim();
+        const pending = Runtime.gradiaIpcPending.get(requestId);
+        if (!pending) return;
+        if (text(response.action || '').trim() !== pending.action) return;
+        Runtime.gradiaIpcPending.delete(requestId);
+        Runtime.gradiaIpcLastSeenAt = Date.now();
+        Runtime.gradiaIpcLastError = response.ok === true ? '' : text(response.error || 'GRADIA IPC request failed.');
+        clearTimeout(pending.timer);
+        if (response.ok === true) pending.resolve(response.result);
+        else {
+          const error = new Error(Runtime.gradiaIpcLastError || 'GRADIA IPC request failed.');
+          error.code = 'GRADIA_IPC_REJECTED';
+          error.remoteReachable = true;
+          error.action = pending.action;
+          pending.reject(error);
+        }
+      }
+    );
+    Runtime.gradiaIpcRegistered = true;
+    return true;
+  };
+
+  const requestGradiaIpc = async (action, payload = {}, options = {}) => {
+    const registered = await registerGradiaIpc().catch(error => {
+      warn('GRADIA IPC listener registration failed', error);
+      return false;
+    });
+    const api = liveApi(['postPluginChannelMessage']);
+    if (!registered || typeof api?.postPluginChannelMessage !== 'function') {
+      const error = new Error('GRADIA IPC API is unavailable. GRADIA v0.25.25 or later is required.');
+      error.code = 'GRADIA_IPC_UNAVAILABLE';
+      throw error;
+    }
+    const requestId = uuid();
+    const timeoutMs = Math.max(400, Math.min(30000, Number(options.timeoutMs || 4000) || 4000));
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        Runtime.gradiaIpcPending.delete(requestId);
+        const error = new Error(`GRADIA IPC timed out after ${timeoutMs}ms.`);
+        error.code = 'GRADIA_IPC_TIMEOUT';
+        error.action = text(action || '').trim();
+        Runtime.gradiaIpcLastError = error.message;
+        reject(error);
+      }, timeoutMs);
+      Runtime.gradiaIpcPending.set(requestId, { resolve, reject, timer, action: text(action || '').trim(), at: Date.now() });
+      Promise.resolve(api.postPluginChannelMessage(
+        GRADIA_PLUGIN_ID,
+        GRADIA_IPC_REQUEST_CHANNEL,
+        { schema: GRADIA_IPC_SCHEMA, kind: 'request', requestId, action: text(action || '').trim(), payload: clone(payload, {}) }
+      )).catch(error => {
+        const pending = Runtime.gradiaIpcPending.get(requestId);
+        if (!pending) return;
+        Runtime.gradiaIpcPending.delete(requestId);
+        clearTimeout(pending.timer);
+        Runtime.gradiaIpcLastError = text(error?.message || error);
+        reject(error);
+      });
+    });
+  };
+
+  const probeGradiaIpc = async (options = {}) => {
+    const timeoutMs = Math.max(500, Math.min(5000, Number(options.timeoutMs || 1800) || 1800));
+    const attempts = Math.max(1, Math.min(3, Number(options.attempts || 2) || 2));
+    let lastError = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        const result = await requestGradiaIpc('ping', {}, { timeoutMs });
+        const schemaOk = result?.schema === GRADIA_CAPABILITIES_SCHEMA;
+        return {
+          available: true, reachable: true, schemaOk, legacy: !schemaOk,
+          pluginVersion: text(result?.pluginVersion || ''), capabilities: clone(result, {}),
+          attempts: attempt, reason: schemaOk ? 'gradia_ping_ok' : 'gradia_ping_legacy_response'
+        };
+      } catch (error) {
+        lastError = error;
+        if (error?.remoteReachable === true || text(error?.code) === 'GRADIA_IPC_REJECTED') {
+          return {
+            available: true, reachable: true, schemaOk: false, legacy: true,
+            pluginVersion: '', capabilities: {}, attempts: attempt,
+            reason: 'gradia_ping_rejected_but_reachable', error: text(error?.message || error)
+          };
+        }
+        if (attempt < attempts) await delay(120);
+      }
+    }
+    return {
+      available: false, reachable: false, schemaOk: false, legacy: false,
+      pluginVersion: '', capabilities: {}, attempts,
+      reason: text(lastError?.code || 'gradia_ipc_unavailable'), error: text(lastError?.message || lastError || '')
+    };
+  };
+
+  const activeGradiaRuntime = () => {
+    try {
+      const candidate = globalThis.__SerialGradationAgentsForRP
+        || globalThis.__pluginApis__?.serial_gradation_agents_for_rp
+        || globalThis.__pluginApis__?.GRADIA;
+      if (candidate && typeof candidate === 'object') return candidate;
+    } catch (_) {}
+    return null;
+  };
+
+  const normalizeGradiaInspection = (inspection, identity = {}, readSource = 'gradia_plugin_ipc') => {
+    const source = inspection && typeof inspection === 'object' && !Array.isArray(inspection) ? inspection : {};
+    const schemaOk = source.schema === GRADIA_INSPECT_SCHEMA;
+    const scope = source.scope && typeof source.scope === 'object' ? source.scope : {};
+    const requestedChatId = text(identity?.chatId || '').trim();
+    const chatId = text(scope.chatId || '').trim();
+    const scopeMatches = !requestedChatId || !chatId || requestedChatId === chatId;
+    const integrityOk = schemaOk && scopeMatches && source?.integrity?.ok !== false;
+    const counts = source.counts && typeof source.counts === 'object' ? clone(source.counts, {}) : {};
+    const storyArcCount = Math.max(0, Math.min(1, Number(counts.storyArc || (source.storyArc ? 1 : 0)) || 0));
+    const writerDesignCount = Math.max(0, Math.min(1, Number(counts.writerDesign || (source.writerDesign ? 1 : 0)) || 0));
+    return {
+      available: schemaOk && scopeMatches && integrityOk && (storyArcCount > 0 || writerDesignCount > 0),
+      pluginAvailable: schemaOk,
+      inspectionAvailable: schemaOk && scopeMatches,
+      integrityOk,
+      reason: !schemaOk ? 'gradia_ipc_contract_unavailable'
+        : !scopeMatches ? 'gradia_scope_mismatch'
+          : !integrityOk ? text(source?.integrity?.reason || 'gradia_integrity_failed')
+            : (storyArcCount || writerDesignCount) ? 'loaded' : 'empty',
+      readSource,
+      pluginVersion: text(source.pluginVersion || ''),
+      scope,
+      integrity: clone(source.integrity, { ok: integrityOk }),
+      counts: { ...counts, storyArc: storyArcCount, writerDesign: writerDesignCount },
+      storyArc: source.storyArc && typeof source.storyArc === 'object' ? clone(source.storyArc, {}) : null,
+      writerDesign: source.writerDesign && typeof source.writerDesign === 'object' ? clone(source.writerDesign, {}) : null,
+      storyArcCount,
+      writerDesignCount,
+      manualUserIntentCount: Math.max(0, Number(counts.manualUserIntent || 0) || 0),
+      storyArcBeatCount: Math.max(0, Number(counts.storyArcBeats || source.storyArc?.beats?.length || 0) || 0),
+      completedTurnCount: Math.max(0, Number(counts.completedTurns || 0) || 0),
+      snapshotHash: text(source.snapshotHash || ''),
+      inspectedAt: text(source.inspectedAt || '')
+    };
+  };
+
+  const readGradiaSource = async context => {
+    const identity = contextIdentity(context || await getCurrentContext());
+    const probe = await probeGradiaIpc({ timeoutMs: 1800, attempts: 2 });
+    if (probe.available) {
+      try {
+        const inspected = await requestGradiaIpc('inspect', {}, { timeoutMs: 8000 });
+        const normalized = normalizeGradiaInspection(inspected, identity, 'gradia_plugin_ipc');
+        normalized.capabilities = clone(probe.capabilities, {});
+        normalized.probe = clone(probe, {});
+        return normalized;
+      } catch (error) {
+        const code = text(error?.code || '').trim();
+        const reason = code === 'GRADIA_IPC_TIMEOUT' ? 'gradia_inspect_timeout' : 'gradia_inspect_failed';
+        warn('GRADIA IPC inspection failed after successful discovery', error);
+        return {
+          available: false, pluginAvailable: true, inspectionAvailable: false, integrityOk: false,
+          reason, readSource: 'gradia_plugin_ipc', pluginVersion: text(probe.pluginVersion || ''),
+          scope: {}, integrity: { ok: false, reason }, counts: {}, storyArc: null, writerDesign: null,
+          storyArcCount: 0, writerDesignCount: 0, manualUserIntentCount: 0, storyArcBeatCount: 0,
+          completedTurnCount: 0, snapshotHash: '', capabilities: clone(probe.capabilities, {}), probe: clone(probe, {}),
+          errors: [text(error?.message || error || reason)]
+        };
+      }
+    }
+    const runtime = activeGradiaRuntime();
+    if (runtime && typeof runtime.inspectForRetrace === 'function') {
+      try {
+        const inspected = await runtime.inspectForRetrace();
+        const normalized = normalizeGradiaInspection(inspected, identity, 'gradia_runtime_api');
+        normalized.probe = clone(probe, {});
+        return normalized;
+      } catch (error) { warn('GRADIA runtime inspection failed', error); }
+    }
+    return {
+      available: false, pluginAvailable: false, inspectionAvailable: false, integrityOk: false,
+      reason: 'gradia_ipc_unavailable', readSource: 'none', pluginVersion: '', scope: {}, integrity: { ok: false },
+      counts: {}, storyArc: null, writerDesign: null, storyArcCount: 0, writerDesignCount: 0,
+      manualUserIntentCount: 0, storyArcBeatCount: 0, completedTurnCount: 0, snapshotHash: '',
+      probe: clone(probe, {}), errors: [probe.error || 'GRADIA v0.25.25 or later IPC contract is required.']
+    };
+  };
+
+  const gradiaReceiptCountMatches = (receipt, field, expected) => (
+    Boolean(receipt && Object.prototype.hasOwnProperty.call(receipt, field))
+    && Number.isInteger(Number(receipt[field]))
+    && Number(receipt[field]) === expected
+  );
+
+  const gradiaOwnerReceiptMatches = (receipt, transport, mutation) => (
+    transport !== 'gradia_plugin_ipc'
+    || (
+      text(receipt?.ownerPluginId || '') === GRADIA_PLUGIN_ID
+      && text(receipt?.authorizedRequester || '') === 'flashback_hayaku_bridge'
+      && text(receipt?.mutation || '') === mutation
+    )
+  );
+
+  const gradiaPreparationReceiptMatches = (receipt, options, transport) => {
+    const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
+    const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
+    return receipt?.schema === GRADIA_HANDOFF_RECEIPT_SCHEMA
+      && receipt?.action === 'prepared'
+      && receipt?.prepared === true
+      && receipt?.durable === true
+      && text(receipt?.transferId || '') === text(options?.transferId || '')
+      && gradiaReceiptCountMatches(receipt, 'storyArc', expectedStoryArc)
+      && gradiaReceiptCountMatches(receipt, 'expectedStoryArc', expectedStoryArc)
+      && gradiaReceiptCountMatches(receipt, 'writerDesign', expectedWriterDesign)
+      && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
+      && gradiaOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
+  };
+
+  const gradiaAdoptionReceiptMatches = (receipt, options, transport) => {
+    const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
+    const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
+    return receipt?.schema === GRADIA_HANDOFF_RECEIPT_SCHEMA
+      && receipt?.action === 'adopted'
+      && receipt?.verified === true
+      && receipt?.durable === true
+      && text(receipt?.targetChatId || '') === text(options?.targetChatId || '')
+      && text(receipt?.transferId || '') === text(options?.transferId || '')
+      && gradiaReceiptCountMatches(receipt, 'storyArc', expectedStoryArc)
+      && gradiaReceiptCountMatches(receipt, 'expectedStoryArc', expectedStoryArc)
+      && gradiaReceiptCountMatches(receipt, 'writerDesign', expectedWriterDesign)
+      && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
+      && gradiaOwnerReceiptMatches(receipt, transport, 'adopt_session_handoff');
+  };
+
+  const gradiaVerificationReceiptMatches = (receipt, options, transport) => {
+    const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
+    const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
+    return receipt?.schema === GRADIA_HANDOFF_RECEIPT_SCHEMA
+      && receipt?.action === 'verified'
+      && receipt?.verified === true
+      && receipt?.durable === true
+      && text(receipt?.targetChatId || '') === text(options?.targetChatId || '')
+      && text(receipt?.transferId || '') === text(options?.transferId || '')
+      && gradiaReceiptCountMatches(receipt, 'storyArc', expectedStoryArc)
+      && gradiaReceiptCountMatches(receipt, 'expectedStoryArc', expectedStoryArc)
+      && gradiaReceiptCountMatches(receipt, 'writerDesign', expectedWriterDesign)
+      && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
+      && gradiaOwnerReceiptMatches(receipt, transport, 'verify_session_handoff');
+  };
+
+  const prepareGradiaSessionHandoff = async options => {
+    const runtime = activeGradiaRuntime();
+    try {
+      const result = await requestGradiaIpc('prepare_session_handoff', options || {}, { timeoutMs: 6000 });
+      if (!gradiaPreparationReceiptMatches(result, options, 'gradia_plugin_ipc')) throw new Error('GRADIA handoff preparation receipt is invalid.');
+      return { ...result, transport: 'gradia_plugin_ipc' };
+    } catch (error) {
+      if (runtime && typeof runtime.prepareSessionHandoff === 'function') {
+        const result = await runtime.prepareSessionHandoff(options || {});
+        if (!gradiaPreparationReceiptMatches(result, options, 'gradia_runtime_api')) throw new Error('GRADIA runtime handoff preparation receipt is invalid.');
+        return { ...result, transport: 'gradia_runtime_api' };
+      }
+      throw error;
+    }
+  };
+
+  const adoptGradiaSessionHandoff = async options => {
+    const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
+    const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
+    const runtime = activeGradiaRuntime();
+    try {
+      const result = await requestGradiaIpc('adopt_session_handoff', options || {}, { timeoutMs: 12000 });
+      return { ...result, transport: 'gradia_plugin_ipc' };
+    } catch (error) {
+      if (runtime && typeof runtime.adoptSessionHandoff === 'function') {
+        try { return { ...(await runtime.adoptSessionHandoff(options || {})), transport: 'gradia_runtime_api' }; }
+        catch (runtimeError) { error = runtimeError; }
+      }
+      return {
+        schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: false, durable: false,
+        storyArc: 0, expectedStoryArc, writerDesign: 0, expectedWriterDesign,
+        targetChatId: text(options?.targetChatId || ''), transferId: text(options?.transferId || ''),
+        transport: 'unavailable', reason: text(error?.message || error || 'gradia_handoff_adoption_failed')
+      };
+    }
+  };
+
+  const adoptGradiaSessionHandoffDurable = async options => {
+    let last = null;
+    const maxAttempts = 4;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      last = await adoptGradiaSessionHandoff(options || {});
+      if (gradiaAdoptionReceiptMatches(last, options, last?.transport)) return { ...last, attempts: attempt };
+      if (attempt < maxAttempts) await delay(Math.min(1200, 220 * attempt));
+    }
+    return { ...(last || {}), attempts: maxAttempts, verified: false, durable: false, reason: 'gradia_handoff_receipt_mismatch' };
+  };
+
+  const verifyDurableGradiaSessionHandoff = async options => {
+    if (options?.included !== true) return {
+      schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: true, durable: true,
+      adopted: false, storyArc: 0, expectedStoryArc: 0, writerDesign: 0, expectedWriterDesign: 0, reason: 'no_gradia_data'
+    };
+    const payload = {
+      transferId: text(options?.transferId || ''),
+      targetChatId: text(options?.targetChatId || ''),
+      expectedStoryArc: Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0)),
+      expectedWriterDesign: Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0))
+    };
+    const runtime = activeGradiaRuntime();
+    try {
+      const result = await requestGradiaIpc('verify_session_handoff', payload, { timeoutMs: 6000 });
+      return gradiaVerificationReceiptMatches(result, payload, 'gradia_plugin_ipc')
+        ? { ...result, transport: 'gradia_plugin_ipc' }
+        : { ...result, verified: false, durable: false, transport: 'gradia_plugin_ipc', reason: 'gradia_handoff_receipt_mismatch' };
+    } catch (error) {
+      if (runtime && typeof runtime.verifySessionHandoff === 'function') {
+        try {
+          const result = await runtime.verifySessionHandoff(payload);
+          return gradiaVerificationReceiptMatches(result, payload, 'gradia_runtime_api')
+            ? { ...result, transport: 'gradia_runtime_api' }
+            : { ...result, verified: false, durable: false, transport: 'gradia_runtime_api', reason: 'gradia_handoff_receipt_mismatch' };
+        } catch (runtimeError) { error = runtimeError; }
+      }
+      return {
+        schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: false, durable: false,
+        storyArc: 0, expectedStoryArc: payload.expectedStoryArc, writerDesign: 0, expectedWriterDesign: payload.expectedWriterDesign,
+        targetChatId: payload.targetChatId, transferId: payload.transferId, transport: 'unavailable',
+        reason: text(error?.message || error || 'gradia_handoff_verification_failed')
+      };
+    }
+  };
 
   const registerLiaIpc = async () => {
     if (Runtime.liaIpcRegistered) return true;
@@ -5993,11 +6476,12 @@
 
   const inspectTransition = async () => {
     const context = await getCurrentContext();
-    const [flashback, hayaku, pendingColdStart, libra] = await Promise.all([
+    const [flashback, hayaku, pendingColdStart, libra, gradia] = await Promise.all([
       readFlashbackViewer(context),
       readHayakuSource(context),
       readPendingColdStartCapsule(context),
-      readLibraSource(context)
+      readLibraSource(context),
+      readGradiaSource(context)
     ]);
     const preview = {
       context,
@@ -6005,11 +6489,15 @@
       flashback,
       hayaku,
       libra,
+      gradia,
       pendingColdStart,
       includeHayaku: hayaku.available === true || pendingColdStart.available === true,
       includeLibra: libra.available === true,
+      includeGradia: gradia.available === true,
       hayakuRecordCount: hayaku.available ? hayaku.records.length : pendingColdStart.packets.length,
       libraRecordCount: libra.recordCount,
+      gradiaStoryArcCount: gradia.storyArcCount,
+      gradiaWriterDesignCount: gradia.writerDesignCount,
       inspectedAt: Date.now()
     };
     Runtime.lastPreview = preview;
@@ -6133,12 +6621,13 @@
     (status?.flashbackRequired !== true || status?.flashbackVerified === true)
     && (status?.hayakuRequired !== true || status?.hayakuVerified === true)
     && (status?.libraRequired !== true || status?.libraVerified === true)
+    && (status?.gradiaRequired !== true || status?.gradiaVerified === true)
     && (status?.liaRequired !== true || status?.liaVerified === true)
   );
 
   const continueToNextSession = async () => {
     const preview = await inspectTransition();
-    const { context, identity, flashback, hayaku, libra, pendingColdStart } = preview;
+    const { context, identity, flashback, hayaku, libra, gradia, pendingColdStart } = preview;
     if (!identity.chatId) throw new Error('현재 채팅에 안정적인 id가 없습니다.');
     if (flashback.integrityOk === false) {
       throw new Error(`Flashback 원장이 완전하지 않아 다음 세션 승계를 중단했습니다. ${JSON.stringify({
@@ -6156,6 +6645,15 @@
         ? 'LIBRA is connected, but canonical memory inspection could not be verified; next-session handoff was stopped.'
         : 'LIBRA canonical memory integrity is incomplete; next-session handoff was stopped.'} ${JSON.stringify({
         reason: libra.reason, records: libra.recordCount, integrity: libra.integrity, errors: libra.errors || []
+      })}`);
+    }
+    if (gradia.pluginAvailable && gradia.integrityOk === false) {
+      const inspectionFailed = ['gradia_inspect_timeout', 'gradia_inspect_failed'].includes(text(gradia.reason));
+      throw new Error(`${inspectionFailed
+        ? 'GRADIA is connected, but Story Arc/Writer inspection could not be verified; next-session handoff was stopped.'
+        : 'GRADIA Story Arc/Writer state integrity is incomplete; next-session handoff was stopped.'} ${JSON.stringify({
+        reason: gradia.reason, storyArc: gradia.storyArcCount, writerDesign: gradia.writerDesignCount,
+        integrity: gradia.integrity, errors: gradia.errors || []
       })}`);
     }
     const targetChatId = uuid();
@@ -6176,6 +6674,21 @@
       || Number(libraPreparation.worldAdditional || 0) !== Number(libra.worldAdditionalCount || 0)
     )) {
       throw new Error(`LIBRA next-session handoff preparation failed before creating the new chat: ${libraPreparation.reason || 'record_count_mismatch'}`);
+    }
+    const gradiaPreparation = preview.includeGradia
+      ? await prepareGradiaSessionHandoff({
+        transferId,
+        expectedStoryArc: gradia.storyArcCount,
+        expectedWriterDesign: gradia.writerDesignCount,
+        expectedSnapshotHash: gradia.snapshotHash
+      })
+      : { schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, prepared: false, storyArc: 0, writerDesign: 0, reason: 'no_gradia_data' };
+    if (preview.includeGradia && (
+      gradiaPreparation.prepared !== true
+      || Number(gradiaPreparation.storyArc || 0) !== Number(gradia.storyArcCount || 0)
+      || Number(gradiaPreparation.writerDesign || 0) !== Number(gradia.writerDesignCount || 0)
+    )) {
+      throw new Error(`GRADIA next-session handoff preparation failed before creating the new chat: ${gradiaPreparation.reason || 'record_count_mismatch'}`);
     }
 
     const nextCharacter = clone(context.character, null);
@@ -6206,6 +6719,18 @@
           preparedAt: libraPreparation.preparedAt || new Date(createdAt).toISOString()
         }
       } : {}),
+      ...(preview.includeGradia ? {
+        gradiaSessionHandoff: {
+          schema: GRADIA_CHAT_HANDOFF_MARKER_SCHEMA,
+          transferId, sourceChatId: identity.chatId, targetChatId,
+          sourceStoryArcScopeKey: text(gradia.scope?.storyArcScopeKey || ''),
+          sourceWriterScopeKey: text(gradia.scope?.writerScopeKey || ''),
+          storyArcCount: gradia.storyArcCount,
+          writerDesignCount: gradia.writerDesignCount,
+          sourceSnapshotHash: text(gradia.snapshotHash || ''),
+          preparedAt: gradiaPreparation.preparedAt || new Date(createdAt).toISOString()
+        }
+      } : {}),
       memorySessionBridge: {
         schema: HANDOFF_SCHEMA,
         timelineContract: 'session_epoch_then_completed_pair_v1',
@@ -6214,16 +6739,21 @@
         sourceFlashbackScopeKey: text(flashback.sourceScope?.scopeKey || ''),
         sourceHayakuScopeKey: text(hayaku.scope?.scopeKey || ''),
         sourceLibraScopeKey: text(libra.scope?.scopeKey || ''),
+        sourceGradiaStoryArcScopeKey: text(gradia.scope?.storyArcScopeKey || ''),
+        sourceGradiaWriterScopeKey: text(gradia.scope?.writerScopeKey || ''),
         targetChatId,
         includeFlashback: true,
         includeHayaku: preview.includeHayaku === true,
         includeLibra: preview.includeLibra === true,
+        includeGradia: preview.includeGradia === true,
         includeLiaLivePersona: liaRequired,
         sourceLiaLivePersonaId: liaRequired ? sourceLivePersonaId : '',
         flashbackRecordCount: Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0),
         hayakuRecordCount: preview.hayakuRecordCount,
         libraRecordCount: libra.recordCount,
         libraWorldAdditionalCount: libra.worldAdditionalCount,
+        gradiaStoryArcCount: gradia.storyArcCount,
+        gradiaWriterDesignCount: gradia.writerDesignCount,
         createdAt
       }
     };
@@ -6252,10 +6782,19 @@
         throw new Error('LIBRA canonical memory changed during handoff preparation. Run the transition again.');
       }
     }
+    if (preview.includeGradia) {
+      const latestGradia = await readGradiaSource(latest);
+      if (!latestGradia.integrityOk
+        || latestGradia.snapshotHash !== gradia.snapshotHash
+        || latestGradia.storyArcCount !== gradia.storyArcCount
+        || latestGradia.writerDesignCount !== gradia.writerDesignCount) {
+        throw new Error('GRADIA Story Arc/Writer state changed during handoff preparation. Run the transition again.');
+      }
+    }
     const writer = await saveCharacter(nextCharacter, context.characterIndex);
     const flashbackRecords = Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0);
     const hayakuRecords = Math.max(0, Number(preview.hayakuRecordCount || 0) || 0);
-    const [flashbackAdoption, hayakuAdoption, libraAdoptionInitial, liaAdoption] = await Promise.all([
+    const [flashbackAdoption, hayakuAdoption, libraAdoptionInitial, gradiaAdoptionInitial, liaAdoption] = await Promise.all([
       adoptFlashbackSessionHandoff({
         targetChatId, transferId, sourceScopeKey: text(flashback.sourceScope?.scopeKey || ''), expectedRecords: flashbackRecords
       }),
@@ -6279,6 +6818,23 @@
           expectedWorldAdditional: 0,
           reason: 'no_libra_data'
         }),
+      preview.includeGradia
+        ? adoptGradiaSessionHandoffDurable({
+          targetChatId,
+          transferId,
+          expectedStoryArc: gradia.storyArcCount,
+          expectedWriterDesign: gradia.writerDesignCount
+        })
+        : Promise.resolve({
+          schema: GRADIA_HANDOFF_RECEIPT_SCHEMA,
+          verified: true,
+          durable: true,
+          storyArc: 0,
+          expectedStoryArc: 0,
+          writerDesign: 0,
+          expectedWriterDesign: 0,
+          reason: 'no_gradia_data'
+        }),
       adoptLiaLivePersonaHandoff({ sourceChatId: identity.chatId, targetChatId, transferId, sourceLivePersonaId })
     ]);
     const libraAdoption = preview.includeLibra && libraAdoptionInitial?.verified !== true
@@ -6290,6 +6846,15 @@
         expectedWorldAdditional: libra.worldAdditionalCount
       })
       : libraAdoptionInitial;
+    const gradiaAdoption = preview.includeGradia && gradiaAdoptionInitial?.verified !== true
+      ? await verifyDurableGradiaSessionHandoff({
+        included: true,
+        targetChatId,
+        transferId,
+        expectedStoryArc: gradia.storyArcCount,
+        expectedWriterDesign: gradia.writerDesignCount
+      })
+      : gradiaAdoptionInitial;
     const flashbackVerified = flashbackAdoption?.verified === true
       && flashbackAdoption?.durable === true
       && Math.max(0, Number(flashbackAdoption?.records || 0) || 0) === flashbackRecords;
@@ -6305,6 +6870,13 @@
       && text(libraAdoption?.transferId || '') === transferId
       && Number(libraAdoption?.records || 0) === Number(libra.recordCount || 0)
       && Number(libraAdoption?.worldAdditional || 0) === Number(libra.worldAdditionalCount || 0);
+    const gradiaRequired = preview.includeGradia === true;
+    const gradiaVerified = gradiaAdoption?.verified === true
+      && gradiaAdoption?.durable === true
+      && text(gradiaAdoption?.targetChatId || '') === targetChatId
+      && text(gradiaAdoption?.transferId || '') === transferId
+      && Number(gradiaAdoption?.storyArc || 0) === Number(gradia.storyArcCount || 0)
+      && Number(gradiaAdoption?.writerDesign || 0) === Number(gradia.writerDesignCount || 0);
     const liaVerified = !liaRequired || (
       liaAdoption?.schema === LIA_HANDOFF_RECEIPT_SCHEMA
       && liaAdoption?.verified === true
@@ -6324,6 +6896,8 @@
         hayakuVerified,
         libraRequired,
         libraVerified,
+        gradiaRequired,
+        gradiaVerified,
         liaRequired,
         liaVerified
       }),
@@ -6346,6 +6920,13 @@
       libraRecords: libra.recordCount,
       libraWorldAdditional: libra.worldAdditionalCount,
       libraSource: preview.includeLibra ? text(libra.readSource || 'unknown') : 'none',
+      gradiaScheduled: gradiaRequired && !gradiaVerified,
+      gradiaVerified,
+      gradiaAdoption,
+      gradiaStoryArc: gradia.storyArcCount,
+      gradiaWriterDesign: gradia.writerDesignCount,
+      gradiaStoryArcBeats: gradia.storyArcBeatCount,
+      gradiaSource: preview.includeGradia ? text(gradia.readSource || 'unknown') : 'none',
       liaRequired,
       liaVerified,
       liaAdoption,
@@ -6689,6 +7270,15 @@
         ['none', 'Provider default / omit'], ['minimal', 'Minimal'], ['low', 'Low'], ['medium', 'Medium'],
         ['high', 'High'], ['xhigh', 'XHigh'], ['max', 'Max']
       ].map(([value, label]) => `<option value="${value}" ${profile.reasoningEffort === value ? 'selected' : ''} ${effortSupport && !effortSupport.has(value) ? 'disabled' : ''}>${label}</option>`).join('');
+      const modelMeta = providerModelMetadata(profile.provider, profile.url);
+      const cachedModelEntry = cachedProviderModelEntry(profile);
+      const cachedModels = Array.isArray(cachedModelEntry?.models) ? cachedModelEntry.models : [];
+      const cachedModelOptions = cachedModels.map(item => `<option value="${escapeHtml(item.id)}" ${profile.model === item.id ? 'selected' : ''}>${escapeHtml(item.label === item.id ? item.id : `${item.label} · ${item.id}`)}</option>`).join('');
+      const modelCatalogHint = modelMeta?.nativeOllama
+        ? 'Ollama의 /api/tags에서 현재 호스트에 실제 설치된 모델을 읽습니다. 수동 모델 입력도 그대로 사용할 수 있습니다.'
+        : modelMeta?.modelsUrl
+          ? `${modelMeta.label} 모델 카탈로그를 조회합니다. 수동 모델 입력도 그대로 사용할 수 있습니다.`
+          : '자동 모델 목록 조회가 등록되지 않은 프로바이더는 Model 칸에 ID를 직접 입력하세요.';
       return `<section class="settings-feature-group">
         <div class="settings-feature-group-head"><h4>${title}</h4><p>HAYAKU 콜드스타트 분석에 사용하는 단일 프로필</p></div>
         <div class="settings-feature-grid">
@@ -6696,6 +7286,12 @@
           <label class="fld"><span>Model</span><input data-provider-field="${name}.model" value="${escapeHtml(profile.model)}" /></label>
           <label class="fld field-wide"><span>Endpoint URL</span><input data-provider-field="${name}.url" value="${escapeHtml(profile.url)}" /></label>
           <label class="fld"><span>API Key / Vertex credentials</span><input type="password" data-provider-field="${name}.key" value="${escapeHtml(profile.key)}" autocomplete="off" /></label>
+          <div class="provider-model-catalog field-wide" data-provider-model-catalog="${name}">
+            <div class="provider-model-catalog-head"><span>Provider model list</span><em data-provider-model-status="${name}">${cachedModelEntry ? `${formatNumber(cachedModels.length)}개 로드됨` : (modelMeta ? '목록 미조회' : '자동 조회 미지원')}</em></div>
+            <div class="provider-model-actions"><button type="button" class="btn load-provider-models" data-load-models-profile="${name}" ${modelMeta ? '' : 'disabled'}>모델 목록 불러오기</button></div>
+            <select data-provider-model-select="${name}" ${cachedModels.length ? '' : 'hidden'}><option value="">불러온 모델에서 선택</option>${cachedModelOptions}</select>
+            <small data-provider-model-hint="${name}">${escapeHtml(modelCatalogHint)}</small>
+          </div>
           <label class="fld"><span>Timeout (ms)</span><input type="number" min="5000" max="300000" data-provider-field="${name}.timeoutMs" value="${profile.timeoutMs}" /></label>
           <label class="fld"><span>Max output tokens</span><input type="number" min="64" max="200000" data-provider-field="${name}.maxTokens" value="${profile.maxTokens}" /></label>
           <label class="fld"><span>Temperature</span><input type="number" min="0" max="2" step="0.05" data-provider-field="${name}.temperature" value="${profile.temperature}" /></label>
@@ -6740,15 +7336,15 @@
       .side{padding:14px 10px;border-right:1px solid var(--lra-line);background:var(--lra-surface-2);display:flex;flex-direction:column;gap:6px}.nav-group-label{padding:8px 10px 2px;color:var(--lra-text-3);font-size:9px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.nav{display:flex;align-items:center;gap:9px;min-height:38px;padding:7px 10px;border:0;border-radius:11px;background:transparent;color:var(--lra-text-2);font:650 12px inherit;text-align:left;cursor:pointer}.nav:hover{background:var(--lra-surface);color:var(--lra-text)}.nav.active{background:var(--lra-surface);color:var(--lra-primary);box-shadow:var(--lra-shadow-sm)}.nav .ic{width:28px;height:28px;display:grid;place-items:center;border-radius:9px;background:var(--lra-primary-soft);color:var(--lra-primary)}.scope-card{margin-top:auto;padding:11px;border:1px solid var(--lra-line);border-radius:13px;background:var(--lra-surface)}.scope-card b{display:block}.scope-card span{display:block;margin-top:3px;color:var(--lra-text-3);font-size:9px}.version{margin-top:6px;color:var(--lra-text-3);font-size:9px;text-align:center}
       .main{min-width:0;min-height:0;overflow:hidden}.panel{display:none;width:100%;height:100%;max-width:1120px;margin:0 auto;padding:20px 24px 80px;overflow-y:auto}.panel.active{display:flex;flex-direction:column;gap:13px}.panel-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:3px}.panel-heading h2{margin:0;font-size:20px}.panel-heading p{margin:4px 0 0;color:var(--lra-text-3);font-size:12px}
       .card,.settings-feature-group{padding:15px;border:1px solid var(--lra-line);border-radius:17px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.heading{display:flex;justify-content:space-between;gap:16px}.heading>div{display:grid;gap:4px}.heading strong{font-size:17px}.heading span,.muted{color:var(--lra-text-3)}.badge{padding:3px 8px;border-radius:999px;background:var(--lra-green-soft);color:var(--lra-green);font-size:10px;font-weight:800;height:max-content}
-      .flow{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:16px 0}.flow div{padding:13px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface-2);display:flex;flex-direction:column;gap:4px}.flow b{color:var(--lra-primary)}.flow small{color:var(--lra-text-3)}.status{padding:11px 12px;border:1px solid color-mix(in srgb,var(--lra-primary) 28%,var(--lra-line));background:var(--lra-primary-soft);color:var(--lra-primary);border-radius:10px;white-space:pre-line;font-weight:700}.note{margin:12px 0;color:var(--lra-text-2)}.actions,.profile-actions{display:flex;justify-content:flex-end;gap:7px}.btn{min-height:31px;padding:4px 10px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface);color:var(--lra-text);font:650 12px inherit;cursor:pointer}.btn:hover{background:var(--lra-surface-2)}.primary{background:var(--lra-primary);border-color:var(--lra-primary);color:#fff}.primary:hover{filter:brightness(.97)}.btn:disabled{opacity:.5;cursor:not-allowed}
+      .flow{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:16px 0}.session-handoff-flow{grid-template-columns:repeat(3,minmax(0,1fr))}.flow div{padding:13px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface-2);display:flex;flex-direction:column;gap:4px}.flow b{color:var(--lra-primary)}.flow small{color:var(--lra-text-3)}.status{padding:11px 12px;border:1px solid color-mix(in srgb,var(--lra-primary) 28%,var(--lra-line));background:var(--lra-primary-soft);color:var(--lra-primary);border-radius:10px;white-space:pre-line;font-weight:700}.note{margin:12px 0;color:var(--lra-text-2)}.actions,.profile-actions{display:flex;justify-content:flex-end;gap:7px}.btn{min-height:31px;padding:4px 10px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface);color:var(--lra-text);font:650 12px inherit;cursor:pointer}.btn:hover{background:var(--lra-surface-2)}.primary{background:var(--lra-primary);border-color:var(--lra-primary);color:#fff}.primary:hover{filter:brightness(.97)}.btn:disabled{opacity:.5;cursor:not-allowed}
       .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metrics div{padding:13px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm);display:flex;flex-direction:column;gap:3px}.metrics span{color:var(--lra-text-3)}.metrics strong{font-size:15px}.ledger-key{display:flex;align-items:center;gap:8px;color:var(--lra-text-2)}.ledger-key span{padding:3px 7px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-weight:800;font-size:9px}.ledger-key code{min-width:0;overflow:hidden;text-overflow:ellipsis}.ledger-key small{margin-left:auto;color:var(--lra-text-3);white-space:nowrap}.record-list{display:grid;gap:9px}.record{padding:13px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.record-head{display:flex;justify-content:space-between;gap:12px}.record-head>div{display:flex;flex-direction:column}.record-head span,.meta{color:var(--lra-text-3);font-size:10px}.record-head em{font-style:normal;color:var(--lra-green);font-size:9px}.record p{color:var(--lra-text-2);white-space:pre-wrap}.meta{display:flex;gap:10px;flex-wrap:wrap}.record details{margin-top:8px}.record summary{cursor:pointer;color:var(--lra-text-2)}.record pre{max-height:340px;overflow:auto;padding:10px;border:1px solid var(--lra-line);border-radius:9px;background:var(--lra-surface-2);color:var(--lra-text-2);white-space:pre-wrap;word-break:break-word}.memory-tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.memory-tags span{padding:2px 6px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px}.packet-sections{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:10px}.packet-section{min-width:0;padding:9px 10px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface-2)}.packet-section b{display:block;margin-bottom:4px;color:var(--lra-text);font-size:10px}.packet-section span{display:block;margin-top:2px;color:var(--lra-text-2);font-size:10px;white-space:pre-wrap;overflow-wrap:anywhere}.viewer-warning{border-color:color-mix(in srgb,var(--lra-red) 28%,var(--lra-line));background:color-mix(in srgb,var(--lra-red) 7%,var(--lra-surface));color:var(--lra-red)}
       .record-actions{display:flex;justify-content:flex-end;gap:6px;margin-top:8px}.record-action{min-height:27px;padding:3px 9px;border:1px solid var(--lra-line);border-radius:8px;background:var(--lra-surface-2);color:var(--lra-text-2);font:700 10px inherit;cursor:pointer}.record-action:hover{border-color:var(--lra-primary);color:var(--lra-primary)}.record-action.danger:hover{border-color:var(--lra-red);color:var(--lra-red)}.record-action:disabled{opacity:.42;cursor:not-allowed}.record-action:disabled:hover{border-color:var(--lra-line);color:var(--lra-text-2)}
       .turn-jump{align-self:flex-start;display:flex;align-items:center;gap:9px;padding:8px 9px;border:1px solid var(--lra-line);border-radius:11px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.turn-jump>strong{font-size:11px}.turn-jump>span{color:var(--lra-text-3);font-size:9px}.turn-jump>div{display:flex;align-items:center;gap:6px}.turn-jump input{width:92px;min-height:31px;padding:4px 8px;border:1px solid var(--lra-line);border-radius:9px;background:var(--lra-surface-2);color:var(--lra-text);font:650 11px inherit}.turn-jump input:focus{outline:0;border-color:var(--lra-primary);box-shadow:inset 0 0 0 1px var(--lra-primary)}
-      .settings-feature-group{margin-bottom:11px}.settings-feature-group-head{display:grid;gap:3px;margin-bottom:12px}.settings-feature-group-head h4{margin:0;font-size:15px}.settings-feature-group-head p{margin:0;color:var(--lra-text-3)}.settings-feature-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 14px}.fld{display:grid;gap:5px}.fld[hidden]{display:none!important}.fld span{font-weight:650}.fld small{color:var(--lra-text-3)}.fld input,.fld select,.fld textarea{width:100%;min-height:34px;padding:6px 9px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface);color:var(--lra-text);font:12px inherit}.fld textarea{min-height:76px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.fld input:focus,.fld select:focus,.fld textarea:focus{outline:0;border-color:var(--lra-primary);box-shadow:inset 0 0 0 1px var(--lra-primary)}.field-wide,.profile-actions{grid-column:1/-1}.settings-callout{padding:10px 11px;border:1px solid color-mix(in srgb,var(--lra-primary) 18%,var(--lra-line));border-radius:10px;background:var(--lra-primary-soft);color:var(--lra-text-2)}.provider-advanced{padding:10px 11px;border:1px solid var(--lra-line);border-radius:12px;background:var(--lra-surface-2)}.provider-advanced summary{cursor:pointer;font-weight:750;color:var(--lra-text-2)}.provider-danger-zone{border-color:color-mix(in srgb,var(--lra-red) 22%,var(--lra-line))}.advanced-grid{margin-top:12px}.reasoning-hint{padding:9px 10px;border:1px solid var(--lra-line);border-radius:9px;background:var(--lra-surface);color:var(--lra-text-3)}.advanced-note{display:grid;gap:2px;padding:9px 10px;border:1px solid var(--lra-line);border-radius:9px;background:var(--lra-surface);color:var(--lra-text-3)}.advanced-note strong{color:var(--lra-text);font-size:11px}.advanced-note-warning{border-color:color-mix(in srgb,var(--lra-red) 24%,var(--lra-line));background:color-mix(in srgb,var(--lra-red) 5%,var(--lra-surface))}
+      .settings-feature-group{margin-bottom:11px}.settings-feature-group-head{display:grid;gap:3px;margin-bottom:12px}.settings-feature-group-head h4{margin:0;font-size:15px}.settings-feature-group-head p{margin:0;color:var(--lra-text-3)}.settings-feature-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 14px}.fld{display:grid;gap:5px}.fld[hidden]{display:none!important}.fld span{font-weight:650}.fld small{color:var(--lra-text-3)}.fld input,.fld select,.fld textarea,.provider-model-catalog select{width:100%;min-height:34px;padding:6px 9px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface);color:var(--lra-text);font:12px inherit}.fld textarea{min-height:76px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.fld input:focus,.fld select:focus,.fld textarea:focus,.provider-model-catalog select:focus{outline:0;border-color:var(--lra-primary);box-shadow:inset 0 0 0 1px var(--lra-primary)}.field-wide,.profile-actions{grid-column:1/-1}.settings-callout{padding:10px 11px;border:1px solid color-mix(in srgb,var(--lra-primary) 18%,var(--lra-line));border-radius:10px;background:var(--lra-primary-soft);color:var(--lra-text-2)}.provider-model-catalog{display:grid;gap:8px;padding:10px 11px;border:1px solid var(--lra-line);border-radius:12px;background:var(--lra-surface-2)}.provider-model-catalog-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.provider-model-catalog-head>span{font-weight:750}.provider-model-catalog-head>em{font-style:normal;padding:2px 7px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px;font-weight:800}.provider-model-actions{display:flex;align-items:center;gap:7px}.provider-model-catalog small{color:var(--lra-text-3)}.provider-model-catalog select[hidden]{display:none!important}.provider-advanced{padding:10px 11px;border:1px solid var(--lra-line);border-radius:12px;background:var(--lra-surface-2)}.provider-advanced summary{cursor:pointer;font-weight:750;color:var(--lra-text-2)}.provider-danger-zone{border-color:color-mix(in srgb,var(--lra-red) 22%,var(--lra-line))}.advanced-grid{margin-top:12px}.reasoning-hint{padding:9px 10px;border:1px solid var(--lra-line);border-radius:9px;background:var(--lra-surface);color:var(--lra-text-3)}.advanced-note{display:grid;gap:2px;padding:9px 10px;border:1px solid var(--lra-line);border-radius:9px;background:var(--lra-surface);color:var(--lra-text-3)}.advanced-note strong{color:var(--lra-text);font-size:11px}.advanced-note-warning{border-color:color-mix(in srgb,var(--lra-red) 24%,var(--lra-line));background:color-mix(in srgb,var(--lra-red) 5%,var(--lra-surface))}
       .analysis-console{display:grid;gap:11px}.analysis-console-head{display:flex;align-items:center;gap:10px}.analysis-console-head strong{font-size:14px}.analysis-console-head span{margin-left:auto;padding:3px 8px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:10px;font-weight:800}.analysis-progress-track{height:9px;overflow:hidden;border-radius:999px;background:var(--lra-surface-2);border:1px solid var(--lra-line)}.analysis-progress-bar{height:100%;width:0;background:linear-gradient(90deg,var(--lra-primary),#8869e9);transition:width .25s ease}.analysis-progress-summary{display:flex;justify-content:space-between;gap:12px;color:var(--lra-text-2);font-size:11px}.analysis-console-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px}.analysis-console-metrics div{padding:8px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface-2);display:grid;gap:2px}.analysis-console-metrics span{color:var(--lra-text-3);font-size:9px}.analysis-console-metrics b{font-size:12px}.analysis-current{padding:9px 10px;border-radius:10px;background:var(--lra-primary-soft);color:var(--lra-primary);font-weight:700;white-space:pre-line}.analysis-log{max-height:190px;overflow:auto;margin:0;padding:9px 11px;border:1px solid var(--lra-line);border-radius:10px;background:#111622;color:#d8e0f0;font:10px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word}.analysis-log .log-time{color:#8492aa}.analysis-log .log-error{color:#ff9ca4}.analysis-console-card[data-state="failed"]{border-color:color-mix(in srgb,var(--lra-red) 35%,var(--lra-line))}.analysis-console-card[data-state="completed"]{border-color:color-mix(in srgb,var(--lra-green) 35%,var(--lra-line))}
       .empty{min-height:220px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;color:var(--lra-text-3);border:1px dashed var(--lra-line);border-radius:14px}.empty strong{color:var(--lra-text)}.busy .status-dot{background:var(--lra-primary)}
-      @media(max-width:820px){.bridge{grid-template-columns:78px minmax(0,1fr)}.side{padding:10px 7px}.nav-group-label,.nav>span:not(.ic),.scope-card,.version{display:none}.nav{justify-content:center;padding:6px}.panel{padding:18px 14px 70px}.flow,.metrics{grid-template-columns:1fr 1fr}}
-      @media(max-width:560px){.bridge{height:100dvh;max-height:100dvh;border-radius:0;grid-template-columns:64px minmax(0,1fr);grid-template-rows:62px minmax(0,1fr)}.top{padding:0 10px}.brand span,.global-status{display:none}.flow,.metrics,.settings-feature-grid,.packet-sections,.analysis-console-metrics{grid-template-columns:1fr}.ledger-key small{display:none}.field-wide,.profile-actions{grid-column:1}}
+      @media(max-width:820px){.session-handoff-flow{grid-template-columns:1fr 1fr}.bridge{grid-template-columns:78px minmax(0,1fr)}.side{padding:10px 7px}.nav-group-label,.nav>span:not(.ic),.scope-card,.version{display:none}.nav{justify-content:center;padding:6px}.panel{padding:18px 14px 70px}.flow,.metrics{grid-template-columns:1fr 1fr}}
+      @media(max-width:560px){.session-handoff-flow{grid-template-columns:1fr}.bridge{height:100dvh;max-height:100dvh;border-radius:0;grid-template-columns:64px minmax(0,1fr);grid-template-rows:62px minmax(0,1fr)}.top{padding:0 10px}.brand span,.global-status{display:none}.flow,.metrics,.settings-feature-grid,.packet-sections,.analysis-console-metrics{grid-template-columns:1fr}.ledger-key small{display:none}.field-wide,.profile-actions{grid-column:1}}
     </style>
     <div class="bridge${Runtime.busy ? ' busy' : ''}">
       <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>LIBRA · HAYAKU · Flashback · LIA Continuity</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="closeBridge" class="btn">닫기</button></div></header>
@@ -6766,10 +7362,10 @@
       </aside>
       <main class="main">
         <section class="panel ${Runtime.activeTab === 'session' ? 'active' : ''}" data-panel="session">
-          <div class="panel-heading"><div><h2>다음 세션</h2><p>LIBRA, HAYAKU, Flashback의 정본 데이터를 새 채팅으로 함께 승계합니다.</p></div></div>
+          <div class="panel-heading"><div><h2>다음 세션</h2><p>LIBRA, GRADIA, HAYAKU, Flashback의 연속성 데이터를 새 채팅으로 함께 승계합니다.</p></div></div>
           <div class="card"><div class="heading"><div><strong>대화 이어가기</strong><span>새 채팅 저장 직후 세 시스템의 승계 계약과 영속 반영을 검증합니다.</span></div><em class="badge">원본 보존</em></div>
-            <div class="flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · Flashback</b><small>이전 기억을 영구 과거로 즉시 채택·검증</small></div><div><b>3 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>4 · LIA</b><small>활성 Live Persona를 새 채팅 전용 Persona로 Fork·재바인딩</small></div><div><b>5 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
-            <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">LIBRA는 World Manager/로어북 승계 계약을 사용하지 않습니다. LIBRA 공식 IPC로 pluginStorage 정본을 새 세션의 영구 이전 기억으로 채택합니다. Flashback과 HAYAKU도 각 공식 채택 경로를 사용합니다.</p>
+            <div class="flow session-handoff-flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · GRADIA</b><small>Story Arc의 다음 5턴 비트와 Writer/OOC 상태를 새 세션 기준으로 재결속</small></div><div><b>3 · Flashback</b><small>이전 기억을 영구 과거로 즉시 채택·검증</small></div><div><b>4 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>5 · LIA</b><small>활성 Live Persona를 새 채팅 전용 Persona로 Fork·재바인딩</small></div><div><b>6 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
+            <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">LIBRA는 공식 IPC로 pluginStorage 정본을 이전 세션 영구 기억에 채택합니다. GRADIA는 Story Arc를 새 세션의 로컬 TURN 1~5 기준으로 재기준화해 다음 비트를 유지하고 Writer/OOC 상태도 독립 스코프로 승계합니다. Flashback과 HAYAKU도 각 공식 채택 경로를 사용합니다.</p>
             <div class="actions"><button id="refreshTransition" class="btn">다시 확인</button><button id="createSession" class="btn primary">다음 세션 만들기</button></div>
           </div>
         </section>
@@ -6925,7 +7521,14 @@
             ? `LIBRA 연결됨 · 정본 조회 실패 (${preview.libra.reason})`
             : `LIBRA 연결됨 · 정본 없음 (${preview.libra.reason})`
           : 'LIBRA IPC 연결 없음 · LIBRA v1.0.4+ 필요';
-      node.textContent = `${libraLine}\n${flashbackLine}\n${hayakuLine}`;
+      const gradiaLine = preview.includeGradia
+        ? `GRADIA Story Arc ${formatNumber(preview.gradiaStoryArcCount)}개 · Writer/OOC ${formatNumber(preview.gradiaWriterDesignCount)}개 승계 준비`
+        : preview.gradia.pluginAvailable
+          ? ['gradia_inspect_timeout', 'gradia_inspect_failed'].includes(text(preview.gradia.reason))
+            ? `GRADIA 연결됨 · Story Arc 조회 실패 (${preview.gradia.reason})`
+            : `GRADIA 연결됨 · 승계할 Story Arc/Writer 상태 없음 (${preview.gradia.reason})`
+          : 'GRADIA IPC 연결 없음 · GRADIA v0.25.25+ 필요';
+      node.textContent = `${libraLine}\n${gradiaLine}\n${flashbackLine}\n${hayakuLine}`;
       return preview;
     } catch (error) {
       node.textContent = `확인 실패: ${error?.message || error}`;
@@ -7218,6 +7821,63 @@
       }
       return presetKey;
     };
+    const providerProfileFromUi = profileName => {
+      const settings = readProviderSettingsFromUi();
+      return settings?.[profileName] || settings?.primary || normalizeProfileSettings({}, DEFAULT_PROFILE);
+    };
+    const populateProviderModelPicker = (profileName, profile, models, options = {}) => {
+      const select = root.querySelector(`[data-provider-model-select="${profileName}"]`);
+      const status = root.querySelector(`[data-provider-model-status="${profileName}"]`);
+      if (!select) return;
+      while (select.firstChild) select.removeChild(select.firstChild);
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = models.length ? '불러온 모델에서 선택' : '조회된 모델 없음';
+      select.appendChild(placeholder);
+      for (const item of models) {
+        const option = document.createElement('option');
+        option.value = item.id;
+        option.textContent = item.label === item.id ? item.id : `${item.label} · ${item.id}`;
+        if (text(profile?.model) === item.id) option.selected = true;
+        select.appendChild(option);
+      }
+      select.hidden = models.length === 0;
+      select.dataset.providerModelIdentity = providerModelCacheKey(profile);
+      if (status) status.textContent = `${formatNumber(models.length)}개 ${options.cached ? '캐시됨' : '로드됨'}`;
+    };
+    const syncProviderModelPicker = (profileName, options = {}) => {
+      const profile = providerProfileFromUi(profileName);
+      const meta = providerModelMetadata(profile.provider, profile.url);
+      const button = root.querySelector(`[data-load-models-profile="${profileName}"]`);
+      const select = root.querySelector(`[data-provider-model-select="${profileName}"]`);
+      const status = root.querySelector(`[data-provider-model-status="${profileName}"]`);
+      const hint = root.querySelector(`[data-provider-model-hint="${profileName}"]`);
+      const identity = providerModelCacheKey(profile);
+      if (button && !Runtime.providerModelLoading.has(profileName)) button.disabled = !meta;
+      if (hint) hint.textContent = meta?.nativeOllama
+        ? 'Ollama의 /api/tags에서 현재 호스트에 실제 설치된 모델을 읽습니다. 수동 모델 입력도 그대로 사용할 수 있습니다.'
+        : meta?.modelsUrl
+          ? `${meta.label} 모델 카탈로그를 조회합니다. 수동 모델 입력도 그대로 사용할 수 있습니다.`
+          : '자동 모델 목록 조회가 등록되지 않은 프로바이더는 Model 칸에 ID를 직접 입력하세요.';
+      const stale = Boolean(select && select.dataset.providerModelIdentity && select.dataset.providerModelIdentity !== identity);
+      if ((options.clear === true || stale) && select) {
+        while (select.firstChild) select.removeChild(select.firstChild);
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = '불러온 모델에서 선택';
+        select.appendChild(placeholder);
+        select.hidden = true;
+        select.dataset.providerModelIdentity = identity;
+        if (status) status.textContent = meta ? '목록 미조회' : '자동 조회 미지원';
+      }
+      const cached = cachedProviderModelEntry(profile);
+      if (cached && (!select || select.options.length <= 1 || select.hidden)) {
+        populateProviderModelPicker(profileName, profile, cached.models || [], { cached: true });
+      } else if (!meta && status) {
+        status.textContent = '자동 조회 미지원';
+      }
+      return { profile, meta };
+    };
     root.querySelector('#closeBridge')?.addEventListener('click', () => closeUi());
     root.querySelector('#analysisReturnToRisu')?.addEventListener('click', () => closeUi());
     for (const button of root.querySelectorAll('.nav[data-tab]')) {
@@ -7325,6 +7985,52 @@
         }
         const requestFormat = root.querySelector(`[data-provider-field="${profileName}.requestFormat"]`);
         if (requestFormat && !supportsResponses(select.value)) requestFormat.value = 'chat_completions';
+        syncProviderModelPicker(profileName, { clear: true });
+      });
+    }
+    for (const node of root.querySelectorAll('[data-provider-field$=".url"], [data-provider-field$=".key"]')) {
+      const profileName = text(node.getAttribute('data-provider-field')).split('.')[0];
+      node.addEventListener('change', () => syncProviderModelPicker(profileName, { clear: true }));
+    }
+    for (const select of root.querySelectorAll('[data-provider-model-select]')) {
+      select.addEventListener('change', () => {
+        const profileName = text(select.getAttribute('data-provider-model-select')).trim();
+        const model = text(select.value).trim();
+        if (!profileName || !model) return;
+        const modelInput = root.querySelector(`[data-provider-field="${profileName}.model"]`);
+        if (modelInput) modelInput.value = model;
+        setProviderStatus(`모델 선택 · ${model} · 저장 버튼을 누르면 적용됩니다.`, 'ok');
+      });
+    }
+    for (const button of root.querySelectorAll('.load-provider-models[data-load-models-profile]')) {
+      const profileName = text(button.getAttribute('data-load-models-profile')).trim() || 'primary';
+      syncProviderModelPicker(profileName);
+      button.addEventListener('click', async () => {
+        if (Runtime.providerModelLoading.has(profileName)) return;
+        const { profile, meta } = syncProviderModelPicker(profileName);
+        if (!meta) {
+          setProviderStatus(`${providerLabel(profile.provider)}는 자동 모델 목록 조회가 등록되어 있지 않습니다.`, 'error');
+          return;
+        }
+        Runtime.providerModelLoading.add(profileName);
+        const status = root.querySelector(`[data-provider-model-status="${profileName}"]`);
+        const originalText = button.textContent;
+        button.disabled = true;
+        button.textContent = '불러오는 중…';
+        if (status) status.textContent = '조회 중';
+        setProviderStatus(`${meta.label} 모델 목록을 불러오는 중…`);
+        try {
+          const models = await listProviderModels(profile, { force: true });
+          populateProviderModelPicker(profileName, profile, models);
+          setProviderStatus(`${meta.label} 모델 ${formatNumber(models.length)}개를 불러왔습니다.`, 'ok');
+        } catch (error) {
+          if (status) status.textContent = '조회 실패';
+          setProviderStatus(`모델 목록 조회 실패: ${error?.message || error}`, 'error');
+        } finally {
+          Runtime.providerModelLoading.delete(profileName);
+          button.textContent = originalText || '모델 목록 불러오기';
+          syncProviderModelPicker(profileName);
+        }
       });
     }
     for (const node of root.querySelectorAll('[data-provider-field$=".reasoningPreset"]')) {
@@ -7533,6 +8239,9 @@
           + (preview.includeLibra
             ? `LIBRA 정본 레코드 ${formatNumber(preview.libraRecordCount)}개\n`
             : 'LIBRA 데이터 없음\n')
+          + (preview.includeGradia
+            ? `GRADIA Story Arc ${formatNumber(preview.gradiaStoryArcCount)}개 · Writer/OOC ${formatNumber(preview.gradiaWriterDesignCount)}개\n`
+            : 'GRADIA 세션 데이터 없음\n')
           + (isLiaLivePersonaId(preview.identity?.personaId) ? 'LIA Live Persona · 새 채팅 전용 Fork\n' : 'LIA Live Persona 없음\n')
           + `Flashback 기억 ${formatNumber(preview.flashback.records)}개\n`
           + (preview.includeHayaku
@@ -7556,6 +8265,11 @@
           : result.libraRecords > 0
             ? `LIBRA 승계 표식 저장 · 영속 검증 실패: ${result.libraAdoption?.reason || 'unknown'}`
             : 'LIBRA 데이터 없음';
+        const gradiaStatus = result.gradiaVerified
+          ? `GRADIA 승계 확인: Story Arc ${formatNumber(result.gradiaAdoption?.storyArc || result.gradiaStoryArc)} · Writer/OOC ${formatNumber(result.gradiaAdoption?.writerDesign || result.gradiaWriterDesign)}`
+          : (result.gradiaStoryArc > 0 || result.gradiaWriterDesign > 0)
+            ? `GRADIA 승계 표식 저장 · 영속 검증 실패: ${result.gradiaAdoption?.reason || 'unknown'}`
+            : 'GRADIA 세션 데이터 없음';
         const liaStatus = result.liaRequired
           ? result.liaVerified
             ? `LIA Live Persona Fork 확인: ${result.targetLivePersonaId || result.liaAdoption?.livePersonaName || 'new Live Persona'}`
@@ -7564,6 +8278,7 @@
         globalThis.alert?.(
           `다음 세션을 만들었습니다.\n`
           + `${libraStatus}\n`
+          + `${gradiaStatus}\n`
           + `${liaStatus}\n`
           + `${flashbackStatus}\n`
           + hayakuStatus
@@ -7679,10 +8394,16 @@
     listHayakuLedgerBackups,
     loadSettings,
     saveSettings,
+    async listProviderModels(profile = null, options = {}) {
+      const source = profile || (await loadSettings()).primary;
+      return await listProviderModels(source, options || {});
+    },
+    resetProviderModelCache() { ProviderModelCache.clear(); return true; },
     testProvider: () => callProfile('primary', 'Return exactly MEMORY_SESSION_BRIDGE_PROVIDER_OK.', 'Connection test.', { maxTokens: 64, temperature: 0 }),
     readFlashbackViewer: async () => readFlashbackViewer(await getCurrentContext()),
     readHayakuViewer: async () => readHayakuSource(await getCurrentContext()),
     readLibraViewer: async () => await readLibraSource(await getCurrentContext()),
+    readGradiaSource: async () => await readGradiaSource(await getCurrentContext()),
     lastTransition: () => clone(Runtime.lastTransition, null),
     lastColdStart: () => clone(Runtime.lastColdStart, null),
     lastIncrementalRecovery: () => clone(Runtime.lastIncrementalRecovery, null),
@@ -7706,8 +8427,10 @@
       extractJsonObject, normalizeBridgeRecallAliases, normalizeColdStartPacket, normalizeIncrementalRecoveryPacket,
       validateBridgeCapsulePacketSet, bridgePacketHasSemanticPayload, priorTurnContextForChunk,
       requestLibraIpc, probeLibraIpc, normalizeLibraInspection, readLibraSource,
+      requestGradiaIpc, probeGradiaIpc, normalizeGradiaInspection, readGradiaSource,
       requestLiaIpc, adoptLiaLivePersonaHandoff, isLiaLivePersonaId,
       prepareLibraSessionHandoff, adoptLibraSessionHandoff, adoptLibraSessionHandoffDurable, verifyDurableLibraSessionHandoff,
+      prepareGradiaSessionHandoff, adoptGradiaSessionHandoff, adoptGradiaSessionHandoffDurable, verifyDurableGradiaSessionHandoff,
       requiredHandoffsVerified,
       libraMemoryViewerInfo,
       coldStartChunkHash, coldStartConfigHash, incrementalRecoveryConfigHash,
@@ -7721,6 +8444,7 @@
       normalizeReasoningPresetKey, reasoningPresetDefinition,
       effectiveReasoningFamily, reasoningState,
       providerModelLeaf, isGpt56Model, isKimiK3Model, isClaudeOpus5Model, isGemini3Model,
+      ollamaBaseUrl, ollamaApiUrl, providerModelMetadata, normalizeProviderModels, providerModelCacheKey, cachedProviderModelEntry, listProviderModels,
       callProfile
     }
   });
@@ -7733,6 +8457,7 @@
   await registerFlashbackIpc().catch(error => warn('Flashback IPC registration failed', error));
   await registerHayakuIpc().catch(error => warn('HAYAKU IPC registration failed', error));
   await registerLibraIpc().catch(error => warn('LIBRA IPC registration failed', error));
+  await registerGradiaIpc().catch(error => warn('GRADIA IPC registration failed', error));
   await registerLiaIpc().catch(error => warn('LIA IPC registration failed', error));
   await registerUi();
   const unloadApi = liveApi(['onUnload']);
@@ -7755,6 +8480,11 @@
         pending.reject(new Error('RE:TRACE unloaded before LIBRA IPC completed.'));
       }
       Runtime.libraIpcPending.clear();
+      for (const pending of Runtime.gradiaIpcPending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('RE:TRACE unloaded before GRADIA IPC completed.'));
+      }
+      Runtime.gradiaIpcPending.clear();
       for (const pending of Runtime.liaIpcPending.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error('RE:TRACE unloaded before LIA IPC completed.'));

@@ -1,7 +1,7 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.15
+//@version 1.9.16
 //@allowed-ipc libra
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
@@ -15,7 +15,7 @@
   'use strict';
 
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.15';
+  const PLUGIN_VERSION = '1.9.16';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v1';
   const LIBRA_PLUGIN_ID = 'libra';
   const LIBRA_IPC_SCHEMA = 'libra-retrace-ipc-v1';
@@ -146,6 +146,17 @@
   };
   const clone = (value, fallback = null) => {
     try { return JSON.parse(JSON.stringify(value)); } catch (_) { return fallback; }
+  };
+  const numericVersionParts = value => text(value || '').match(/\d+/g)?.slice(0, 3).map(Number) || [];
+  const versionAtLeast = (value, minimum) => {
+    const left = numericVersionParts(value);
+    const right = numericVersionParts(minimum);
+    for (let index = 0; index < 3; index += 1) {
+      const a = Number(left[index] || 0);
+      const b = Number(right[index] || 0);
+      if (a !== b) return a > b;
+    }
+    return true;
   };
   const normalizedHayakuPacketMaxChars = value => {
     const number = Math.floor(Number(value));
@@ -2100,24 +2111,30 @@
     const counts = source.counts && typeof source.counts === 'object' ? clone(source.counts, {}) : {};
     const storyArcCount = Math.max(0, Math.min(1, Number(counts.storyArc || (source.storyArc ? 1 : 0)) || 0));
     const writerDesignCount = Math.max(0, Math.min(1, Number(counts.writerDesign || (source.writerDesign ? 1 : 0)) || 0));
+    const narrativeArchiveCount = Math.max(
+      0,
+      Number(counts.narrativeArchive ?? source.narrativeArchive?.entries?.length ?? 0) || 0
+    );
     return {
-      available: schemaOk && scopeMatches && integrityOk && (storyArcCount > 0 || writerDesignCount > 0),
+      available: schemaOk && scopeMatches && integrityOk && (storyArcCount > 0 || writerDesignCount > 0 || narrativeArchiveCount > 0),
       pluginAvailable: schemaOk,
       inspectionAvailable: schemaOk && scopeMatches,
       integrityOk,
       reason: !schemaOk ? 'gradia_ipc_contract_unavailable'
         : !scopeMatches ? 'gradia_scope_mismatch'
           : !integrityOk ? text(source?.integrity?.reason || 'gradia_integrity_failed')
-            : (storyArcCount || writerDesignCount) ? 'loaded' : 'empty',
+            : (storyArcCount || writerDesignCount || narrativeArchiveCount) ? 'loaded' : 'empty',
       readSource,
       pluginVersion: text(source.pluginVersion || ''),
       scope,
       integrity: clone(source.integrity, { ok: integrityOk }),
-      counts: { ...counts, storyArc: storyArcCount, writerDesign: writerDesignCount },
+      counts: { ...counts, storyArc: storyArcCount, writerDesign: writerDesignCount, narrativeArchive: narrativeArchiveCount },
       storyArc: source.storyArc && typeof source.storyArc === 'object' ? clone(source.storyArc, {}) : null,
       writerDesign: source.writerDesign && typeof source.writerDesign === 'object' ? clone(source.writerDesign, {}) : null,
+      narrativeArchive: source.narrativeArchive && typeof source.narrativeArchive === 'object' ? clone(source.narrativeArchive, {}) : null,
       storyArcCount,
       writerDesignCount,
+      narrativeArchiveCount,
       manualUserIntentCount: Math.max(0, Number(counts.manualUserIntent || 0) || 0),
       storyArcBeatCount: Math.max(0, Number(counts.storyArcBeats || source.storyArc?.beats?.length || 0) || 0),
       completedTurnCount: Math.max(0, Number(counts.completedTurns || 0) || 0),
@@ -2143,8 +2160,8 @@
         return {
           available: false, pluginAvailable: true, inspectionAvailable: false, integrityOk: false,
           reason, readSource: 'gradia_plugin_ipc', pluginVersion: text(probe.pluginVersion || ''),
-          scope: {}, integrity: { ok: false, reason }, counts: {}, storyArc: null, writerDesign: null,
-          storyArcCount: 0, writerDesignCount: 0, manualUserIntentCount: 0, storyArcBeatCount: 0,
+          scope: {}, integrity: { ok: false, reason }, counts: {}, storyArc: null, writerDesign: null, narrativeArchive: null,
+          storyArcCount: 0, writerDesignCount: 0, narrativeArchiveCount: 0, manualUserIntentCount: 0, storyArcBeatCount: 0,
           completedTurnCount: 0, snapshotHash: '', capabilities: clone(probe.capabilities, {}), probe: clone(probe, {}),
           errors: [text(error?.message || error || reason)]
         };
@@ -2162,7 +2179,7 @@
     return {
       available: false, pluginAvailable: false, inspectionAvailable: false, integrityOk: false,
       reason: 'gradia_ipc_unavailable', readSource: 'none', pluginVersion: '', scope: {}, integrity: { ok: false },
-      counts: {}, storyArc: null, writerDesign: null, storyArcCount: 0, writerDesignCount: 0,
+      counts: {}, storyArc: null, writerDesign: null, narrativeArchive: null, storyArcCount: 0, writerDesignCount: 0, narrativeArchiveCount: 0,
       manualUserIntentCount: 0, storyArcBeatCount: 0, completedTurnCount: 0, snapshotHash: '',
       probe: clone(probe, {}), errors: [probe.error || 'GRADIA v0.25.25 or later IPC contract is required.']
     };
@@ -2183,9 +2200,16 @@
     )
   );
 
+  const gradiaArchiveReceiptCountMatches = (receipt, field, expected) => {
+    const required = Math.max(0, Number(expected || 0) || 0) > 0;
+    if (!receipt || !Object.prototype.hasOwnProperty.call(receipt, field)) return !required;
+    return Number.isInteger(Number(receipt[field])) && Number(receipt[field]) === expected;
+  };
+
   const gradiaPreparationReceiptMatches = (receipt, options, transport) => {
     const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
     const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
+    const expectedNarrativeArchive = Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0);
     return receipt?.schema === GRADIA_HANDOFF_RECEIPT_SCHEMA
       && receipt?.action === 'prepared'
       && receipt?.prepared === true
@@ -2195,12 +2219,15 @@
       && gradiaReceiptCountMatches(receipt, 'expectedStoryArc', expectedStoryArc)
       && gradiaReceiptCountMatches(receipt, 'writerDesign', expectedWriterDesign)
       && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
+      && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
+      && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
       && gradiaOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
   };
 
   const gradiaAdoptionReceiptMatches = (receipt, options, transport) => {
     const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
     const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
+    const expectedNarrativeArchive = Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0);
     return receipt?.schema === GRADIA_HANDOFF_RECEIPT_SCHEMA
       && receipt?.action === 'adopted'
       && receipt?.verified === true
@@ -2211,12 +2238,15 @@
       && gradiaReceiptCountMatches(receipt, 'expectedStoryArc', expectedStoryArc)
       && gradiaReceiptCountMatches(receipt, 'writerDesign', expectedWriterDesign)
       && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
+      && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
+      && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
       && gradiaOwnerReceiptMatches(receipt, transport, 'adopt_session_handoff');
   };
 
   const gradiaVerificationReceiptMatches = (receipt, options, transport) => {
     const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
     const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
+    const expectedNarrativeArchive = Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0);
     return receipt?.schema === GRADIA_HANDOFF_RECEIPT_SCHEMA
       && receipt?.action === 'verified'
       && receipt?.verified === true
@@ -2227,6 +2257,8 @@
       && gradiaReceiptCountMatches(receipt, 'expectedStoryArc', expectedStoryArc)
       && gradiaReceiptCountMatches(receipt, 'writerDesign', expectedWriterDesign)
       && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
+      && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
+      && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
       && gradiaOwnerReceiptMatches(receipt, transport, 'verify_session_handoff');
   };
 
@@ -2249,6 +2281,7 @@
   const adoptGradiaSessionHandoff = async options => {
     const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
     const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
+    const expectedNarrativeArchive = Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0);
     const runtime = activeGradiaRuntime();
     try {
       const result = await requestGradiaIpc('adopt_session_handoff', options || {}, { timeoutMs: 12000 });
@@ -2261,6 +2294,7 @@
       return {
         schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: false, durable: false,
         storyArc: 0, expectedStoryArc, writerDesign: 0, expectedWriterDesign,
+        narrativeArchive: 0, expectedNarrativeArchive,
         targetChatId: text(options?.targetChatId || ''), transferId: text(options?.transferId || ''),
         transport: 'unavailable', reason: text(error?.message || error || 'gradia_handoff_adoption_failed')
       };
@@ -2281,13 +2315,15 @@
   const verifyDurableGradiaSessionHandoff = async options => {
     if (options?.included !== true) return {
       schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: true, durable: true,
-      adopted: false, storyArc: 0, expectedStoryArc: 0, writerDesign: 0, expectedWriterDesign: 0, reason: 'no_gradia_data'
+      adopted: false, storyArc: 0, expectedStoryArc: 0, writerDesign: 0, expectedWriterDesign: 0,
+      narrativeArchive: 0, expectedNarrativeArchive: 0, reason: 'no_gradia_data'
     };
     const payload = {
       transferId: text(options?.transferId || ''),
       targetChatId: text(options?.targetChatId || ''),
       expectedStoryArc: Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0)),
-      expectedWriterDesign: Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0))
+      expectedWriterDesign: Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0)),
+      expectedNarrativeArchive: Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0)
     };
     const runtime = activeGradiaRuntime();
     try {
@@ -2307,6 +2343,7 @@
       return {
         schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: false, durable: false,
         storyArc: 0, expectedStoryArc: payload.expectedStoryArc, writerDesign: 0, expectedWriterDesign: payload.expectedWriterDesign,
+        narrativeArchive: 0, expectedNarrativeArchive: payload.expectedNarrativeArchive,
         targetChatId: payload.targetChatId, transferId: payload.transferId, transport: 'unavailable',
         reason: text(error?.message || error || 'gradia_handoff_verification_failed')
       };
@@ -6498,6 +6535,7 @@
       libraRecordCount: libra.recordCount,
       gradiaStoryArcCount: gradia.storyArcCount,
       gradiaWriterDesignCount: gradia.writerDesignCount,
+      gradiaNarrativeArchiveCount: gradia.narrativeArchiveCount,
       inspectedAt: Date.now()
     };
     Runtime.lastPreview = preview;
@@ -6650,11 +6688,18 @@
     if (gradia.pluginAvailable && gradia.integrityOk === false) {
       const inspectionFailed = ['gradia_inspect_timeout', 'gradia_inspect_failed'].includes(text(gradia.reason));
       throw new Error(`${inspectionFailed
-        ? 'GRADIA is connected, but Story Arc/Writer inspection could not be verified; next-session handoff was stopped.'
-        : 'GRADIA Story Arc/Writer state integrity is incomplete; next-session handoff was stopped.'} ${JSON.stringify({
+        ? 'GRADIA is connected, but Story Arc/Writer/Narrative Archive inspection could not be verified; next-session handoff was stopped.'
+        : 'GRADIA Story Arc/Writer/Narrative Archive state integrity is incomplete; next-session handoff was stopped.'} ${JSON.stringify({
         reason: gradia.reason, storyArc: gradia.storyArcCount, writerDesign: gradia.writerDesignCount,
-        integrity: gradia.integrity, errors: gradia.errors || []
+        narrativeArchive: gradia.narrativeArchiveCount, integrity: gradia.integrity, errors: gradia.errors || []
       })}`);
+    }
+    const gradiaArchiveHandoffSupported = gradia?.capabilities?.features?.narrativeArchiveHandoff === true;
+    if (gradia.pluginAvailable
+      && versionAtLeast(gradia.pluginVersion, '0.25.32')
+      && !versionAtLeast(gradia.pluginVersion, '0.25.37')
+      && !gradiaArchiveHandoffSupported) {
+      throw new Error(`GRADIA ${gradia.pluginVersion || '0.25.32-0.25.36'} includes Narrative Archive but does not expose durable Archive session handoff. Update GRADIA to v0.25.37 or later before creating the next session.`);
     }
     const targetChatId = uuid();
     const transferId = uuid();
@@ -6680,13 +6725,15 @@
         transferId,
         expectedStoryArc: gradia.storyArcCount,
         expectedWriterDesign: gradia.writerDesignCount,
+        expectedNarrativeArchive: gradia.narrativeArchiveCount,
         expectedSnapshotHash: gradia.snapshotHash
       })
-      : { schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, prepared: false, storyArc: 0, writerDesign: 0, reason: 'no_gradia_data' };
+      : { schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, prepared: false, storyArc: 0, writerDesign: 0, narrativeArchive: 0, reason: 'no_gradia_data' };
     if (preview.includeGradia && (
       gradiaPreparation.prepared !== true
       || Number(gradiaPreparation.storyArc || 0) !== Number(gradia.storyArcCount || 0)
       || Number(gradiaPreparation.writerDesign || 0) !== Number(gradia.writerDesignCount || 0)
+      || Number(gradiaPreparation.narrativeArchive || 0) !== Number(gradia.narrativeArchiveCount || 0)
     )) {
       throw new Error(`GRADIA next-session handoff preparation failed before creating the new chat: ${gradiaPreparation.reason || 'record_count_mismatch'}`);
     }
@@ -6725,8 +6772,10 @@
           transferId, sourceChatId: identity.chatId, targetChatId,
           sourceStoryArcScopeKey: text(gradia.scope?.storyArcScopeKey || ''),
           sourceWriterScopeKey: text(gradia.scope?.writerScopeKey || ''),
+          sourceNarrativeArchiveScopeKey: text(gradia.scope?.narrativeArchiveScopeKey || ''),
           storyArcCount: gradia.storyArcCount,
           writerDesignCount: gradia.writerDesignCount,
+          narrativeArchiveCount: gradia.narrativeArchiveCount,
           sourceSnapshotHash: text(gradia.snapshotHash || ''),
           preparedAt: gradiaPreparation.preparedAt || new Date(createdAt).toISOString()
         }
@@ -6741,6 +6790,7 @@
         sourceLibraScopeKey: text(libra.scope?.scopeKey || ''),
         sourceGradiaStoryArcScopeKey: text(gradia.scope?.storyArcScopeKey || ''),
         sourceGradiaWriterScopeKey: text(gradia.scope?.writerScopeKey || ''),
+        sourceGradiaNarrativeArchiveScopeKey: text(gradia.scope?.narrativeArchiveScopeKey || ''),
         targetChatId,
         includeFlashback: true,
         includeHayaku: preview.includeHayaku === true,
@@ -6754,6 +6804,7 @@
         libraWorldAdditionalCount: libra.worldAdditionalCount,
         gradiaStoryArcCount: gradia.storyArcCount,
         gradiaWriterDesignCount: gradia.writerDesignCount,
+        gradiaNarrativeArchiveCount: gradia.narrativeArchiveCount,
         createdAt
       }
     };
@@ -6787,8 +6838,9 @@
       if (!latestGradia.integrityOk
         || latestGradia.snapshotHash !== gradia.snapshotHash
         || latestGradia.storyArcCount !== gradia.storyArcCount
-        || latestGradia.writerDesignCount !== gradia.writerDesignCount) {
-        throw new Error('GRADIA Story Arc/Writer state changed during handoff preparation. Run the transition again.');
+        || latestGradia.writerDesignCount !== gradia.writerDesignCount
+        || latestGradia.narrativeArchiveCount !== gradia.narrativeArchiveCount) {
+        throw new Error('GRADIA Story Arc/Writer/Narrative Archive state changed during handoff preparation. Run the transition again.');
       }
     }
     const writer = await saveCharacter(nextCharacter, context.characterIndex);
@@ -6823,7 +6875,8 @@
           targetChatId,
           transferId,
           expectedStoryArc: gradia.storyArcCount,
-          expectedWriterDesign: gradia.writerDesignCount
+          expectedWriterDesign: gradia.writerDesignCount,
+          expectedNarrativeArchive: gradia.narrativeArchiveCount
         })
         : Promise.resolve({
           schema: GRADIA_HANDOFF_RECEIPT_SCHEMA,
@@ -6833,6 +6886,8 @@
           expectedStoryArc: 0,
           writerDesign: 0,
           expectedWriterDesign: 0,
+          narrativeArchive: 0,
+          expectedNarrativeArchive: 0,
           reason: 'no_gradia_data'
         }),
       adoptLiaLivePersonaHandoff({ sourceChatId: identity.chatId, targetChatId, transferId, sourceLivePersonaId })
@@ -6852,7 +6907,8 @@
         targetChatId,
         transferId,
         expectedStoryArc: gradia.storyArcCount,
-        expectedWriterDesign: gradia.writerDesignCount
+        expectedWriterDesign: gradia.writerDesignCount,
+        expectedNarrativeArchive: gradia.narrativeArchiveCount
       })
       : gradiaAdoptionInitial;
     const flashbackVerified = flashbackAdoption?.verified === true
@@ -6876,7 +6932,8 @@
       && text(gradiaAdoption?.targetChatId || '') === targetChatId
       && text(gradiaAdoption?.transferId || '') === transferId
       && Number(gradiaAdoption?.storyArc || 0) === Number(gradia.storyArcCount || 0)
-      && Number(gradiaAdoption?.writerDesign || 0) === Number(gradia.writerDesignCount || 0);
+      && Number(gradiaAdoption?.writerDesign || 0) === Number(gradia.writerDesignCount || 0)
+      && Number(gradiaAdoption?.narrativeArchive || 0) === Number(gradia.narrativeArchiveCount || 0);
     const liaVerified = !liaRequired || (
       liaAdoption?.schema === LIA_HANDOFF_RECEIPT_SCHEMA
       && liaAdoption?.verified === true
@@ -6925,6 +6982,7 @@
       gradiaAdoption,
       gradiaStoryArc: gradia.storyArcCount,
       gradiaWriterDesign: gradia.writerDesignCount,
+      gradiaNarrativeArchive: gradia.narrativeArchiveCount,
       gradiaStoryArcBeats: gradia.storyArcBeatCount,
       gradiaSource: preview.includeGradia ? text(gradia.readSource || 'unknown') : 'none',
       liaRequired,
@@ -7364,8 +7422,8 @@
         <section class="panel ${Runtime.activeTab === 'session' ? 'active' : ''}" data-panel="session">
           <div class="panel-heading"><div><h2>다음 세션</h2><p>LIBRA, GRADIA, HAYAKU, Flashback의 연속성 데이터를 새 채팅으로 함께 승계합니다.</p></div></div>
           <div class="card"><div class="heading"><div><strong>대화 이어가기</strong><span>새 채팅 저장 직후 세 시스템의 승계 계약과 영속 반영을 검증합니다.</span></div><em class="badge">원본 보존</em></div>
-            <div class="flow session-handoff-flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · GRADIA</b><small>Story Arc의 다음 5턴 비트와 Writer/OOC 상태를 새 세션 기준으로 재결속</small></div><div><b>3 · Flashback</b><small>이전 기억을 영구 과거로 즉시 채택·검증</small></div><div><b>4 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>5 · LIA</b><small>활성 Live Persona를 새 채팅 전용 Persona로 Fork·재바인딩</small></div><div><b>6 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
-            <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">LIBRA는 공식 IPC로 pluginStorage 정본을 이전 세션 영구 기억에 채택합니다. GRADIA는 Story Arc를 새 세션의 로컬 TURN 1~5 기준으로 재기준화해 다음 비트를 유지하고 Writer/OOC 상태도 독립 스코프로 승계합니다. Flashback과 HAYAKU도 각 공식 채택 경로를 사용합니다.</p>
+            <div class="flow session-handoff-flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · GRADIA</b><small>Story Arc의 다음 5턴 비트·Writer/OOC·Narrative Archive를 새 세션 기준으로 재결속</small></div><div><b>3 · Flashback</b><small>이전 기억을 영구 과거로 즉시 채택·검증</small></div><div><b>4 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>5 · LIA</b><small>활성 Live Persona를 새 채팅 전용 Persona로 Fork·재바인딩</small></div><div><b>6 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
+            <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">LIBRA는 공식 IPC로 pluginStorage 정본을 이전 세션 영구 기억에 채택합니다. GRADIA는 Story Arc를 새 세션의 로컬 TURN 1~5 기준으로 재기준화하고 Writer/OOC를 독립 스코프로 옮기며, Narrative Archive는 과거 세션의 휴면 서사 기록으로 승계합니다. Flashback과 HAYAKU도 각 공식 채택 경로를 사용합니다.</p>
             <div class="actions"><button id="refreshTransition" class="btn">다시 확인</button><button id="createSession" class="btn primary">다음 세션 만들기</button></div>
           </div>
         </section>
@@ -7522,11 +7580,11 @@
             : `LIBRA 연결됨 · 정본 없음 (${preview.libra.reason})`
           : 'LIBRA IPC 연결 없음 · LIBRA v1.0.4+ 필요';
       const gradiaLine = preview.includeGradia
-        ? `GRADIA Story Arc ${formatNumber(preview.gradiaStoryArcCount)}개 · Writer/OOC ${formatNumber(preview.gradiaWriterDesignCount)}개 승계 준비`
+        ? `GRADIA Story Arc ${formatNumber(preview.gradiaStoryArcCount)}개 · Writer/OOC ${formatNumber(preview.gradiaWriterDesignCount)}개 · Narrative Archive ${formatNumber(preview.gradiaNarrativeArchiveCount)}개 승계 준비`
         : preview.gradia.pluginAvailable
           ? ['gradia_inspect_timeout', 'gradia_inspect_failed'].includes(text(preview.gradia.reason))
             ? `GRADIA 연결됨 · Story Arc 조회 실패 (${preview.gradia.reason})`
-            : `GRADIA 연결됨 · 승계할 Story Arc/Writer 상태 없음 (${preview.gradia.reason})`
+            : `GRADIA 연결됨 · 승계할 Story Arc/Writer/Narrative Archive 상태 없음 (${preview.gradia.reason})`
           : 'GRADIA IPC 연결 없음 · GRADIA v0.25.25+ 필요';
       node.textContent = `${libraLine}\n${gradiaLine}\n${flashbackLine}\n${hayakuLine}`;
       return preview;
@@ -8240,7 +8298,7 @@
             ? `LIBRA 정본 레코드 ${formatNumber(preview.libraRecordCount)}개\n`
             : 'LIBRA 데이터 없음\n')
           + (preview.includeGradia
-            ? `GRADIA Story Arc ${formatNumber(preview.gradiaStoryArcCount)}개 · Writer/OOC ${formatNumber(preview.gradiaWriterDesignCount)}개\n`
+            ? `GRADIA Story Arc ${formatNumber(preview.gradiaStoryArcCount)}개 · Writer/OOC ${formatNumber(preview.gradiaWriterDesignCount)}개 · Narrative Archive ${formatNumber(preview.gradiaNarrativeArchiveCount)}개\n`
             : 'GRADIA 세션 데이터 없음\n')
           + (isLiaLivePersonaId(preview.identity?.personaId) ? 'LIA Live Persona · 새 채팅 전용 Fork\n' : 'LIA Live Persona 없음\n')
           + `Flashback 기억 ${formatNumber(preview.flashback.records)}개\n`
@@ -8266,8 +8324,8 @@
             ? `LIBRA 승계 표식 저장 · 영속 검증 실패: ${result.libraAdoption?.reason || 'unknown'}`
             : 'LIBRA 데이터 없음';
         const gradiaStatus = result.gradiaVerified
-          ? `GRADIA 승계 확인: Story Arc ${formatNumber(result.gradiaAdoption?.storyArc || result.gradiaStoryArc)} · Writer/OOC ${formatNumber(result.gradiaAdoption?.writerDesign || result.gradiaWriterDesign)}`
-          : (result.gradiaStoryArc > 0 || result.gradiaWriterDesign > 0)
+          ? `GRADIA 승계 확인: Story Arc ${formatNumber(result.gradiaAdoption?.storyArc || result.gradiaStoryArc)} · Writer/OOC ${formatNumber(result.gradiaAdoption?.writerDesign || result.gradiaWriterDesign)} · Narrative Archive ${formatNumber(result.gradiaAdoption?.narrativeArchive || result.gradiaNarrativeArchive)}`
+          : (result.gradiaStoryArc > 0 || result.gradiaWriterDesign > 0 || result.gradiaNarrativeArchive > 0)
             ? `GRADIA 승계 표식 저장 · 영속 검증 실패: ${result.gradiaAdoption?.reason || 'unknown'}`
             : 'GRADIA 세션 데이터 없음';
         const liaStatus = result.liaRequired

@@ -22,6 +22,7 @@
   const PLUGIN_NAME = 'RE:TRACE';
   const PLUGIN_VERSION = '1.9.18';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v1';
+  const HANDOFF_JOURNAL_SCHEMA = 'memory-session-bridge-handoff-journal-v1';
   const LIBRA_PLUGIN_ID = 'libra';
   const LIBRA_IPC_SCHEMA = 'libra-retrace-ipc-v1';
   const LIBRA_IPC_REQUEST_CHANNEL = 'libra_memory_bridge_request_v1';
@@ -142,6 +143,7 @@
     liaIpcRegistered: false,
     liaIpcPending: new Map(),
     liaIpcLastError: '',
+    handoffResumePromises: new Map(),
     warnings: []
   };
 
@@ -2509,6 +2511,38 @@
   };
 
   const isLiaLivePersonaId = value => text(value || '').trim().startsWith(LIA_LIVE_PERSONA_ID_PREFIX);
+
+  const liaAdoptionReceiptMatches = (receipt, options = {}) => {
+    const sourceChatId = text(options.sourceChatId || '').trim();
+    const targetChatId = text(options.targetChatId || '').trim();
+    const transferId = text(options.transferId || '').trim();
+    const sourceLivePersonaId = text(options.sourceLivePersonaId || '').trim();
+    const livePersonaId = text(receipt?.livePersonaId || '').trim();
+    const sourceScopeKey = text(receipt?.sourceScopeKey || '').trim();
+    const targetScopeKey = text(receipt?.targetScopeKey || '').trim();
+    return receipt?.schema === LIA_HANDOFF_RECEIPT_SCHEMA
+      && receipt?.action === 'adopted'
+      && typeof receipt?.adopted === 'boolean'
+      && receipt?.verified === true
+      && receipt?.durable === true
+      && receipt?.durableReadbackVerified === true
+      && text(receipt?.ownerPluginId || '') === LIA_PLUGIN_ID
+      && text(receipt?.authorizedRequester || '') === 'flashback_hayaku_bridge'
+      && text(receipt?.mutation || '') === 'adopt_chat_handoff'
+      && text(receipt?.sourceChatId || '') === sourceChatId
+      && text(receipt?.targetChatId || '') === targetChatId
+      && text(receipt?.transferId || '') === transferId
+      && text(receipt?.sourceLivePersonaId || '') === sourceLivePersonaId
+      && isLiaLivePersonaId(livePersonaId)
+      && livePersonaId !== sourceLivePersonaId
+      && sourceScopeKey.length > 0
+      && targetScopeKey.length > 0
+      && targetScopeKey !== sourceScopeKey
+      && text(receipt?.forkedFromScopeKey || '') === sourceScopeKey
+      && text(receipt?.forkedFromLivePersonaId || '') === sourceLivePersonaId
+      && text(receipt?.handoffSourceChatId || '') === sourceChatId
+      && text(receipt?.handoffTransferId || '') === transferId;
+  };
 
   const adoptLiaLivePersonaHandoff = async options => {
     const sourceLivePersonaId = text(options?.sourceLivePersonaId || '').trim();
@@ -6159,6 +6193,9 @@
       && (stagedHasUnfinishedWork || stagedNeedsFinalization)
       && checkpointPlan.matchedCheckpointCount > 0
       && (checkpointPlan.pendingChunkCount > 0 || stagedNeedsFinalization);
+    // A verified capsule awaiting owner adoption is already past analysis. Do
+    // not simultaneously advertise its older staged run as resumable work.
+    const canResume = resumableRun && !capsuleNeedsAdoption;
     const eligible = hasHayakuHistory
       && evidence.recoveryTurns.length > 0
       && evidence.chunks.length > 0;
@@ -6171,16 +6208,16 @@
       evidence,
       checkpointPlan,
       hasHayakuHistory,
-      eligible: eligible || capsuleNeedsAdoption || resumableRun,
+      eligible: eligible || capsuleNeedsAdoption || canResume,
       canReadopt: capsuleNeedsAdoption,
-      canResume: resumableRun,
+      canResume,
       stalePendingCapsule,
       targeted,
-      recommendedMode: capsuleNeedsAdoption ? 'readopt' : resumableRun ? 'resume' : 'incremental',
+      recommendedMode: capsuleNeedsAdoption ? 'readopt' : canResume ? 'resume' : 'incremental',
       reason: !hasHayakuHistory ? 'cold_start_required'
         : stalePendingCapsule ? 'incremental_recovery_stale_capsule'
           : capsuleNeedsAdoption ? 'incremental_recovery_readopt'
-          : resumableRun ? 'incremental_recovery_resume'
+          : canResume ? 'incremental_recovery_resume'
             : targeted && evidence.chunks.length ? 'targeted_regeneration'
             : evidence.coverage.missingTurns.length === 0 && evidence.coverage.userSuppressedTurns.length
               ? 'user_suppressed_only'
@@ -6880,6 +6917,11 @@
       && libraReceiptCountMatches(receipt, 'expectedRecords', expectedRecords)
       && libraReceiptCountMatches(receipt, 'worldAdditional', expectedWorldAdditional)
       && libraReceiptCountMatches(receipt, 'expectedWorldAdditional', expectedWorldAdditional)
+      && text(receipt?.archiveId || '').trim().length > 0
+      && Number.isInteger(Number(receipt?.archiveGeneration))
+      && Number(receipt.archiveGeneration) >= 1
+      && text(receipt?.archiveDigest || '').trim().length > 0
+      && libraReceiptCountMatches(receipt, 'archiveRecordCount', expectedRecords)
       && libraArchiveReceiptMatches(receipt, options)
       && libraOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
   };
@@ -7033,6 +7075,7 @@
 
   const inspectTransition = async () => {
     const context = await getCurrentContext();
+    const pendingHandoff = await inspectPendingNextSessionHandoff({ context });
     const [flashback, hayaku, pendingColdStart, libra, gradia] = await Promise.all([
       readFlashbackSource(context, { includeRecords: false }),
       readHayakuSource(context, { includeRecords: false }),
@@ -7048,6 +7091,7 @@
       libra,
       gradia,
       pendingColdStart,
+      pendingHandoff,
       includeHayaku: hayaku.available === true || pendingColdStart.available === true,
       includeLibra: libra.available === true,
       includeGradia: gradia.available === true,
@@ -7170,6 +7214,98 @@
     return { writer: 'setCharacter', characterIndex };
   };
 
+  const sealNextSessionHandoffJournal = value => {
+    const journal = clone(value, {});
+    delete journal.journalDigest;
+    journal.journalDigest = stableHash64(JSON.stringify(journal));
+    return journal;
+  };
+
+  const nextSessionHandoffJournalFromChat = chat => {
+    const targetChatId = contextIdentity({ chat }).chatId;
+    const bridge = chat?.memorySessionBridge && typeof chat.memorySessionBridge === 'object'
+      ? chat.memorySessionBridge
+      : null;
+    const journal = bridge?.handoffJournal && typeof bridge.handoffJournal === 'object'
+      ? bridge.handoffJournal
+      : null;
+    if (!bridge || bridge.schema !== HANDOFF_SCHEMA || !journal || journal.schema !== HANDOFF_JOURNAL_SCHEMA) {
+      return { available: false, reason: 'handoff_journal_absent', targetChatId, bridge: null, journal: null };
+    }
+    const identityMatches = text(bridge.targetChatId || '') === targetChatId
+      && text(journal.targetChatId || '') === targetChatId
+      && text(journal.transferId || '') === text(bridge.transferId || '')
+      && text(journal.sourceChatId || '') === text(bridge.sourceChatId || '')
+      && targetChatId !== text(journal.sourceChatId || '');
+    const expectedDigest = text(journal.journalDigest || '');
+    const actualDigest = sealNextSessionHandoffJournal(journal).journalDigest;
+    const integrityOk = identityMatches && expectedDigest.length > 0 && expectedDigest === actualDigest;
+    return {
+      available: integrityOk,
+      reason: !identityMatches ? 'handoff_journal_identity_mismatch'
+        : expectedDigest !== actualDigest ? 'handoff_journal_digest_mismatch'
+          : 'handoff_journal_loaded',
+      targetChatId,
+      bridge: clone(bridge, {}),
+      journal: clone(journal, {}),
+      integrityOk
+    };
+  };
+
+  const inspectPendingNextSessionHandoff = async (options = {}) => {
+    const context = options?.context || await getCurrentContext();
+    const requestedTargetChatId = text(options?.targetChatId || '').trim();
+    const currentChatId = contextIdentity(context).chatId;
+    const targetChatId = requestedTargetChatId || currentChatId;
+    const chats = Array.isArray(context?.character?.chats) ? context.character.chats : [];
+    const chat = chats.find(item => contextIdentity({ chat: item }).chatId === targetChatId) || null;
+    if (!chat) return { available: false, pending: false, reason: 'handoff_target_chat_missing', targetChatId };
+    const loaded = nextSessionHandoffJournalFromChat(chat);
+    const pending = loaded.available === true && text(loaded.journal?.state || '') !== 'completed';
+    return { ...loaded, context, chat, pending };
+  };
+
+  const persistNextSessionHandoffJournal = async (targetChatIdValue, transferIdValue, patch = {}) => {
+    const targetChatId = text(targetChatIdValue || '').trim();
+    const transferId = text(transferIdValue || '').trim();
+    const latest = await getCurrentContext();
+    const nextCharacter = clone(latest.character, null);
+    const chats = Array.isArray(nextCharacter?.chats) ? nextCharacter.chats : [];
+    const targetIndex = chats.findIndex(chat => contextIdentity({ chat }).chatId === targetChatId);
+    if (!nextCharacter || targetIndex < 0) throw new Error('RE:TRACE pending handoff target chat was not found.');
+    const loaded = nextSessionHandoffJournalFromChat(chats[targetIndex]);
+    if (!loaded.available || text(loaded.journal?.transferId || '') !== transferId) {
+      throw new Error(`RE:TRACE pending handoff journal is invalid: ${loaded.reason || 'identity_mismatch'}`);
+    }
+    const nextJournal = sealNextSessionHandoffJournal({
+      ...clone(loaded.journal, {}),
+      ...clone(patch, {}),
+      ownerStatus: {
+        ...clone(loaded.journal?.ownerStatus, {}),
+        ...clone(patch?.ownerStatus, {})
+      },
+      updatedAt: Date.now()
+    });
+    chats[targetIndex] = {
+      ...clone(chats[targetIndex], {}),
+      memorySessionBridge: {
+        ...clone(loaded.bridge, {}),
+        handoffJournal: nextJournal
+      }
+    };
+    await saveCharacter(nextCharacter, latest.characterIndex);
+    const readbackContext = await getCurrentContext();
+    const readbackChat = (Array.isArray(readbackContext?.character?.chats) ? readbackContext.character.chats : [])
+      .find(chat => contextIdentity({ chat }).chatId === targetChatId);
+    const readback = nextSessionHandoffJournalFromChat(readbackChat);
+    if (!readback.available
+      || text(readback.journal?.transferId || '') !== transferId
+      || text(readback.journal?.journalDigest || '') !== text(nextJournal.journalDigest || '')) {
+      throw new Error('RE:TRACE pending handoff journal durable readback failed.');
+    }
+    return readback.journal;
+  };
+
   const requiredHandoffsVerified = status => (
     (status?.flashbackRequired !== true || status?.flashbackVerified === true)
     && (status?.hayakuRequired !== true || status?.hayakuVerified === true)
@@ -7178,7 +7314,201 @@
     && (status?.liaRequired !== true || status?.liaVerified === true)
   );
 
+  const performPendingNextSessionHandoff = async loaded => {
+    const bridge = clone(loaded?.bridge, {});
+    const journal = clone(loaded?.journal, {});
+    const targetChatId = text(bridge.targetChatId || '').trim();
+    const transferId = text(bridge.transferId || '').trim();
+    const sourceChatId = text(bridge.sourceChatId || '').trim();
+    if (!loaded?.available || !targetChatId || !transferId || !sourceChatId || sourceChatId === targetChatId) {
+      throw new Error('RE:TRACE pending handoff journal identity is invalid.');
+    }
+    const activeChatId = contextIdentity(await getCurrentContext()).chatId;
+    if (activeChatId !== targetChatId) {
+      throw new Error('Select the pending target chat before resuming its owner handoffs.');
+    }
+    const attempt = Math.max(0, Number(journal.attempts || 0) || 0) + 1;
+
+    const flashbackRecords = Math.max(0, Number(bridge.flashbackRecordCount || 0) || 0);
+    const hayakuRecords = Math.max(0, Number(bridge.hayakuRecordCount || 0) || 0);
+    const libraRecords = Math.max(0, Number(bridge.libraRecordCount || 0) || 0);
+    const libraWorldAdditional = Math.max(0, Number(bridge.libraWorldAdditionalCount || 0) || 0);
+    const gradiaStoryArc = Math.max(0, Number(bridge.gradiaStoryArcCount || 0) || 0);
+    const gradiaWriterDesign = Math.max(0, Number(bridge.gradiaWriterDesignCount || 0) || 0);
+    const gradiaNarrativeArchive = Math.max(0, Number(bridge.gradiaNarrativeArchiveCount || 0) || 0);
+    const sourceLivePersonaId = text(bridge.sourceLiaLivePersonaId || '').trim();
+    const flashbackRequired = bridge.includeFlashback === true && flashbackRecords > 0;
+    const hayakuRequired = bridge.includeHayaku === true && hayakuRecords > 0;
+    const libraRequired = bridge.includeLibra === true;
+    const gradiaRequired = bridge.includeGradia === true;
+    const liaRequired = bridge.includeLiaLivePersona === true && isLiaLivePersonaId(sourceLivePersonaId);
+    const libraOptions = {
+      targetChatId, transferId,
+      expectedRecords: libraRecords,
+      expectedWorldAdditional: libraWorldAdditional,
+      expectedArchiveId: text(bridge.libraArchiveId || ''),
+      expectedArchiveGeneration: Math.max(0, Number(bridge.libraArchiveGeneration || 0) || 0),
+      expectedArchiveDigest: text(bridge.libraArchiveDigest || '')
+    };
+    const gradiaOptions = {
+      targetChatId, transferId,
+      expectedStoryArc: gradiaStoryArc,
+      expectedWriterDesign: gradiaWriterDesign,
+      expectedNarrativeArchive: gradiaNarrativeArchive,
+      expectedNarrativeArchiveId: text(bridge.gradiaNarrativeArchiveId || ''),
+      expectedNarrativeArchiveGeneration: Math.max(0, Number(bridge.gradiaNarrativeArchiveGeneration || 0) || 0),
+      expectedNarrativeArchiveDigest: text(bridge.gradiaNarrativeArchiveDigest || '')
+    };
+    const [flashbackAdoption, hayakuAdoption, libraAdoption, gradiaAdoptionInitial, liaAdoption] = await Promise.all([
+      adoptFlashbackSessionHandoff({
+        targetChatId, transferId,
+        sourceScopeKey: text(bridge.sourceFlashbackScopeKey || ''),
+        expectedRecords: flashbackRequired ? flashbackRecords : 0
+      }),
+      adoptHayakuSessionHandoff({
+        targetChatId, transferId,
+        sourceScopeKey: text(bridge.sourceHayakuScopeKey || ''),
+        expectedRecords: hayakuRequired ? hayakuRecords : 0
+      }),
+      libraRequired
+        ? adoptLibraSessionHandoffDurable(libraOptions)
+        : Promise.resolve({ schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: true, durable: true, records: 0, expectedRecords: 0, worldAdditional: 0, expectedWorldAdditional: 0, reason: 'no_libra_data' }),
+      gradiaRequired
+        ? adoptGradiaSessionHandoffDurable(gradiaOptions)
+        : Promise.resolve({ schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: true, durable: true, storyArc: 0, expectedStoryArc: 0, writerDesign: 0, expectedWriterDesign: 0, narrativeArchive: 0, expectedNarrativeArchive: 0, reason: 'no_gradia_data' }),
+      adoptLiaLivePersonaHandoff({ sourceChatId, targetChatId, transferId, sourceLivePersonaId })
+    ]);
+    // A successful adoption response is not used as a substitute for a current
+    // target-ledger readback. The prepared archive identity is carried through
+    // both mutation and verification.
+    const libraVerification = libraRequired
+      ? await verifyDurableLibraSessionHandoff({ included: true, ...libraOptions })
+      : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: true, durable: true, records: 0, expectedRecords: 0, worldAdditional: 0, expectedWorldAdditional: 0, reason: 'no_libra_data' };
+    const gradiaAdoption = gradiaRequired && gradiaAdoptionInitial?.verified !== true
+      ? await verifyDurableGradiaSessionHandoff({ included: true, ...gradiaOptions })
+      : gradiaAdoptionInitial;
+
+    const flashbackVerified = !flashbackRequired || (
+      flashbackAdoption?.ok === true
+      && flashbackAdoption?.verified === true
+      && flashbackAdoption?.durable === true
+      && Number(flashbackAdoption?.records || 0) === flashbackRecords
+    );
+    const hayakuVerified = !hayakuRequired || (
+      hayakuAdoption?.ok === true
+      && hayakuAdoption?.verified === true
+      && hayakuAdoption?.durable === true
+      && Number(hayakuAdoption?.records || 0) === hayakuRecords
+    );
+    const libraVerified = !libraRequired
+      || libraVerificationReceiptMatches(libraVerification, libraOptions, libraVerification?.transport);
+    const gradiaVerified = !gradiaRequired || (
+      gradiaAdoption?.action === 'verified'
+        ? gradiaVerificationReceiptMatches(gradiaAdoption, gradiaOptions, gradiaAdoption?.transport)
+        : gradiaAdoptionReceiptMatches(gradiaAdoption, gradiaOptions, gradiaAdoption?.transport)
+    );
+    const liaVerified = !liaRequired || liaAdoptionReceiptMatches(liaAdoption, {
+      sourceChatId, targetChatId, transferId, sourceLivePersonaId
+    });
+    const ok = requiredHandoffsVerified({
+      flashbackRequired, flashbackVerified,
+      hayakuRequired, hayakuVerified,
+      libraRequired, libraVerified,
+      gradiaRequired, gradiaVerified,
+      liaRequired, liaVerified
+    });
+    const ownerStatus = {
+      flashback: { required: flashbackRequired, verified: flashbackVerified, durable: flashbackAdoption?.durable === true, reason: text(flashbackAdoption?.reason || ''), receipt: clone(flashbackAdoption, {}) },
+      hayaku: { required: hayakuRequired, verified: hayakuVerified, durable: hayakuAdoption?.durable === true, reason: text(hayakuAdoption?.reason || ''), receipt: clone(hayakuAdoption, {}) },
+      libra: { required: libraRequired, verified: libraVerified, durable: libraVerification?.durable === true, reason: text(libraVerification?.reason || libraAdoption?.reason || ''), receipt: clone(libraVerification, {}) },
+      gradia: { required: gradiaRequired, verified: gradiaVerified, durable: gradiaAdoption?.durable === true, reason: text(gradiaAdoption?.reason || ''), receipt: clone(gradiaAdoption, {}) },
+      lia: { required: liaRequired, verified: liaVerified, durable: liaAdoption?.durable === true && liaAdoption?.durableReadbackVerified === true, reason: text(liaAdoption?.reason || ''), receipt: clone(liaAdoption, {}) }
+    };
+    const finalJournal = await persistNextSessionHandoffJournal(targetChatId, transferId, {
+      state: ok ? 'completed' : 'pending_owner_handoffs',
+      attempts: attempt,
+      ownerStatus,
+      writer: clone(loaded?.writer || journal.writer, null),
+      lastAttemptAt: Date.now(),
+      completedAt: ok ? Date.now() : 0,
+      lastError: ok ? '' : 'one_or_more_required_owner_handoffs_not_verified'
+    });
+    const result = {
+      ok,
+      schema: HANDOFF_SCHEMA,
+      transferId,
+      sourceChatId,
+      targetChatId,
+      resumed: attempt > 1,
+      handoffJournalState: finalJournal.state,
+      handoffAttempts: attempt,
+      flashbackScheduled: flashbackRequired && !flashbackVerified,
+      flashbackVerified, flashbackAdoption, flashbackRecords,
+      hayakuScheduled: hayakuRequired && !hayakuVerified,
+      hayakuVerified, hayakuAdoption, hayakuRecords,
+      hayakuSource: text(bridge.hayakuSource || 'none'),
+      libraScheduled: libraRequired && !libraVerified,
+      libraVerified, libraAdoption, libraVerification,
+      libraRecords, libraWorldAdditional,
+      libraSource: text(bridge.libraSource || 'none'),
+      gradiaScheduled: gradiaRequired && !gradiaVerified,
+      gradiaVerified, gradiaAdoption,
+      gradiaStoryArc, gradiaWriterDesign, gradiaNarrativeArchive,
+      gradiaStoryArcBeats: Math.max(0, Number(bridge.gradiaStoryArcBeatCount || 0) || 0),
+      gradiaSource: text(bridge.gradiaSource || 'none'),
+      liaRequired, liaVerified, liaAdoption,
+      sourceLivePersonaId: liaRequired ? sourceLivePersonaId : '',
+      targetLivePersonaId: liaRequired ? text(liaAdoption?.livePersonaId || '') : '',
+      writer: clone(finalJournal.writer, null),
+      createdAt: Number(bridge.createdAt || journal.createdAt || Date.now())
+    };
+    Runtime.lastTransition = result;
+    return result;
+  };
+
+  const resumeNextSessionHandoff = async (options = {}) => {
+    const loaded = await inspectPendingNextSessionHandoff(options || {});
+    if (!loaded.available) throw new Error(`RE:TRACE resumable handoff is unavailable: ${loaded.reason || 'not_found'}`);
+    const expectedTransferId = text(options?.transferId || '').trim();
+    if (expectedTransferId && expectedTransferId !== text(loaded.journal?.transferId || '')) {
+      throw new Error('RE:TRACE resumable handoff transfer identity does not match.');
+    }
+    if (text(loaded.journal?.state || '') === 'completed') {
+      throw new Error('RE:TRACE handoff is already durably completed.');
+    }
+    loaded.writer = clone(options?.writer || loaded.journal?.writer, null);
+    const lockKey = `${loaded.targetChatId}:${loaded.journal.transferId}`;
+    const existing = Runtime.handoffResumePromises.get(lockKey);
+    if (existing) return await existing;
+    const promise = (async () => {
+      try {
+        return await performPendingNextSessionHandoff(loaded);
+      } catch (error) {
+        try {
+          await persistNextSessionHandoffJournal(loaded.targetChatId, loaded.journal.transferId, {
+            state: 'pending_owner_handoffs',
+            lastError: text(error?.message || error || 'handoff_retry_failed')
+          });
+        } catch (journalError) {
+          warn('RE:TRACE could not persist the failed handoff retry state', journalError);
+        }
+        throw error;
+      } finally {
+        Runtime.handoffResumePromises.delete(lockKey);
+      }
+    })();
+    Runtime.handoffResumePromises.set(lockKey, promise);
+    return await promise;
+  };
+
   const continueToNextSession = async () => {
+    const pending = await inspectPendingNextSessionHandoff();
+    if (pending.pending) {
+      return await resumeNextSessionHandoff({
+        targetChatId: pending.targetChatId,
+        transferId: pending.journal.transferId
+      });
+    }
     const preview = await inspectTransition();
     const { context, identity, flashback, hayaku, libra, gradia, pendingColdStart } = preview;
     if (!identity.chatId) throw new Error('현재 채팅에 안정적인 id가 없습니다.');
@@ -7225,10 +7555,7 @@
       ? await prepareLibraSessionHandoff({
         transferId,
         expectedRecords: libra.recordCount,
-        expectedWorldAdditional: libra.worldAdditionalCount,
-        expectedArchiveId: text(libraPreparation?.archiveId || ''),
-        expectedArchiveGeneration: Math.max(0, Number(libraPreparation?.archiveGeneration || 0) || 0),
-        expectedArchiveDigest: text(libraPreparation?.archiveDigest || '')
+        expectedWorldAdditional: libra.worldAdditionalCount
       })
       : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, prepared: false, records: 0, worldAdditional: 0, reason: 'no_libra_data' };
     if (preview.includeLibra && (
@@ -7281,6 +7608,9 @@
           sourceScopeKey: text(libra.scope?.scopeKey || ''),
           recordCount: libra.recordCount,
           worldAdditionalCount: libra.worldAdditionalCount,
+          archiveId: text(libraPreparation?.archiveId || ''),
+          archiveGeneration: Math.max(0, Number(libraPreparation?.archiveGeneration || 0) || 0),
+          archiveDigest: text(libraPreparation?.archiveDigest || ''),
           preparedAt: libraPreparation.preparedAt || new Date(createdAt).toISOString()
         }
       } : {}),
@@ -7324,6 +7654,10 @@
         gradiaStoryArcCount: gradia.storyArcCount,
         gradiaWriterDesignCount: gradia.writerDesignCount,
         gradiaNarrativeArchiveCount: gradia.narrativeArchiveCount,
+        gradiaStoryArcBeatCount: gradia.storyArcBeatCount,
+        hayakuSource: hayaku.available ? 'canonical_ledger' : pendingColdStart.available ? 'pending_cold_start' : 'none',
+        libraSource: preview.includeLibra ? text(libra.readSource || 'unknown') : 'none',
+        gradiaSource: preview.includeGradia ? text(gradia.readSource || 'unknown') : 'none',
         libraArchiveId: text(libraPreparation?.archiveId || ''),
         libraArchiveGeneration: Math.max(0, Number(libraPreparation?.archiveGeneration || 0) || 0),
         libraArchiveDigest: text(libraPreparation?.archiveDigest || ''),
@@ -7333,6 +7667,25 @@
         createdAt
       }
     };
+    newChat.memorySessionBridge.handoffJournal = sealNextSessionHandoffJournal({
+      schema: HANDOFF_JOURNAL_SCHEMA,
+      state: 'pending_owner_handoffs',
+      transferId,
+      sourceChatId: identity.chatId,
+      targetChatId,
+      attempts: 0,
+      createdAt,
+      updatedAt: createdAt,
+      completedAt: 0,
+      lastError: '',
+      ownerStatus: {
+        flashback: { required: Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0) > 0, verified: false },
+        hayaku: { required: preview.includeHayaku === true && Number(preview.hayakuRecordCount || 0) > 0, verified: false },
+        libra: { required: preview.includeLibra === true, verified: false },
+        gradia: { required: preview.includeGradia === true, verified: false },
+        lia: { required: liaRequired, verified: false }
+      }
+    });
     // Never make the new chat temporarily share an LIA-managed Live Persona.
     // LIA creates and verifies a target-chat-specific fork through IPC below.
     // Sharing the source Live ID even briefly can race with cleanup/rebinding logic.
@@ -7369,172 +7722,14 @@
       }
     }
     const writer = await saveCharacter(nextCharacter, context.characterIndex);
-    const flashbackRecords = Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0);
-    const hayakuRecords = Math.max(0, Number(preview.hayakuRecordCount || 0) || 0);
-    const [flashbackAdoption, hayakuAdoption, libraAdoptionInitial, gradiaAdoptionInitial, liaAdoption] = await Promise.all([
-      adoptFlashbackSessionHandoff({
-        targetChatId, transferId, sourceScopeKey: text(flashback.sourceScope?.scopeKey || ''), expectedRecords: flashbackRecords
-      }),
-      adoptHayakuSessionHandoff({
-        targetChatId, transferId, sourceScopeKey: text(hayaku.scope?.scopeKey || ''), expectedRecords: preview.includeHayaku === true ? hayakuRecords : 0
-      }),
-      preview.includeLibra
-        ? adoptLibraSessionHandoffDurable({
-          targetChatId,
-          transferId,
-          expectedRecords: libra.recordCount,
-          expectedWorldAdditional: libra.worldAdditionalCount,
-          expectedArchiveId: text(libraPreparation?.archiveId || ''),
-          expectedArchiveGeneration: Math.max(0, Number(libraPreparation?.archiveGeneration || 0) || 0),
-          expectedArchiveDigest: text(libraPreparation?.archiveDigest || '')
-        })
-        : Promise.resolve({
-          schema: LIBRA_HANDOFF_RECEIPT_SCHEMA,
-          verified: true,
-          durable: true,
-          records: 0,
-          expectedRecords: 0,
-          worldAdditional: 0,
-          expectedWorldAdditional: 0,
-          reason: 'no_libra_data'
-        }),
-      preview.includeGradia
-        ? adoptGradiaSessionHandoffDurable({
-          targetChatId,
-          transferId,
-          expectedStoryArc: gradia.storyArcCount,
-          expectedWriterDesign: gradia.writerDesignCount,
-          expectedNarrativeArchive: gradia.narrativeArchiveCount,
-          expectedNarrativeArchiveId: text(gradiaPreparation?.narrativeArchiveId || ''),
-          expectedNarrativeArchiveGeneration: Math.max(0, Number(gradiaPreparation?.narrativeArchiveGeneration || 0) || 0),
-          expectedNarrativeArchiveDigest: text(gradiaPreparation?.narrativeArchiveDigest || '')
-        })
-        : Promise.resolve({
-          schema: GRADIA_HANDOFF_RECEIPT_SCHEMA,
-          verified: true,
-          durable: true,
-          storyArc: 0,
-          expectedStoryArc: 0,
-          writerDesign: 0,
-          expectedWriterDesign: 0,
-          narrativeArchive: 0,
-          expectedNarrativeArchive: 0,
-          reason: 'no_gradia_data'
-        }),
-      adoptLiaLivePersonaHandoff({ sourceChatId: identity.chatId, targetChatId, transferId, sourceLivePersonaId })
-    ]);
-    const libraAdoption = preview.includeLibra && libraAdoptionInitial?.verified !== true
-      ? await verifyDurableLibraSessionHandoff({
-        included: true,
-        targetChatId,
-        transferId,
-        expectedRecords: libra.recordCount,
-        expectedWorldAdditional: libra.worldAdditionalCount
-      })
-      : libraAdoptionInitial;
-    const gradiaAdoption = preview.includeGradia && gradiaAdoptionInitial?.verified !== true
-      ? await verifyDurableGradiaSessionHandoff({
-        included: true,
-        targetChatId,
-        transferId,
-        expectedStoryArc: gradia.storyArcCount,
-        expectedWriterDesign: gradia.writerDesignCount,
-        expectedNarrativeArchive: gradia.narrativeArchiveCount,
-        expectedNarrativeArchiveId: text(gradiaPreparation?.narrativeArchiveId || ''),
-        expectedNarrativeArchiveGeneration: Math.max(0, Number(gradiaPreparation?.narrativeArchiveGeneration || 0) || 0),
-        expectedNarrativeArchiveDigest: text(gradiaPreparation?.narrativeArchiveDigest || '')
-      })
-      : gradiaAdoptionInitial;
-    const flashbackVerified = flashbackAdoption?.verified === true
-      && flashbackAdoption?.durable === true
-      && Math.max(0, Number(flashbackAdoption?.records || 0) || 0) === flashbackRecords;
-    const flashbackRequired = flashbackRecords > 0;
-    const hayakuVerified = hayakuAdoption?.verified === true
-      && hayakuAdoption?.durable === true
-      && Math.max(0, Number(hayakuAdoption?.records || 0) || 0) === hayakuRecords;
-    const hayakuRequired = preview.includeHayaku === true && hayakuRecords > 0;
-    const libraRequired = preview.includeLibra === true;
-    const libraVerified = libraAdoption?.verified === true
-      && libraAdoption?.durable === true
-      && text(libraAdoption?.targetChatId || '') === targetChatId
-      && text(libraAdoption?.transferId || '') === transferId
-      && Number(libraAdoption?.records || 0) === Number(libra.recordCount || 0)
-      && Number(libraAdoption?.worldAdditional || 0) === Number(libra.worldAdditionalCount || 0)
-      && (!text(libraPreparation?.archiveId || '') || text(libraAdoption?.archiveId || '') === text(libraPreparation.archiveId))
-      && (!text(libraPreparation?.archiveDigest || '') || text(libraAdoption?.archiveDigest || '') === text(libraPreparation.archiveDigest))
-      && (!Number(libraPreparation?.archiveGeneration || 0) || Number(libraAdoption?.archiveGeneration || 0) === Number(libraPreparation.archiveGeneration));
-    const gradiaRequired = preview.includeGradia === true;
-    const gradiaVerified = gradiaAdoption?.verified === true
-      && gradiaAdoption?.durable === true
-      && text(gradiaAdoption?.targetChatId || '') === targetChatId
-      && text(gradiaAdoption?.transferId || '') === transferId
-      && Number(gradiaAdoption?.storyArc || 0) === Number(gradia.storyArcCount || 0)
-      && Number(gradiaAdoption?.writerDesign || 0) === Number(gradia.writerDesignCount || 0)
-      && Number(gradiaAdoption?.narrativeArchive || 0) === Number(gradia.narrativeArchiveCount || 0)
-      && (!text(gradiaPreparation?.narrativeArchiveId || '') || text(gradiaAdoption?.narrativeArchiveId || '') === text(gradiaPreparation.narrativeArchiveId))
-      && (!text(gradiaPreparation?.narrativeArchiveDigest || '') || text(gradiaAdoption?.narrativeArchiveDigest || '') === text(gradiaPreparation.narrativeArchiveDigest))
-      && (!Number(gradiaPreparation?.narrativeArchiveGeneration || 0) || Number(gradiaAdoption?.narrativeArchiveGeneration || 0) === Number(gradiaPreparation.narrativeArchiveGeneration));
-    const liaVerified = !liaRequired || (
-      liaAdoption?.schema === LIA_HANDOFF_RECEIPT_SCHEMA
-      && liaAdoption?.verified === true
-      && liaAdoption?.durable === true
-      && text(liaAdoption?.sourceChatId || '') === identity.chatId
-      && text(liaAdoption?.targetChatId || '') === targetChatId
-      && text(liaAdoption?.transferId || '') === transferId
-      && text(liaAdoption?.sourceLivePersonaId || '') === sourceLivePersonaId
-      && isLiaLivePersonaId(liaAdoption?.livePersonaId || '')
-      && text(liaAdoption?.livePersonaId || '') !== sourceLivePersonaId
-    );
-    const result = {
-      ok: requiredHandoffsVerified({
-        flashbackRequired,
-        flashbackVerified,
-        hayakuRequired,
-        hayakuVerified,
-        libraRequired,
-        libraVerified,
-        gradiaRequired,
-        gradiaVerified,
-        liaRequired,
-        liaVerified
-      }),
-      schema: HANDOFF_SCHEMA,
-      transferId,
-      sourceChatId: identity.chatId,
-      targetChatId,
-      flashbackScheduled: flashbackRequired && !flashbackVerified,
-      flashbackVerified,
-      flashbackAdoption,
-      flashbackRecords,
-      hayakuScheduled: hayakuRequired && !hayakuVerified,
-      hayakuVerified,
-      hayakuAdoption,
-      hayakuRecords,
-      hayakuSource: hayaku.available ? 'canonical_ledger' : pendingColdStart.available ? 'pending_cold_start' : 'none',
-      libraScheduled: libraRequired && !libraVerified,
-      libraVerified,
-      libraAdoption,
-      libraRecords: libra.recordCount,
-      libraWorldAdditional: libra.worldAdditionalCount,
-      libraSource: preview.includeLibra ? text(libra.readSource || 'unknown') : 'none',
-      gradiaScheduled: gradiaRequired && !gradiaVerified,
-      gradiaVerified,
-      gradiaAdoption,
-      gradiaStoryArc: gradia.storyArcCount,
-      gradiaWriterDesign: gradia.writerDesignCount,
-      gradiaNarrativeArchive: gradia.narrativeArchiveCount,
-      gradiaStoryArcBeats: gradia.storyArcBeatCount,
-      gradiaSource: preview.includeGradia ? text(gradia.readSource || 'unknown') : 'none',
-      liaRequired,
-      liaVerified,
-      liaAdoption,
-      sourceLivePersonaId: liaRequired ? sourceLivePersonaId : '',
-      targetLivePersonaId: liaRequired ? text(liaAdoption?.livePersonaId || '') : '',
-      writer,
-      createdAt
-    };
-    Runtime.lastTransition = result;
-    return result;
+    const persistedPending = await inspectPendingNextSessionHandoff({ targetChatId });
+    if (!persistedPending.available
+      || !persistedPending.pending
+      || text(persistedPending.journal?.transferId || '') !== transferId) {
+      throw new Error(`RE:TRACE pending handoff journal was not durably created: ${persistedPending.reason || 'readback_failed'}`);
+    }
+    return await resumeNextSessionHandoff({ targetChatId, transferId, writer });
+
   };
 
   const packetItemText = (value, max = 180) => {
@@ -8107,6 +8302,14 @@
     try {
       const preview = await inspectTransition();
       const scopeNode = Runtime.root?.querySelector?.('#sidebarScope');
+      if (preview.pendingHandoff?.pending) {
+        const failedOwners = Object.entries(preview.pendingHandoff.journal?.ownerStatus || {})
+          .filter(([, status]) => status?.required === true && status?.verified !== true)
+          .map(([owner]) => owner)
+          .join(', ');
+        node.textContent = `미완료 다음 세션 handoff가 있습니다. 같은 target/transfer로 재시도합니다.\n실패 또는 미검증 owner: ${failedOwners || '확인 중'}`;
+        return preview;
+      }
       if (scopeNode) scopeNode.textContent = compact(preview.context?.chat?.name || preview.identity.chatId || '현재 채팅', 44);
       const flashbackLine = preview.flashback.available
         ? `Flashback 기억 ${formatNumber(preview.flashback.records)}개 · ${formatNumber(preview.flashback.shards)}개 샤드`
@@ -8835,6 +9038,19 @@
       setBusy(true);
       try {
         const preview = await inspectTransition();
+        if (preview.pendingHandoff?.pending) {
+          const retryMessage = '미완료 다음 세션 handoff를 같은 target/transfer로 다시 검증합니다. 새 채팅은 추가로 만들지 않습니다.\n\n계속할까요?';
+          if (typeof globalThis.confirm === 'function' && !globalThis.confirm(retryMessage)) return;
+          const retried = await resumeNextSessionHandoff({
+            targetChatId: preview.pendingHandoff.targetChatId,
+            transferId: preview.pendingHandoff.journal.transferId
+          });
+          globalThis.alert?.(retried.ok
+            ? `다음 세션 handoff 재개가 완료되었습니다.\ntransferId: ${retried.transferId}`
+            : `다음 세션 handoff가 아직 미완료입니다. 같은 버튼으로 다시 재시도할 수 있습니다.\ntransferId: ${retried.transferId}`);
+          await refreshTransition();
+          return;
+        }
         const message = `새 채팅을 만들고 기억을 이어갈까요?\n\n`
           + (preview.includeLibra
             ? `LIBRA 정본 레코드 ${formatNumber(preview.libraRecordCount)}개\n`
@@ -8850,6 +9066,11 @@
           + '\n\n원본 채팅과 원장은 그대로 보존됩니다.';
         if (typeof globalThis.confirm === 'function' && !globalThis.confirm(message)) return;
         const result = await continueToNextSession();
+        if (!result.ok) {
+          globalThis.alert?.(`새 채팅은 보존되었지만 필수 owner handoff가 아직 미완료입니다. 같은 버튼으로 동일 target/transfer를 재시도할 수 있습니다.\ntransferId: ${result.transferId}`);
+          await refreshTransition();
+          return;
+        }
         const flashbackStatus = result.flashbackVerified
           ? `Flashback 기억 승계 확인: ${formatNumber(result.flashbackAdoption?.records || result.flashbackRecords)}개`
           : result.flashbackRecords > 0
@@ -8979,6 +9200,8 @@
     closeUi,
     inspectTransition,
     continueToNextSession,
+    inspectPendingNextSessionHandoff,
+    resumeNextSessionHandoff,
     adoptFlashbackSessionHandoff,
     adoptHayakuSessionHandoff,
     inspectColdStart,
@@ -9028,10 +9251,12 @@
       validateBridgeCapsulePacketSet, bridgePacketHasSemanticPayload, priorTurnContextForChunk,
       requestLibraIpc, probeLibraIpc, normalizeLibraInspection, readLibraSource,
       requestGradiaIpc, probeGradiaIpc, normalizeGradiaInspection, readGradiaSource,
-      requestLiaIpc, adoptLiaLivePersonaHandoff, isLiaLivePersonaId,
+      requestLiaIpc, adoptLiaLivePersonaHandoff, liaAdoptionReceiptMatches, isLiaLivePersonaId,
       prepareLibraSessionHandoff, adoptLibraSessionHandoff, adoptLibraSessionHandoffDurable, verifyDurableLibraSessionHandoff,
       prepareGradiaSessionHandoff, adoptGradiaSessionHandoff, adoptGradiaSessionHandoffDurable, verifyDurableGradiaSessionHandoff,
       requiredHandoffsVerified,
+      sealNextSessionHandoffJournal, nextSessionHandoffJournalFromChat,
+      inspectPendingNextSessionHandoff, persistNextSessionHandoffJournal, performPendingNextSessionHandoff,
       libraMemoryViewerInfo,
       coldStartChunkHash, coldStartConfigHash, incrementalRecoveryConfigHash,
       incrementalRecoveryCheckpointBodyReusable, incrementalRecoveryCheckpointPlan,

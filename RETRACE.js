@@ -1,7 +1,7 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.16
+//@version 1.9.18
 //@allowed-ipc libra
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
@@ -11,11 +11,16 @@
 //@description LIBRA, GRADIA, HAYAKU, Flashback, and LIA Live Persona continuity analysis and next-session handoff bridge
 //@author Hayaku
 
+/* v1.9.18 keeps RE:TRACE compatible with the storage-tier builds: the ordinary Flashback/HAYAKU viewers now page only the newest records without hydrating every historical archive layer, pluginStorage fallbacks can decode the immutable gzip archive wrappers, LIBRA/GRADIA handoff receipts are cross-checked against the prepared archive identity/digest, and summary-only runtime fallbacks remain summary-only.
+ * v1.9.17 coordinates immutable shared-archive handoff for Flashback, HAYAKU,
+ * LIBRA, and GRADIA Narrative Archive, and uses summary-only transition probes
+ * so next-session validation checks archive ID/digest metadata without hydrating historical memory bodies, packet JSON, or vectors. */
+
 (async () => {
   'use strict';
 
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.16';
+  const PLUGIN_VERSION = '1.9.18';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v1';
   const LIBRA_PLUGIN_ID = 'libra';
   const LIBRA_IPC_SCHEMA = 'libra-retrace-ipc-v1';
@@ -57,8 +62,19 @@
   ]);
   const FLASHBACK_REGISTRY_KEY = 'vector_rag_memory:scope_registry:v2';
   const FLASHBACK_SCOPE_PREFIX = 'vector_rag_memory:scope:';
+  const FLASHBACK_ARCHIVE_REF_SCHEMA = 'flashback_memory.archive_ref.v1';
+  const FLASHBACK_ARCHIVE_SHARD_GZIP_SCHEMA = 'flashback_memory.archive_shard_gzip.v1';
+  const FLASHBACK_ARCHIVE_SHARD_GZIP_ENCODING = 'gzip+base64';
+  const FLASHBACK_ARCHIVE_MAX_DEPTH = 256;
   const HAYAKU_LEDGER_PREFIX = 'hayaku.v2.ledger.';
   const HAYAKU_LEDGER_SCHEMAS = new Set(['hayaku_storage_ledger_v1', 'hayaku_storage_ledger_v2']);
+  const HAYAKU_ARCHIVE_SCHEMA = 'hayaku.shared_archive.v1';
+  const HAYAKU_ARCHIVE_GZIP_SCHEMA = 'hayaku.shared_archive.gzip.v1';
+  const HAYAKU_ARCHIVE_GZIP_ENCODING = 'gzip+base64';
+  const HAYAKU_ARCHIVE_META_SCHEMA = 'hayaku.shared_archive_meta.v1';
+  const HAYAKU_ARCHIVE_REF_SCHEMA = 'hayaku.shared_archive_ref.v1';
+  const HAYAKU_ARCHIVE_META_KEY_PREFIX = 'hayaku.v2.shared_archive_meta.';
+  const HAYAKU_ARCHIVE_MAX_DEPTH = 256;
   const SETTINGS_KEY = 'memory_session_bridge:settings:v1';
   const COLD_START_PREFIX = 'memory_session_bridge:hayaku_cold_start:';
   const COLD_START_SCHEMA = 'memory-session-bridge-hayaku-cold-start-v1';
@@ -205,6 +221,59 @@
   const parseJson = (value, fallback = null) => {
     if (value && typeof value === 'object') return value;
     try { return JSON.parse(String(value)); } catch (_) { return fallback; }
+  };
+  const retraceBase64ToBytes = encoded => {
+    const source = text(encoded || '');
+    if (!source) return new Uint8Array(0);
+    if (typeof Buffer !== 'undefined') return new Uint8Array(Buffer.from(source, 'base64'));
+    if (typeof atob !== 'function') throw new Error('base64_decoder_unavailable');
+    const binary = atob(source);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return bytes;
+  };
+  const retraceGunzipText = async bytesInput => {
+    if (typeof DecompressionStream !== 'function' || typeof TextDecoder !== 'function' || typeof Response !== 'function') {
+      throw new Error('gzip_decompression_unavailable');
+    }
+    const bytes = bytesInput instanceof Uint8Array ? bytesInput : new Uint8Array(bytesInput || []);
+    const input = new Response(bytes).body;
+    if (!input?.pipeThrough) throw new Error('gunzip_input_stream_unavailable');
+    const decompressed = input.pipeThrough(new DecompressionStream('gzip'));
+    return new TextDecoder().decode(await new Response(decompressed).arrayBuffer());
+  };
+  const decodeFlashbackShardPayloadForRetrace = async rawInput => {
+    const outer = parseJson(rawInput, null);
+    if (!outer || typeof outer !== 'object' || Array.isArray(outer) || outer.schema !== FLASHBACK_ARCHIVE_SHARD_GZIP_SCHEMA) {
+      return { parsed: outer, compressed: false, reason: '' };
+    }
+    try {
+      if (outer.encoding !== FLASHBACK_ARCHIVE_SHARD_GZIP_ENCODING) throw new Error('archive_gzip_encoding_invalid');
+      const raw = await retraceGunzipText(retraceBase64ToBytes(outer.data || ''));
+      if (!raw || (outer.rawHash && flashbackKeyHash(raw) !== text(outer.rawHash))) throw new Error('archive_gzip_digest_mismatch');
+      const parsed = parseJson(raw, null);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('archive_gzip_body_invalid');
+      return { parsed, compressed: true, reason: '' };
+    } catch (error) {
+      return { parsed: null, compressed: true, reason: compact(error?.message || error, 240) };
+    }
+  };
+  const decodeHayakuArchivePayloadForRetrace = async rawInput => {
+    const outer = parseJson(rawInput, null);
+    if (!outer || typeof outer !== 'object' || Array.isArray(outer) || outer.schema !== HAYAKU_ARCHIVE_GZIP_SCHEMA) {
+      return { parsed: outer, compressed: false, reason: '' };
+    }
+    try {
+      if (outer.encoding !== HAYAKU_ARCHIVE_GZIP_ENCODING) throw new Error('archive_gzip_encoding_invalid');
+      const raw = await retraceGunzipText(retraceBase64ToBytes(outer.data || ''));
+      if (!raw || (outer.rawHash && stableHash64(raw) !== text(outer.rawHash))) throw new Error('archive_gzip_digest_mismatch');
+      const parsed = parseJson(raw, null);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.schema !== HAYAKU_ARCHIVE_SCHEMA) throw new Error('archive_gzip_body_invalid');
+      if (outer.archiveId && text(parsed.archiveId || '') !== text(outer.archiveId || '')) throw new Error('archive_gzip_identity_mismatch');
+      return { parsed, compressed: true, reason: '' };
+    } catch (error) {
+      return { parsed: null, compressed: true, reason: compact(error?.message || error, 240) };
+    }
   };
   const isFlashbackInheritedRecord = record => Boolean(
     isPermanentSessionHistory(record)
@@ -2132,6 +2201,8 @@
       storyArc: source.storyArc && typeof source.storyArc === 'object' ? clone(source.storyArc, {}) : null,
       writerDesign: source.writerDesign && typeof source.writerDesign === 'object' ? clone(source.writerDesign, {}) : null,
       narrativeArchive: source.narrativeArchive && typeof source.narrativeArchive === 'object' ? clone(source.narrativeArchive, {}) : null,
+      narrativeArchiveRef: source.narrativeArchiveRef && typeof source.narrativeArchiveRef === 'object' ? clone(source.narrativeArchiveRef, {}) : null,
+      payloadIncluded: source.payloadIncluded !== false,
       storyArcCount,
       writerDesignCount,
       narrativeArchiveCount,
@@ -2143,12 +2214,13 @@
     };
   };
 
-  const readGradiaSource = async context => {
+  const readGradiaSource = async (context, options = {}) => {
     const identity = contextIdentity(context || await getCurrentContext());
+    const includePayload = options?.includePayload !== false;
     const probe = await probeGradiaIpc({ timeoutMs: 1800, attempts: 2 });
     if (probe.available) {
       try {
-        const inspected = await requestGradiaIpc('inspect', {}, { timeoutMs: 8000 });
+        const inspected = await requestGradiaIpc('inspect', { includePayload }, { timeoutMs: 8000 });
         const normalized = normalizeGradiaInspection(inspected, identity, 'gradia_plugin_ipc');
         normalized.capabilities = clone(probe.capabilities, {});
         normalized.probe = clone(probe, {});
@@ -2161,6 +2233,7 @@
           available: false, pluginAvailable: true, inspectionAvailable: false, integrityOk: false,
           reason, readSource: 'gradia_plugin_ipc', pluginVersion: text(probe.pluginVersion || ''),
           scope: {}, integrity: { ok: false, reason }, counts: {}, storyArc: null, writerDesign: null, narrativeArchive: null,
+          narrativeArchiveRef: null, payloadIncluded: includePayload,
           storyArcCount: 0, writerDesignCount: 0, narrativeArchiveCount: 0, manualUserIntentCount: 0, storyArcBeatCount: 0,
           completedTurnCount: 0, snapshotHash: '', capabilities: clone(probe.capabilities, {}), probe: clone(probe, {}),
           errors: [text(error?.message || error || reason)]
@@ -2170,7 +2243,7 @@
     const runtime = activeGradiaRuntime();
     if (runtime && typeof runtime.inspectForRetrace === 'function') {
       try {
-        const inspected = await runtime.inspectForRetrace();
+        const inspected = await runtime.inspectForRetrace({ includePayload });
         const normalized = normalizeGradiaInspection(inspected, identity, 'gradia_runtime_api');
         normalized.probe = clone(probe, {});
         return normalized;
@@ -2179,7 +2252,8 @@
     return {
       available: false, pluginAvailable: false, inspectionAvailable: false, integrityOk: false,
       reason: 'gradia_ipc_unavailable', readSource: 'none', pluginVersion: '', scope: {}, integrity: { ok: false },
-      counts: {}, storyArc: null, writerDesign: null, narrativeArchive: null, storyArcCount: 0, writerDesignCount: 0, narrativeArchiveCount: 0,
+      counts: {}, storyArc: null, writerDesign: null, narrativeArchive: null, narrativeArchiveRef: null,
+      payloadIncluded: includePayload, storyArcCount: 0, writerDesignCount: 0, narrativeArchiveCount: 0,
       manualUserIntentCount: 0, storyArcBeatCount: 0, completedTurnCount: 0, snapshotHash: '',
       probe: clone(probe, {}), errors: [probe.error || 'GRADIA v0.25.25 or later IPC contract is required.']
     };
@@ -2206,6 +2280,16 @@
     return Number.isInteger(Number(receipt[field])) && Number(receipt[field]) === expected;
   };
 
+  const gradiaArchiveReceiptMatches = (receipt, options) => {
+    const expectedArchiveId = text(options?.expectedNarrativeArchiveId || '').trim();
+    const expectedArchiveDigest = text(options?.expectedNarrativeArchiveDigest || '').trim();
+    const expectedArchiveGeneration = Math.max(0, Number(options?.expectedNarrativeArchiveGeneration || 0) || 0);
+    if (expectedArchiveId && text(receipt?.narrativeArchiveId || '') !== expectedArchiveId) return false;
+    if (expectedArchiveDigest && text(receipt?.narrativeArchiveDigest || '') !== expectedArchiveDigest) return false;
+    if (expectedArchiveGeneration && Number(receipt?.narrativeArchiveGeneration || 0) !== expectedArchiveGeneration) return false;
+    return true;
+  };
+
   const gradiaPreparationReceiptMatches = (receipt, options, transport) => {
     const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
     const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
@@ -2221,6 +2305,7 @@
       && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
       && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
+      && gradiaArchiveReceiptMatches(receipt, options)
       && gradiaOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
   };
 
@@ -2240,6 +2325,7 @@
       && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
       && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
+      && gradiaArchiveReceiptMatches(receipt, options)
       && gradiaOwnerReceiptMatches(receipt, transport, 'adopt_session_handoff');
   };
 
@@ -2259,6 +2345,7 @@
       && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
       && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
+      && gradiaArchiveReceiptMatches(receipt, options)
       && gradiaOwnerReceiptMatches(receipt, transport, 'verify_session_handoff');
   };
 
@@ -2323,7 +2410,10 @@
       targetChatId: text(options?.targetChatId || ''),
       expectedStoryArc: Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0)),
       expectedWriterDesign: Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0)),
-      expectedNarrativeArchive: Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0)
+      expectedNarrativeArchive: Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0),
+      expectedNarrativeArchiveId: text(options?.expectedNarrativeArchiveId || ''),
+      expectedNarrativeArchiveGeneration: Math.max(0, Number(options?.expectedNarrativeArchiveGeneration || 0) || 0),
+      expectedNarrativeArchiveDigest: text(options?.expectedNarrativeArchiveDigest || '')
     };
     const runtime = activeGradiaRuntime();
     try {
@@ -2577,7 +2667,7 @@
           });
           transport = 'risu_plugin_ipc';
         }
-        const strictReceipt = last?.schema === 'flashback_memory.session_handoff_adoption.v2';
+        const strictReceipt = ['flashback_memory.session_handoff_adoption.v2', 'flashback_memory.session_handoff_adoption.v3'].includes(text(last?.schema || ''));
         const identityMatches = text(last?.targetChatId || '') === targetChatId
           && text(last?.transferId || '') === transferId
           && text(last?.sourceScopeKey || '') === sourceScopeKey
@@ -2642,11 +2732,12 @@
     const manifest = inspected?.manifest && typeof inspected.manifest === 'object'
       ? inspected.manifest
       : {};
-    const runtimeItems = inspected?.recordsIncluded === false
+    const recordsIncluded = inspected?.recordsIncluded !== false;
+    const runtimeItems = !recordsIncluded
       ? null
       : Array.isArray(inspected?.records)
-      ? inspected.records.filter(record => record && typeof record === 'object' && !Array.isArray(record))
-      : null;
+        ? inspected.records.filter(record => record && typeof record === 'object' && !Array.isArray(record))
+        : null;
     const canonicalRecords = Math.max(
       0,
       Number(manifest.count ?? manifest.expectedCount ?? manifest.stats?.recordTotal ?? runtimeItems?.length ?? 0) || 0
@@ -2657,7 +2748,8 @@
     const recordCountMismatch = manifest.recordCountMismatch === true
       || (runtimeItems != null && runtimeItems.length !== canonicalRecords);
     const manifestCorrupt = manifest.manifestCorrupt === true;
-    const integrityOk = !manifestCorrupt && missingShards === 0 && corruptShards === 0 && !recordCountMismatch;
+    const archiveVerified = manifest.archiveVerified !== false;
+    const integrityOk = !manifestCorrupt && archiveVerified && missingShards === 0 && corruptShards === 0 && !recordCountMismatch;
     return {
       available: canonicalRecords > 0 && integrityOk,
       reason: !integrityOk ? 'partial' : canonicalRecords > 0 ? 'loaded' : 'empty',
@@ -2667,28 +2759,128 @@
       manifest,
       manifestKey: '',
       readSource,
+      recordsIncluded,
       ...(runtimeItems == null ? {} : { runtimeItems }),
       runtimeStats: inspected?.stats && typeof inspected.stats === 'object' ? inspected.stats : null,
       missingShards,
       corruptShards,
       recordCountMismatch,
       manifestCorrupt,
+      archiveVerified,
+      archiveReason: text(manifest.archiveReason || ''),
       integrityOk
     };
   };
 
-  const readFlashbackSource = async context => {
+
+  const flashbackArchiveRefPointerForRetrace = value => {
+    const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    const archiveId = text(source.archiveId || '').trim();
+    const archiveScopeKey = text(source.archiveScopeKey || '').trim();
+    if (!archiveId || !archiveScopeKey) return null;
+    return {
+      schema: text(source.schema || FLASHBACK_ARCHIVE_REF_SCHEMA),
+      archiveId,
+      archiveScopeKey,
+      generation: Math.max(1, Number(source.generation || 1) || 1),
+      depth: Math.max(1, Number(source.depth || 1) || 1),
+      deltaCount: Math.max(0, Number(source.deltaCount ?? source.recordCount ?? 0) || 0),
+      recordCount: Math.max(0, Number(source.recordCount || 0) || 0),
+      digest: text(source.digest || '').trim(),
+      responseTurnMax: Math.max(0, Number(source.responseTurnMax || 0) || 0),
+      createdAt: text(source.createdAt || ''),
+      updatedAt: text(source.updatedAt || '')
+    };
+  };
+
+  const normalizeFlashbackArchiveRefForRetrace = value => {
+    const pointer = flashbackArchiveRefPointerForRetrace(value);
+    if (!pointer) return null;
+    const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    return { ...pointer, parentRef: flashbackArchiveRefPointerForRetrace(source.parentRef || source.parentArchiveRef) };
+  };
+
+  // Summary inspection traverses only immutable layer manifests. It never opens
+  // record shards or embedding vectors, so RE:TRACE does not recreate the OOM peak
+  // that the shared-archive contract is intended to remove.
+  const readFlashbackArchiveLayerMetas = async archiveRefValue => {
+    const head = normalizeFlashbackArchiveRefForRetrace(archiveRefValue);
+    if (!head) return { archiveRef: null, layers: [], records: 0, shards: 0, verified: true, reason: 'archive_ref_absent', memberIds: [] };
+    const seen = new Set();
+    const memberSet = new Set();
+    const layers = [];
+    let cursor = head;
+    let reason = '';
+    while (cursor && layers.length < FLASHBACK_ARCHIVE_MAX_DEPTH) {
+      if (seen.has(cursor.archiveScopeKey)) { reason = 'archive_cycle'; break; }
+      seen.add(cursor.archiveScopeKey);
+      const manifestKey = `${FLASHBACK_SCOPE_PREFIX}${flashbackKeyHash(cursor.archiveScopeKey)}:manifest:v2`;
+      const manifest = parseJson(await storageGet(manifestKey), null);
+      if (!manifest
+        || text(manifest.scopeKey || '') !== cursor.archiveScopeKey
+        || manifest.archiveOwner !== true
+        || text(manifest.archiveId || '') !== cursor.archiveId) {
+        reason = 'archive_layer_missing_or_invalid';
+        break;
+      }
+      const deltaCount = Math.max(0, Number(manifest.count ?? manifest.archiveDeltaCount ?? 0) || 0);
+      const cumulativeCount = Math.max(0, Number(manifest.archiveRecordCount ?? cursor.recordCount ?? 0) || 0);
+      const deltaMemberIds = Array.from(new Set((Array.isArray(manifest.archiveDeltaMemberIds) ? manifest.archiveDeltaMemberIds : [])
+        .map(value => text(value || '').trim()).filter(Boolean))).sort();
+      const deltaDigest = flashbackKeyHash(deltaMemberIds.join('\u0001'));
+      const deltaCountMatches = deltaCount === Math.max(0, Number(cursor.deltaCount ?? deltaCount) || 0)
+        && Number(manifest.archiveDeltaCount || 0) === deltaCount
+        && Number(manifest.archiveMemberCatalogVersion || 0) >= 1
+        && deltaMemberIds.length === deltaCount
+        && text(manifest.archiveDeltaDigest || '') === deltaDigest;
+      const cumulativeMatches = cumulativeCount === cursor.recordCount
+        && (!manifest.archiveDigest || !cursor.digest || text(manifest.archiveDigest || '') === cursor.digest)
+        && (!manifest.archiveGeneration || Number(manifest.archiveGeneration || 0) === cursor.generation);
+      if (!deltaCountMatches || !cumulativeMatches || manifest.manifestCorrupt === true) {
+        reason = !deltaCountMatches ? 'archive_delta_catalog_mismatch' : 'archive_layer_manifest_mismatch';
+        break;
+      }
+      for (const memberId of deltaMemberIds) {
+        if (memberSet.has(memberId)) { reason = 'archive_member_duplicate'; break; }
+        memberSet.add(memberId);
+      }
+      if (reason) break;
+      layers.push({ ref: cursor, manifest, manifestKey, scopeKey: cursor.archiveScopeKey, deltaCount, memberIds: deltaMemberIds });
+      cursor = normalizeFlashbackArchiveRefForRetrace(cursor.parentRef || manifest.parentArchiveRef);
+    }
+    if (!reason && cursor) reason = 'archive_depth_exceeded';
+    const memberIds = Array.from(memberSet).sort();
+    const records = memberIds.length;
+    const digest = flashbackKeyHash(memberIds.join('\u0001'));
+    const shards = layers.reduce((sum, layer) => sum + Math.max(0, Number(layer.manifest?.shardCount || 0) || 0), 0);
+    const depthMatches = !head.depth || layers.length === head.depth;
+    const verified = !reason && records === head.recordCount && digest === head.digest && depthMatches;
+    return {
+      archiveRef: head,
+      layers,
+      records,
+      shards,
+      memberIds,
+      digest,
+      verified,
+      reason: verified ? 'archive_chain_verified' : reason || (records !== head.recordCount ? 'archive_record_count_mismatch' : digest !== head.digest ? 'archive_digest_mismatch' : 'archive_depth_mismatch')
+    };
+  };
+
+  const readFlashbackSource = async (context, options = {}) => {
     const identity = contextIdentity(context);
+    const includeRecords = options?.includeRecords !== false;
     const runtime = activeFlashbackRuntime();
     if (runtime) {
       try {
-        const inspected = await runtime.inspect(null, { includeRecords: true });
+        const inspected = await runtime.inspect(null, { includeRecords });
         const normalized = flashbackSourceFromInspection(inspected, identity, 'flashback_runtime_api');
-        if (normalized) return normalized;
-        warn('Flashback runtime ledger scope mismatch; trying IPC/pluginStorage', {
+        if (normalized && (!includeRecords || Array.isArray(normalized.runtimeItems))) return normalized;
+        warn('Flashback runtime ledger scope or record payload mismatch; trying IPC/pluginStorage', {
           expectedChatId: identity.chatId,
           runtimeChatId: text(inspected?.scope?.chatId || ''),
-          runtimeScopeKey: text(inspected?.scope?.scopeKey || '')
+          runtimeScopeKey: text(inspected?.scope?.scopeKey || ''),
+          recordsIncluded: inspected?.recordsIncluded === true
         });
       } catch (error) {
         warn('Flashback runtime ledger inspection failed', error);
@@ -2696,10 +2888,10 @@
     }
 
     try {
-      const inspected = await requestFlashbackIpc('inspect', { includeRecords: true }, { timeoutMs: 1800 });
+      const inspected = await requestFlashbackIpc('inspect', { includeRecords }, { timeoutMs: includeRecords ? 3000 : 1800 });
       const normalized = flashbackSourceFromInspection(inspected, identity, 'flashback_plugin_ipc');
-      if (normalized && Array.isArray(normalized.runtimeItems)) return normalized;
-      warn('Flashback IPC ledger records or scope unavailable; falling back to legacy pluginStorage', {
+      if (normalized && (!includeRecords || Array.isArray(normalized.runtimeItems))) return normalized;
+      warn('Flashback IPC ledger scope or requested record payload unavailable; falling back to pluginStorage', {
         expectedChatId: identity.chatId,
         ipcChatId: text(inspected?.scope?.chatId || ''),
         ipcScopeKey: text(inspected?.scope?.scopeKey || ''),
@@ -2725,25 +2917,43 @@
       .sort((a, b) => b.actorScore - a.actorScore || Number(b.scope?.seenAt || 0) - Number(a.scope?.seenAt || 0));
     const sourceScope = candidates[0]?.scope || null;
     if (!sourceScope?.scopeKey) {
-      return { available: false, reason: 'scope_not_registered', records: 0, shards: 0, sourceScope: null, readSource: 'plugin_storage_fallback' };
+      return { available: false, reason: 'scope_not_registered', records: 0, shards: 0, sourceScope: null, recordsIncluded: false, readSource: 'plugin_storage_fallback' };
     }
     const manifestKey = `${FLASHBACK_SCOPE_PREFIX}${flashbackKeyHash(sourceScope.scopeKey)}:manifest:v2`;
     const manifest = parseJson(await storageGet(manifestKey), null);
     if (!manifest || text(manifest.scopeKey || '') !== text(sourceScope.scopeKey)) {
-      return { available: false, reason: 'manifest_not_found', records: 0, shards: 0, sourceScope, manifest: null, readSource: 'plugin_storage_fallback' };
+      return { available: false, reason: 'manifest_not_found', records: 0, shards: 0, sourceScope, manifest: null, recordsIncluded: false, readSource: 'plugin_storage_fallback' };
     }
-    const records = Math.max(0, Number(manifest.count || manifest.stats?.recordTotal || 0) || 0);
-    const shards = Math.max(0, Number(manifest.shardCount || 0) || 0);
+    const archiveRef = normalizeFlashbackArchiveRefForRetrace(manifest.archiveRef);
+    const archiveState = await readFlashbackArchiveLayerMetas(archiveRef);
+    const localRecords = Math.max(0, Number(manifest.count || manifest.stats?.recordTotal || 0) || 0);
+    const archiveRecords = Math.max(0, Number(archiveState.records || 0) || 0);
+    const records = localRecords + archiveRecords;
+    const shards = Math.max(0, Number(manifest.shardCount || 0) || 0) + Math.max(0, Number(archiveState.shards || 0) || 0);
+    const archiveIntegrityOk = !archiveRef || archiveState.verified === true;
+    const integrityOk = manifest.manifestCorrupt !== true && archiveIntegrityOk;
     return {
-      available: records > 0 && shards > 0,
-      reason: records > 0 && shards > 0 ? 'loaded' : 'empty',
+      available: records > 0 && integrityOk,
+      reason: !integrityOk ? 'partial' : records > 0 ? 'loaded' : 'empty',
       records,
       shards,
       sourceScope,
-      manifest,
+      manifest: {
+        ...manifest,
+        count: records,
+        localCount: localRecords,
+        archiveCount: archiveRecords,
+        archiveRef,
+        archiveVerified: archiveIntegrityOk,
+        archiveReason: archiveState.reason
+      },
       manifestKey,
+      archiveLayers: archiveState.layers,
+      archiveVerified: archiveIntegrityOk,
+      archiveReason: archiveState.reason,
+      recordsIncluded: false,
       readSource: 'plugin_storage_fallback',
-      integrityOk: null
+      integrityOk
     };
   };
 
@@ -2773,7 +2983,8 @@
     if ((raw == null || raw === '') && commitId) {
       const fallbackKey = flashbackLegacyShardStorageKey(scopeKey, shardIndex);
       const fallbackRaw = await storageGet(fallbackKey);
-      const fallbackParsed = parseJson(fallbackRaw, null);
+      const fallbackDecoded = await decodeFlashbackShardPayloadForRetrace(fallbackRaw);
+      const fallbackParsed = fallbackDecoded.parsed;
       if (fallbackParsed && typeof fallbackParsed === 'object' && !Array.isArray(fallbackParsed)
         && text(fallbackParsed.commitId || '') === commitId) {
         storageKey = fallbackKey;
@@ -2782,7 +2993,8 @@
       }
     }
     if (raw == null || raw === '') return { storageKey, shardIndex, records: [], missing: true, corrupt: false };
-    const parsed = parseJson(raw, null);
+    const decoded = await decodeFlashbackShardPayloadForRetrace(raw);
+    const parsed = decoded.parsed;
     const objectPayload = parsed && typeof parsed === 'object' && !Array.isArray(parsed);
     const records = objectPayload && Array.isArray(parsed.records)
       ? parsed.records
@@ -2809,6 +3021,8 @@
       missing: corrupt,
       corrupt,
       fallback,
+      compressed: decoded.compressed === true,
+      decodeReason: decoded.reason || '',
       checksumValid,
       countValid
     };
@@ -2836,75 +3050,85 @@
   };
 
   const readFlashbackViewer = async context => {
-    const source = await readFlashbackSource(context);
+    const source = await readFlashbackSource(context, { includeRecords: false });
     if (!source.sourceScope?.scopeKey || !source.manifest) {
-      return { ...source, items: [], loadedRecords: 0, missingShards: 0, corruptShards: 0, stats: { byType: {} } };
+      return { ...source, items: [], loadedRecords: Math.max(0, Number(source.records || 0) || 0), viewerLoadedRecords: 0, missingShards: 0, corruptShards: 0, stats: source.runtimeStats || { byType: {} } };
     }
-    if (Array.isArray(source.runtimeItems)) {
-      const items = source.runtimeItems;
-      const manifestRecords = Math.max(0, Number(source.manifest?.count || source.records || 0) || 0);
-      const missingShards = Math.max(0, Number(source.missingShards || source.manifest?.missingShards || 0) || 0);
-      const corruptShards = Math.max(0, Number(source.corruptShards || source.manifest?.corruptShards || 0) || 0);
-      const recordCountMismatch = source.recordCountMismatch === true
-        || source.manifest?.recordCountMismatch === true
-        || items.length !== manifestRecords;
-      const manifestCorrupt = source.manifestCorrupt === true || source.manifest?.manifestCorrupt === true;
-      const partial = manifestCorrupt || missingShards > 0 || corruptShards > 0 || recordCountMismatch;
-      return {
-        ...source,
-        available: items.length > 0 && !partial,
-        reason: partial ? 'partial' : items.length ? 'loaded' : 'empty',
-        items,
-        loadedRecords: items.length,
-        manifestRecords,
-        missingShards,
-        corruptShards,
-        recordCountMismatch,
-        manifestCorrupt,
-        integrityOk: !partial,
-        shardCount: Math.max(0, Number(source.manifest?.shardCount || source.shards || 0) || 0),
-        shards: [],
-        stats: source.runtimeStats || summarizeFlashbackRecords(items)
-      };
+    const localScopeKey = source.sourceScope.scopeKey;
+    const localManifest = source.manifest;
+    const archiveRef = normalizeFlashbackArchiveRefForRetrace(localManifest.archiveRef);
+    const archiveState = await readFlashbackArchiveLayerMetas(archiveRef);
+    const physicalScopes = [{
+      scopeKey: localScopeKey,
+      manifest: { ...localManifest, count: Number(localManifest.localCount ?? localManifest.count ?? 0) || 0 },
+      kind: 'local'
+    }];
+    // readFlashbackArchiveLayerMetas is head -> parent. This is also newest -> oldest.
+    for (const layer of archiveState.layers || []) {
+      physicalScopes.push({
+        scopeKey: layer.scopeKey || layer.ref?.archiveScopeKey || '',
+        manifest: layer.manifest || null,
+        kind: 'archive_layer',
+        archiveId: layer.ref?.archiveId || ''
+      });
     }
-    const scopeKey = source.sourceScope.scopeKey;
-    const manifest = source.manifest;
-    const manifestKey = text(source.manifestKey || '');
-    const shardCount = Math.max(0, Math.min(2048, Number(manifest.shardCount || 0) || 0));
-    const shards = [];
-    for (let offset = 0; offset < shardCount; offset += 8) {
-      const batch = Array.from(
-        { length: Math.min(8, shardCount - offset) },
-        (_, index) => readFlashbackShard(scopeKey, manifest, offset + index)
-      );
-      shards.push(...await Promise.all(batch));
+    const limit = FLASHBACK_VIEWER_MAX_RENDERED_RECORDS;
+    const byId = new Map();
+    const sampledShards = [];
+    let missingShards = 0;
+    let corruptShards = 0;
+    let compressedShards = 0;
+    let totalPhysicalShards = 0;
+    for (const physical of physicalScopes) totalPhysicalShards += Math.max(0, Math.min(2048, Number(physical.manifest?.shardCount || 0) || 0));
+    for (const physical of physicalScopes) {
+      if (byId.size >= limit) break;
+      if (!physical.manifest) continue;
+      const shardCount = Math.max(0, Math.min(2048, Number(physical.manifest.shardCount || 0) || 0));
+      for (let shardIndex = shardCount - 1; shardIndex >= 0 && byId.size < limit; shardIndex -= 1) {
+        const shard = await readFlashbackShard(physical.scopeKey, physical.manifest, shardIndex);
+        sampledShards.push({ ...shard, scopeKey: physical.scopeKey, kind: physical.kind });
+        if (shard.missing) {
+          missingShards += 1;
+          if (shard.corrupt) corruptShards += 1;
+          continue;
+        }
+        if (shard.compressed) compressedShards += 1;
+        // Newer records in the shard win. Local scope is scanned before archive layers,
+        // so a repaired current-session alias also wins over its historical predecessor.
+        for (const record of shard.records.slice().reverse()) {
+          const identity = text(record?.permanentHistoryId || record?.id || record?.recordId || record?.sourceHash || '')
+            || flashbackKeyHash(JSON.stringify(record || {}));
+          if (!identity || byId.has(identity)) continue;
+          byId.set(identity, record);
+          if (byId.size >= limit) break;
+        }
+      }
     }
-    const items = shards.flatMap(shard => shard.records);
-    const missingShards = shards.filter(shard => shard.missing).length;
-    const corruptShards = shards.filter(shard => shard.corrupt).length;
-    const manifestRecords = Math.max(0, Number(manifest.count || manifest.stats?.recordTotal || 0) || 0);
-    const recordCountMismatch = missingShards === 0 && items.length !== manifestRecords;
-    const stats = summarizeFlashbackRecords(items);
-    const partial = manifest.manifestCorrupt === true
-      || missingShards > 0
-      || corruptShards > 0
-      || recordCountMismatch;
+    const items = Array.from(byId.values()).sort(compareFlashbackTimelineRecords);
+    const totalRecords = Math.max(0, Number(source.records ?? localManifest.count ?? 0) || 0);
+    const manifestCorrupt = source.manifestCorrupt === true || localManifest.manifestCorrupt === true;
+    const partial = manifestCorrupt || source.archiveVerified === false || corruptShards > 0;
+    const stats = source.runtimeStats || localManifest.stats || summarizeFlashbackRecords(items);
     return {
       ...source,
-      manifest,
-      manifestKey,
-      available: items.length > 0,
-      reason: partial ? 'partial' : items.length ? 'loaded' : 'empty',
+      manifest: localManifest,
+      available: totalRecords > 0 && !partial,
+      reason: partial ? 'partial' : totalRecords > 0 ? 'loaded' : 'empty',
       items,
-      loadedRecords: items.length,
-      manifestRecords,
+      loadedRecords: totalRecords,
+      viewerLoadedRecords: items.length,
+      manifestRecords: totalRecords,
       missingShards,
       corruptShards,
-      recordCountMismatch,
-      manifestCorrupt: manifest.manifestCorrupt === true,
-      integrityOk: !partial && manifest.manifestCorrupt !== true,
-      shardCount,
-      shards: shards.map(({ storageKey, shardIndex, missing, corrupt, fallback }) => ({ storageKey, shardIndex, missing, corrupt, fallback })),
+      recordCountMismatch: source.recordCountMismatch === true,
+      manifestCorrupt,
+      integrityOk: !partial && source.recordCountMismatch !== true,
+      shardCount: totalPhysicalShards,
+      viewerScannedShards: sampledShards.length,
+      viewerCompressedShards: compressedShards,
+      viewerLimited: totalRecords > items.length,
+      viewerReadMode: 'latest_shards_only',
+      shards: sampledShards.map(({ storageKey, shardIndex, missing, corrupt, fallback, compressed, scopeKey, kind }) => ({ storageKey, shardIndex, missing, corrupt, fallback, compressed, scopeKey, kind })),
       stats
     };
   };
@@ -3000,34 +3224,193 @@
       .sort(compareHayakuTimelineRecords);
   };
 
+  const hayakuArchiveRecordIdentityForRetrace = record => text(record?.permanentHistoryId || record?.archiveCanonicalId || '').trim()
+    || stableHash64([
+      text(record?.inheritedFromScopeKey || '').trim(),
+      hayakuRecordSlotId(record),
+      text(record?.hash || '').trim(),
+      text(record?.packetType || '').trim()
+    ].join('\u0001'));
+
+  const hayakuArchiveRefPointerForRetrace = value => {
+    const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    const archiveId = text(source.archiveId || '').trim();
+    const storageKey = text(source.storageKey || '').trim();
+    if (!archiveId || !storageKey) return null;
+    return {
+      schema: text(source.schema || HAYAKU_ARCHIVE_REF_SCHEMA),
+      archiveId,
+      storageKey,
+      metaKey: text(source.metaKey || `${HAYAKU_ARCHIVE_META_KEY_PREFIX}${archiveId}`).trim(),
+      generation: Math.max(1, Number(source.generation || 1) || 1),
+      depth: Math.max(1, Number(source.depth || 1) || 1),
+      deltaCount: Math.max(0, Number(source.deltaCount ?? source.recordCount ?? 0) || 0),
+      recordCount: Math.max(0, Number(source.recordCount || 0) || 0),
+      localOverlapCount: Math.max(0, Number(source.localOverlapCount || 0) || 0),
+      digest: text(source.digest || '').trim(),
+      createdAt: Math.max(0, Number(source.createdAt || 0) || 0),
+      updatedAt: Math.max(0, Number(source.updatedAt || 0) || 0)
+    };
+  };
+
+  const normalizeHayakuArchiveRefForRetrace = value => {
+    const pointer = hayakuArchiveRefPointerForRetrace(value);
+    if (!pointer) return null;
+    const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    return { ...pointer, parentRef: hayakuArchiveRefPointerForRetrace(source.parentRef || source.parentArchiveRef) };
+  };
+
+  const readHayakuArchiveLayerMetas = async archiveRefValue => {
+    const head = normalizeHayakuArchiveRefForRetrace(archiveRefValue);
+    if (!head) return { archiveRef: null, layers: [], records: 0, memberIds: [], verified: true, reason: 'archive_ref_absent' };
+    const seen = new Set();
+    const memberSet = new Set();
+    const layers = [];
+    let cursor = head;
+    let reason = '';
+    while (cursor && layers.length < HAYAKU_ARCHIVE_MAX_DEPTH) {
+      if (seen.has(cursor.metaKey)) { reason = 'archive_cycle'; break; }
+      seen.add(cursor.metaKey);
+      const meta = parseJson(await storageGet(cursor.metaKey), null);
+      if (!meta || meta.schema !== HAYAKU_ARCHIVE_META_SCHEMA || text(meta.archiveId || '') !== cursor.archiveId) {
+        reason = 'archive_meta_missing_or_invalid';
+        break;
+      }
+      const deltaMemberIds = Array.from(new Set((Array.isArray(meta.deltaMemberIds) ? meta.deltaMemberIds : [])
+        .map(value => text(value || '').trim()).filter(Boolean))).sort();
+      const deltaDigest = stableHash64(deltaMemberIds.join('\u0001'));
+      const deltaCount = Math.max(0, Number(meta.deltaCount || 0) || 0);
+      if (deltaMemberIds.length !== deltaCount
+        || deltaCount !== cursor.deltaCount
+        || deltaDigest !== text(meta.deltaDigest || '')) {
+        reason = 'archive_meta_delta_mismatch';
+        break;
+      }
+      for (const memberId of deltaMemberIds) {
+        if (memberSet.has(memberId)) { reason = 'archive_member_duplicate'; break; }
+        memberSet.add(memberId);
+      }
+      if (reason) break;
+      layers.push({ ref: cursor, meta, memberIds: deltaMemberIds });
+      cursor = normalizeHayakuArchiveRefForRetrace(cursor.parentRef || meta.parentRef || meta.parentArchiveRef);
+    }
+    if (!reason && cursor) reason = 'archive_depth_exceeded';
+    const memberIds = Array.from(memberSet).sort();
+    const digest = stableHash64(memberIds.join('\u0001'));
+    const depthMatches = !head.depth || layers.length === head.depth;
+    const verified = !reason && memberIds.length === head.recordCount && digest === head.digest && depthMatches;
+    return {
+      archiveRef: head,
+      layers,
+      records: memberIds.length,
+      memberIds,
+      digest,
+      verified,
+      reason: verified ? 'archive_meta_chain_verified' : reason || (memberIds.length !== head.recordCount ? 'archive_record_count_mismatch' : digest !== head.digest ? 'archive_digest_mismatch' : 'archive_depth_mismatch')
+    };
+  };
+
+  const hydrateHayakuArchiveForRetrace = async ledger => {
+    const head = normalizeHayakuArchiveRefForRetrace(ledger?.archiveRef);
+    if (!head) return { ledger: { ...ledger, archiveRef: null }, archiveVerified: true, archiveRecords: 0, archiveLayers: [] };
+    const seen = new Set();
+    const layers = [];
+    let cursor = head;
+    let reason = '';
+    while (cursor && layers.length < HAYAKU_ARCHIVE_MAX_DEPTH) {
+      if (seen.has(cursor.storageKey)) { reason = 'archive_cycle'; break; }
+      seen.add(cursor.storageKey);
+      const decodedArchive = await decodeHayakuArchivePayloadForRetrace(await storageGet(cursor.storageKey));
+      const archive = decodedArchive.parsed;
+      if (!archive || archive.schema !== HAYAKU_ARCHIVE_SCHEMA || text(archive.archiveId || '') !== cursor.archiveId) {
+        reason = decodedArchive.reason || 'archive_missing_or_invalid';
+        break;
+      }
+      const records = Array.isArray(archive.records) ? archive.records.filter(record => record && typeof record === 'object') : [];
+      const deltaDigest = stableHash64(records.map(hayakuArchiveRecordIdentityForRetrace).sort().join('\u0001'));
+      const deltaCountMatches = records.length === Math.max(0, Number(archive.deltaCount ?? records.length) || 0)
+        && records.length === cursor.deltaCount;
+      const layerMatches = Number(archive.recordCount || 0) === cursor.recordCount
+        && (!archive.digest || !cursor.digest || text(archive.digest || '') === cursor.digest)
+        && (!archive.deltaDigest || text(archive.deltaDigest || '') === deltaDigest)
+        && (!archive.generation || Number(archive.generation || 0) === cursor.generation);
+      if (!deltaCountMatches || !layerMatches) {
+        reason = !deltaCountMatches ? 'archive_delta_count_mismatch' : 'archive_layer_manifest_mismatch';
+        break;
+      }
+      layers.push({ ref: cursor, archive, records, deltaDigest });
+      cursor = normalizeHayakuArchiveRefForRetrace(cursor.parentRef || archive.parentRef || archive.parentArchiveRef);
+    }
+    if (!reason && cursor) reason = 'archive_depth_exceeded';
+    const mergedArchive = new Map();
+    for (const layer of layers.slice().reverse()) {
+      for (const record of layer.records) {
+        const identity = hayakuArchiveRecordIdentityForRetrace(record) || text(record?.recordId || record?.hash || '');
+        if (identity) mergedArchive.set(identity, record);
+      }
+    }
+    const archiveRecords = Array.from(mergedArchive.values()).sort(compareHayakuTimelineRecords);
+    const digest = stableHash64(archiveRecords.map(hayakuArchiveRecordIdentityForRetrace).sort().join('\u0001'));
+    const depthMatches = !head.depth || layers.length === head.depth;
+    const verified = !reason && archiveRecords.length === head.recordCount && digest === head.digest && depthMatches;
+    const merged = new Map();
+    for (const record of [...archiveRecords, ...(Array.isArray(ledger.records) ? ledger.records : [])]) {
+      const identity = hayakuArchiveRecordIdentityForRetrace(record) || text(record?.recordId || record?.hash || '');
+      if (identity) merged.set(identity, record);
+    }
+    return {
+      ledger: {
+        ...ledger,
+        archiveRef: head,
+        records: Array.from(merged.values()),
+        archiveVerified: verified,
+        archiveRecords: archiveRecords.length,
+        archiveReason: verified ? 'archive_chain_verified' : reason || 'archive_digest_mismatch'
+      },
+      archiveVerified: verified,
+      archiveRecords: archiveRecords.length,
+      archiveLayers: layers,
+      archiveReason: verified ? 'archive_chain_verified' : reason || 'archive_digest_mismatch'
+    };
+  };
+
   const hayakuSourceResult = (ledger, scope, readSource, packetAuthoring = null) => {
-    if (!ledger) return { available: false, reason: 'ledger_not_found', records: [], scope };
+    if (!ledger) return { available: false, reason: 'ledger_not_found', records: [], recordCount: 0, scope };
     if (!HAYAKU_LEDGER_SCHEMAS.has(ledger.version)) {
       return {
         available: false,
         reason: 'unsupported_schema',
         schema: text(ledger.version || ''),
         records: [],
+        recordCount: 0,
         scope,
         ledger,
         readSource
       };
     }
     if (text(ledger.scopeKey || '') !== scope.scopeKey) {
-      return { available: false, reason: 'scope_mismatch', records: [], scope, ledger, readSource };
+      return { available: false, reason: 'scope_mismatch', records: [], recordCount: 0, scope, ledger, readSource };
     }
-    const allRecords = Array.isArray(ledger.records)
+    const recordsIncluded = ledger.recordsIncluded !== false;
+    const allRecords = recordsIncluded && Array.isArray(ledger.records)
       ? ledger.records.filter(record => record && typeof record === 'object' && text(record.raw || '').trim())
       : [];
-    const records = effectiveHayakuRecords(ledger);
+    const records = recordsIncluded ? effectiveHayakuRecords(ledger) : [];
+    const recordCount = Math.max(0, Number(ledger.recordCount ?? ledger.logicalRecordCount ?? records.length) || 0);
+    const archiveVerified = ledger.archiveVerified !== false;
+    const integrityOk = archiveVerified;
     return {
-      available: records.length > 0,
-      reason: records.length ? 'loaded' : 'empty',
+      available: recordCount > 0 && integrityOk,
+      reason: !integrityOk ? 'archive_partial' : recordCount ? 'loaded' : 'empty',
       records,
+      recordCount,
+      recordsIncluded,
       allRecords,
       scope,
       ledger,
       readSource,
+      archiveRef: ledger.archiveRef && typeof ledger.archiveRef === 'object' ? clone(ledger.archiveRef, {}) : null,
+      archiveVerified,
       storageLimits: clone(ledger?.storageLimits || ledger?.storage || {}, {}),
       packetAuthoring: normalizeHayakuPacketAuthoringProfile(
         packetAuthoring || ledger?.packetAuthoring,
@@ -3036,12 +3419,13 @@
     };
   };
 
-  const readHayakuSource = async context => {
+  const readHayakuSource = async (context, options = {}) => {
     const scope = hayakuScopeFor(context);
-    if (!scope.available) return { available: false, reason: scope.reason, records: [], scope };
+    const includeRecords = options?.includeRecords !== false;
+    if (!scope.available) return { available: false, reason: scope.reason, records: [], recordCount: 0, scope };
 
     try {
-      const inspected = await requestHayakuIpc('inspect', {}, { timeoutMs: 1500 });
+      const inspected = await requestHayakuIpc('inspect', { includeRecords }, { timeoutMs: includeRecords ? 2600 : 1500 });
       const inspectedLedger = inspected?.ledger && typeof inspected.ledger === 'object'
         ? inspected.ledger
         : inspected;
@@ -3050,6 +3434,10 @@
           ...clone(inspectedLedger, {}),
           version: text(inspectedLedger.version || inspected?.version || '').trim(),
           scopeKey: text(inspectedLedger.scopeKey || inspected?.scopeKey || '').trim(),
+          recordsIncluded: inspected?.recordsIncluded ?? inspectedLedger?.recordsIncluded ?? includeRecords,
+          recordCount: Number(inspected?.recordCount ?? inspectedLedger?.recordCount ?? 0) || 0,
+          archiveRef: clone(inspected?.archiveRef || inspectedLedger?.archiveRef || null, null),
+          archiveVerified: inspected?.archiveVerified ?? inspectedLedger?.archiveVerified,
           storageLimits: clone(
             inspected?.storageLimits
             || inspectedLedger?.storageLimits
@@ -3077,11 +3465,11 @@
     const runtime = activeHayakuRuntime('inspect');
     if (runtime) {
       try {
-        const inspected = await runtime.ledger.inspect();
+        const inspected = await runtime.ledger.inspect({ includeRecords });
         const inspectedLedger = inspected?.ledger && typeof inspected.ledger === 'object'
           ? inspected.ledger
           : inspected;
-        const runtimeSnapshot = typeof runtime.runtime === 'function'
+        const runtimeSnapshot = includeRecords && typeof runtime.runtime === 'function'
           ? await Promise.resolve(runtime.runtime())
           : null;
         if (inspectedLedger && typeof inspectedLedger === 'object') {
@@ -3094,6 +3482,10 @@
               || ''
             ).trim(),
             scopeKey: text(inspectedLedger.scopeKey || inspected?.scopeKey || '').trim(),
+            recordsIncluded: inspected?.recordsIncluded ?? inspectedLedger?.recordsIncluded ?? includeRecords,
+            recordCount: Number(inspected?.recordCount ?? inspectedLedger?.recordCount ?? 0) || 0,
+            archiveRef: clone(inspected?.archiveRef || inspectedLedger?.archiveRef || null, null),
+            archiveVerified: inspected?.archiveVerified ?? inspectedLedger?.archiveVerified,
             packetAuthoring: inspected?.packetAuthoring
               || inspectedLedger?.packetAuthoring
               || runtimeSnapshot?.packetAuthoring
@@ -3109,12 +3501,7 @@
               {}
             )
           };
-          const result = hayakuSourceResult(
-            runtimeLedger,
-            scope,
-            'hayaku_runtime_api',
-            runtimeLedger.packetAuthoring
-          );
+          const result = hayakuSourceResult(runtimeLedger, scope, 'hayaku_runtime_api', runtimeLedger.packetAuthoring);
           if (!['scope_mismatch', 'unsupported_schema'].includes(result.reason)) return result;
           warn(`HAYAKU runtime ledger rejected: ${result.reason}`, result.schema || runtimeLedger.scopeKey);
         }
@@ -3123,8 +3510,109 @@
       }
     }
 
-    const ledger = parseJson(await storageGet(scope.storageKey), null);
-    return hayakuSourceResult(ledger, scope, 'plugin_storage_fallback');
+    const localLedger = parseJson(await storageGet(scope.storageKey), null);
+    if (!includeRecords || !localLedger?.archiveRef) {
+      const archiveState = localLedger?.archiveRef
+        ? await readHayakuArchiveLayerMetas(localLedger.archiveRef)
+        : { verified: true, reason: 'archive_ref_absent', records: 0, layers: [] };
+      const localEffective = effectiveHayakuRecords({ ...localLedger, archiveRef: null }).length;
+      const overlap = Math.min(localEffective, Math.max(0, Number(localLedger?.archiveRef?.localOverlapCount || 0) || 0));
+      const logicalCount = Math.max(0, Number(localLedger?.recordCount || 0) || 0)
+        || Math.max(0, Number(archiveState.records || 0) || 0) + localEffective - overlap;
+      const summaryLedger = localLedger && typeof localLedger === 'object'
+        ? {
+          ...localLedger,
+          recordsIncluded: includeRecords,
+          recordCount: logicalCount,
+          archiveVerified: archiveState.verified === true,
+          archiveReason: archiveState.reason,
+          archiveRecords: archiveState.records,
+          archiveLayers: archiveState.layers
+        }
+        : localLedger;
+      return hayakuSourceResult(summaryLedger, scope, 'plugin_storage_fallback');
+    }
+    const hydrated = await hydrateHayakuArchiveForRetrace(localLedger);
+    return hayakuSourceResult({
+      ...hydrated.ledger,
+      recordsIncluded: true,
+      recordCount: effectiveHayakuRecords(hydrated.ledger).length,
+      archiveVerified: hydrated.archiveVerified
+    }, scope, 'plugin_storage_fallback');
+  };
+
+  const readHayakuViewerSource = async (context, limit = HAYAKU_VIEWER_MAX_RENDERED_RECORDS) => {
+    const summary = await readHayakuSource(context, { includeRecords: false });
+    const scope = summary?.scope?.available ? summary.scope : hayakuScopeFor(context);
+    if (!scope?.available) return summary;
+    const rawLedger = parseJson(await storageGet(scope.storageKey), null);
+    if (!rawLedger || !HAYAKU_LEDGER_SCHEMAS.has(text(rawLedger.version || '')) || text(rawLedger.scopeKey || '') !== scope.scopeKey) return summary;
+    const archiveState = rawLedger.archiveRef
+      ? await readHayakuArchiveLayerMetas(rawLedger.archiveRef)
+      : { verified: true, reason: 'archive_ref_absent', records: 0, layers: [] };
+    const maxRecords = Math.max(1, Math.min(1000, Number(limit || HAYAKU_VIEWER_MAX_RENDERED_RECORDS) || HAYAKU_VIEWER_MAX_RENDERED_RECORDS));
+    const localRecordsAll = Array.isArray(rawLedger.records) ? rawLedger.records.filter(record => record && typeof record === 'object') : [];
+    const localRecords = localRecordsAll.slice().sort((a, b) => compareHayakuTimelineRecords(b, a));
+    const byId = new Map();
+    for (const record of localRecords) {
+      const identity = hayakuArchiveRecordIdentityForRetrace(record) || text(record?.recordId || record?.hash || '');
+      if (!identity || byId.has(identity)) continue;
+      byId.set(identity, record);
+      if (byId.size >= maxRecords) break;
+    }
+    let archiveLayersRead = 0;
+    let compressedLayersRead = 0;
+    let archiveDecodeFailures = 0;
+    for (const layer of archiveState.layers || []) {
+      if (byId.size >= maxRecords) break;
+      const storageKey = text(layer?.ref?.storageKey || layer?.meta?.storageKey || '').trim();
+      if (!storageKey) continue;
+      const decoded = await decodeHayakuArchivePayloadForRetrace(await storageGet(storageKey));
+      const archive = decoded.parsed;
+      archiveLayersRead += 1;
+      if (decoded.compressed) compressedLayersRead += 1;
+      if (!archive || archive.schema !== HAYAKU_ARCHIVE_SCHEMA || text(archive.archiveId || '') !== text(layer?.ref?.archiveId || '')) {
+        archiveDecodeFailures += 1;
+        continue;
+      }
+      const records = Array.isArray(archive.records) ? archive.records.filter(record => record && typeof record === 'object') : [];
+      for (const record of records.slice().sort((a, b) => compareHayakuTimelineRecords(b, a))) {
+        const identity = hayakuArchiveRecordIdentityForRetrace(record) || text(record?.recordId || record?.hash || '');
+        if (!identity || byId.has(identity)) continue;
+        byId.set(identity, record);
+        if (byId.size >= maxRecords) break;
+      }
+    }
+    const sampledRecords = Array.from(byId.values()).sort(compareHayakuTimelineRecords);
+    const localEffective = effectiveHayakuRecords({ ...rawLedger, archiveRef: null }).length;
+    const overlap = Math.min(localEffective, Math.max(0, Number(rawLedger?.archiveRef?.localOverlapCount || 0) || 0));
+    const logicalCount = Math.max(0, Number(summary?.recordCount || 0) || 0)
+      || Math.max(0, Number(archiveState.records || 0) || 0) + localEffective - overlap;
+    const viewerLedger = {
+      ...rawLedger,
+      records: sampledRecords,
+      recordsIncluded: true,
+      recordCount: logicalCount,
+      logicalRecordCount: logicalCount,
+      archiveVerified: archiveState.verified === true && archiveDecodeFailures === 0,
+      archiveReason: archiveDecodeFailures ? 'archive_viewer_decode_failed' : archiveState.reason,
+      archiveRecords: archiveState.records,
+      storageLimits: summary?.storageLimits || rawLedger.storageLimits || rawLedger.storage || {}
+    };
+    const result = hayakuSourceResult(viewerLedger, scope, 'retrace_paged_view', summary?.packetAuthoring);
+    return {
+      ...result,
+      recordCount: logicalCount,
+      archiveRecordCount: Math.max(0, Number(archiveState.records || 0) || 0),
+      localRecordCount: Math.max(0, logicalCount - Math.max(0, Number(archiveState.records || 0) || 0)),
+      viewerLoadedRecords: sampledRecords.length,
+      viewerLimited: logicalCount > sampledRecords.length,
+      viewerReadMode: 'latest_archive_layers_only',
+      viewerArchiveLayersRead: archiveLayersRead,
+      viewerCompressedLayersRead: compressedLayersRead,
+      viewerArchiveDecodeFailures: archiveDecodeFailures,
+      summaryReadSource: summary?.readSource || ''
+    };
   };
 
   const readPendingColdStartCapsule = async context => {
@@ -6236,57 +6724,74 @@
 
   const normalizeLibraInspection = (inspection, identity = {}, readSource = 'libra_plugin_ipc') => {
     const source = inspection && typeof inspection === 'object' && !Array.isArray(inspection) ? inspection : {};
+    const recordsIncluded = source.recordsIncluded !== false;
     const memories = Array.isArray(source.memories) ? source.memories.filter(Boolean) : [];
+    const memoryRefs = Array.isArray(source.memoryRefs) ? source.memoryRefs.filter(Boolean) : [];
     const worldAdditional = Array.isArray(source.worldAdditional) ? source.worldAdditional.filter(Boolean) : [];
+    const worldAdditionalRefs = Array.isArray(source.worldAdditionalRefs) ? source.worldAdditionalRefs.filter(Boolean) : [];
     const scope = source.scope && typeof source.scope === 'object' ? source.scope : {};
     const chatId = text(scope.chatId || '').trim();
     const requestedChatId = text(identity?.chatId || '').trim();
     const scopeMatches = !requestedChatId || !chatId || requestedChatId === chatId;
     const schemaOk = source.schema === LIBRA_INSPECT_SCHEMA;
     const integrityOk = schemaOk && scopeMatches && source?.integrity?.ok !== false;
-    const liveCount = Math.max(0, Number(source?.counts?.liveMemories ?? memories.filter(memory => memory?.inheritedSessionHistory !== true && Number(memory?.sessionEpoch || 0) >= 0).length) || 0);
-    const inheritedCount = Math.max(0, Number(source?.counts?.inheritedMemories ?? memories.length - liveCount) || 0);
-    const partialCount = Math.max(0, Number(source?.counts?.partialMemories ?? memories.filter(memory => memory?.pipeline?.status === 'partial').length) || 0);
-    const snapshotHash = stableHash64(JSON.stringify({
+    const recordCount = Math.max(0, Number(source?.counts?.memories ?? (recordsIncluded ? memories.length : memoryRefs.length)) || 0);
+    const worldAdditionalCount = Math.max(0, Number(source?.counts?.worldAdditional ?? (recordsIncluded ? worldAdditional.length : worldAdditionalRefs.length)) || 0);
+    const liveCount = Math.max(0, Number(source?.counts?.liveMemories ?? (recordsIncluded
+      ? memories.filter(memory => memory?.inheritedSessionHistory !== true && Number(memory?.sessionEpoch || 0) >= 0).length
+      : memoryRefs.filter(memory => memory?.inheritedSessionHistory !== true && Number(memory?.sessionEpoch || 0) >= 0).length)) || 0);
+    const inheritedCount = Math.max(0, Number(source?.counts?.inheritedMemories ?? recordCount - liveCount) || 0);
+    const partialCount = Math.max(0, Number(source?.counts?.partialMemories ?? (recordsIncluded
+      ? memories.filter(memory => memory?.pipeline?.status === 'partial').length
+      : memoryRefs.filter(memory => text(memory?.pipelineStatus || '') === 'partial').length)) || 0);
+    const fallbackSnapshotHash = stableHash64(JSON.stringify({
       scopeKey: text(scope.scopeKey || ''),
-      memories: memories.map(memory => [
+      memories: (recordsIncluded ? memories : memoryRefs).map(memory => [
         text(memory.memoryId || ''), Number(memory.revision || 0), text(memory.sourceDigest || ''),
-        Number(memory.sessionEpoch || 0), text(memory.status || ''), stableHash64(text(memory.text || memory.summary || ''))
+        Number(memory.sessionEpoch || 0), text(memory.status || ''), text(memory.key || ''),
+        stableHash64(text(memory.text || memory.summary || ''))
       ]),
-      worldAdditional: worldAdditional.map(item => [text(item.itemId || ''), text(item.status || ''), stableHash64(text(item.content || ''))])
+      worldAdditional: recordsIncluded
+        ? worldAdditional.map(item => [text(item.itemId || ''), text(item.status || ''), stableHash64(text(item.content || ''))])
+        : worldAdditionalRefs.map(item => text(typeof item === 'string' ? item : item?.itemId || item?.key || ''))
     }));
+    const snapshotHash = text(source.snapshotHash || fallbackSnapshotHash);
     return {
-      available: schemaOk && scopeMatches && (memories.length > 0 || worldAdditional.length > 0),
+      available: schemaOk && scopeMatches && (recordCount > 0 || worldAdditionalCount > 0),
       pluginAvailable: schemaOk,
       inspectionAvailable: schemaOk && scopeMatches,
       integrityOk,
       reason: !schemaOk ? 'libra_ipc_contract_unavailable'
         : !scopeMatches ? 'libra_scope_mismatch'
-          : !integrityOk ? 'libra_integrity_failed'
-            : (memories.length || worldAdditional.length) ? 'loaded' : 'empty',
+          : !integrityOk ? text(source?.integrity?.reason || 'libra_integrity_failed')
+            : (recordCount || worldAdditionalCount) ? 'loaded' : 'empty',
       readSource,
       pluginVersion: text(source.pluginVersion || ''),
+      recordsIncluded,
       scope,
       manifest: clone(source.manifest, {}),
       integrity: clone(source.integrity, { ok: integrityOk }),
       memories,
+      memoryRefs,
       worldAdditional,
-      recordCount: memories.length,
+      worldAdditionalRefs,
+      recordCount,
       liveRecordCount: liveCount,
       inheritedRecordCount: inheritedCount,
       partialRecordCount: partialCount,
-      worldAdditionalCount: worldAdditional.length,
+      worldAdditionalCount,
       snapshotHash,
       inspectedAt: source.inspectedAt || ''
     };
   };
 
-  const readLibraSource = async context => {
+  const readLibraSource = async (context, options = {}) => {
     const identity = contextIdentity(context || await getCurrentContext());
+    const includeRecords = options?.includeRecords !== false;
     const probe = await probeLibraIpc({ timeoutMs: 1800, attempts: 2 });
     if (probe.available) {
       try {
-        const inspected = await requestLibraIpc('inspect', {}, { timeoutMs: 12000 });
+        const inspected = await requestLibraIpc('inspect', { includeRecords }, { timeoutMs: includeRecords ? 12000 : 5000 });
         const normalized = normalizeLibraInspection(inspected, identity, 'libra_plugin_ipc');
         normalized.capabilities = clone(probe.capabilities, {});
         normalized.probe = clone(probe, {});
@@ -6303,8 +6808,9 @@
           reason,
           readSource: 'libra_plugin_ipc',
           pluginVersion: text(probe.pluginVersion || ''),
+          recordsIncluded: includeRecords,
           scope: {}, manifest: {}, integrity: { ok: false, reason },
-          memories: [], worldAdditional: [], recordCount: 0, liveRecordCount: 0,
+          memories: [], memoryRefs: [], worldAdditional: [], worldAdditionalRefs: [], recordCount: 0, liveRecordCount: 0,
           inheritedRecordCount: 0, partialRecordCount: 0, worldAdditionalCount: 0,
           snapshotHash: '', capabilities: clone(probe.capabilities, {}), probe: clone(probe, {}),
           errors: [text(error?.message || error || reason)]
@@ -6312,12 +6818,10 @@
       }
     }
 
-    // Same-realm fallback is retained for unusual hosts/tests, but API-v3 iframe
-    // isolation means official plugin IPC remains the authoritative route.
     const runtime = activeLibraRuntime();
     if (runtime && typeof runtime.inspectForRetrace === 'function') {
       try {
-        const inspected = await runtime.inspectForRetrace();
+        const inspected = await runtime.inspectForRetrace({ includeRecords });
         const normalized = normalizeLibraInspection(inspected, identity, 'libra_runtime_api');
         normalized.probe = clone(probe, {});
         return normalized;
@@ -6332,8 +6836,8 @@
       integrityOk: false,
       reason: 'libra_ipc_unavailable',
       readSource: 'none',
-      pluginVersion: '', scope: {}, manifest: {}, integrity: { ok: false },
-      memories: [], worldAdditional: [], recordCount: 0, liveRecordCount: 0,
+      pluginVersion: '', recordsIncluded: includeRecords, scope: {}, manifest: {}, integrity: { ok: false },
+      memories: [], memoryRefs: [], worldAdditional: [], worldAdditionalRefs: [], recordCount: 0, liveRecordCount: 0,
       inheritedRecordCount: 0, partialRecordCount: 0, worldAdditionalCount: 0,
       snapshotHash: '', probe: clone(probe, {}), errors: [probe.error || 'LIBRA v1.0.4 or later IPC contract is required.']
     };
@@ -6354,6 +6858,16 @@
     )
   );
 
+  const libraArchiveReceiptMatches = (receipt, options) => {
+    const expectedArchiveId = text(options?.expectedArchiveId || '').trim();
+    const expectedArchiveDigest = text(options?.expectedArchiveDigest || '').trim();
+    const expectedArchiveGeneration = Math.max(0, Number(options?.expectedArchiveGeneration || 0) || 0);
+    if (expectedArchiveId && text(receipt?.archiveId || '') !== expectedArchiveId) return false;
+    if (expectedArchiveDigest && text(receipt?.archiveDigest || '') !== expectedArchiveDigest) return false;
+    if (expectedArchiveGeneration && Number(receipt?.archiveGeneration || 0) !== expectedArchiveGeneration) return false;
+    return true;
+  };
+
   const libraPreparationReceiptMatches = (receipt, options, transport) => {
     const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
     const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
@@ -6366,6 +6880,7 @@
       && libraReceiptCountMatches(receipt, 'expectedRecords', expectedRecords)
       && libraReceiptCountMatches(receipt, 'worldAdditional', expectedWorldAdditional)
       && libraReceiptCountMatches(receipt, 'expectedWorldAdditional', expectedWorldAdditional)
+      && libraArchiveReceiptMatches(receipt, options)
       && libraOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
   };
 
@@ -6383,6 +6898,7 @@
       && libraReceiptCountMatches(receipt, 'expectedRecords', expectedRecords)
       && libraReceiptCountMatches(receipt, 'worldAdditional', expectedWorldAdditional)
       && libraReceiptCountMatches(receipt, 'expectedWorldAdditional', expectedWorldAdditional)
+      && libraArchiveReceiptMatches(receipt, options)
       && libraOwnerReceiptMatches(receipt, transport, 'adopt_session_handoff');
   };
 
@@ -6399,6 +6915,7 @@
       && libraReceiptCountMatches(receipt, 'expectedRecords', expectedRecords)
       && libraReceiptCountMatches(receipt, 'worldAdditional', expectedWorldAdditional)
       && libraReceiptCountMatches(receipt, 'expectedWorldAdditional', expectedWorldAdditional)
+      && libraArchiveReceiptMatches(receipt, options)
       && libraOwnerReceiptMatches(receipt, transport, 'verify_session_handoff');
   };
 
@@ -6480,7 +6997,10 @@
       transferId: text(options?.transferId || ''),
       targetChatId: text(options?.targetChatId || ''),
       expectedRecords: Math.max(0, Number(options?.expectedRecords || 0) || 0),
-      expectedWorldAdditional: Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0)
+      expectedWorldAdditional: Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0),
+      expectedArchiveId: text(options?.expectedArchiveId || ''),
+      expectedArchiveGeneration: Math.max(0, Number(options?.expectedArchiveGeneration || 0) || 0),
+      expectedArchiveDigest: text(options?.expectedArchiveDigest || '')
     };
     const runtime = activeLibraRuntime();
     try {
@@ -6514,11 +7034,11 @@
   const inspectTransition = async () => {
     const context = await getCurrentContext();
     const [flashback, hayaku, pendingColdStart, libra, gradia] = await Promise.all([
-      readFlashbackViewer(context),
-      readHayakuSource(context),
+      readFlashbackSource(context, { includeRecords: false }),
+      readHayakuSource(context, { includeRecords: false }),
       readPendingColdStartCapsule(context),
-      readLibraSource(context),
-      readGradiaSource(context)
+      readLibraSource(context, { includeRecords: false }),
+      readGradiaSource(context, { includePayload: false })
     ]);
     const preview = {
       context,
@@ -6531,7 +7051,7 @@
       includeHayaku: hayaku.available === true || pendingColdStart.available === true,
       includeLibra: libra.available === true,
       includeGradia: gradia.available === true,
-      hayakuRecordCount: hayaku.available ? hayaku.records.length : pendingColdStart.packets.length,
+      hayakuRecordCount: hayaku.available ? Math.max(0, Number(hayaku.recordCount ?? hayaku.records?.length ?? 0) || 0) : pendingColdStart.packets.length,
       libraRecordCount: libra.recordCount,
       gradiaStoryArcCount: gradia.storyArcCount,
       gradiaWriterDesignCount: gradia.writerDesignCount,
@@ -6563,41 +7083,43 @@
 
   const backupHayakuLedger = async () => {
     const context = await getCurrentContext();
-    const hayaku = await readHayakuSource(context);
+    const hayaku = await readHayakuSource(context, { includeRecords: true });
     const scope = hayaku.scope || hayakuScopeFor(context);
     if (!scope?.available) throw new Error('HAYAKU 스코프를 계산하지 못했습니다.');
     if (!hayaku.ledger || !HAYAKU_LEDGER_SCHEMAS.has(text(hayaku.ledger.version))) {
       throw new Error('백업할 HAYAKU 미러 원장이 없습니다.');
     }
     const createdAt = Date.now();
-    const ledger = clone(hayaku.ledger, null);
-    if (!ledger) throw new Error('HAYAKU 원장 스냅샷을 복제하지 못했습니다.');
-    const ledgerJson = JSON.stringify(ledger);
+    const ledgerJson = JSON.stringify(hayaku.ledger);
     const checksum = stableHash64(ledgerJson);
     const backupId = `hayaku-backup-${createdAt}-${checksum.slice(-10)}`;
     const storageKey = `${HAYAKU_BACKUP_PREFIX}${scope.scopeKey}:${backupId}`;
-    const envelope = {
+    const recordCount = Array.isArray(hayaku.ledger.records) ? hayaku.ledger.records.length : 0;
+    const slotHeadCount = Array.isArray(hayaku.ledger.slotHeads) ? hayaku.ledger.slotHeads.length : 0;
+    const tombstoneCount = Array.isArray(hayaku.ledger.tombstones) ? hayaku.ledger.tombstones.length : 0;
+    const envelopeMeta = {
       schema: HAYAKU_BACKUP_SCHEMA,
       backupId,
       scopeKey: scope.scopeKey,
       sourceStorageKey: scope.storageKey || `${HAYAKU_LEDGER_PREFIX}${scope.scopeKey}`,
       sourceReadMethod: text(hayaku.readSource || 'unknown'),
-      sourceLedgerVersion: text(ledger.version || ''),
+      sourceLedgerVersion: text(hayaku.ledger.version || ''),
       createdAt,
       checksum,
-      recordCount: Array.isArray(ledger.records) ? ledger.records.length : 0,
-      slotHeadCount: Array.isArray(ledger.slotHeads) ? ledger.slotHeads.length : 0,
-      tombstoneCount: Array.isArray(ledger.tombstones) ? ledger.tombstones.length : 0,
-      immutable: true,
-      ledger
+      recordCount,
+      slotHeadCount,
+      tombstoneCount,
+      immutable: true
     };
-    if (!await storageSet(storageKey, JSON.stringify(envelope))) {
+    // Insert the already-serialized ledger as raw JSON so a large ledger is not
+    // deep-cloned and serialized yet another time merely to build the envelope.
+    const metaJson = JSON.stringify(envelopeMeta);
+    const envelopeJson = `${metaJson.slice(0, -1)},"ledger":${ledgerJson}}`;
+    if (!await storageSet(storageKey, envelopeJson)) {
       throw new Error('HAYAKU 미러 원장 백업을 저장하지 못했습니다.');
     }
-    const verified = parseJson(await storageGet(storageKey), null);
-    if (!verified || verified.schema !== HAYAKU_BACKUP_SCHEMA
-      || verified.backupId !== backupId
-      || stableHash64(JSON.stringify(verified.ledger)) !== checksum) {
+    const verifiedRaw = await storageGet(storageKey);
+    if (typeof verifiedRaw !== 'string' || stableHash64(verifiedRaw) !== stableHash64(envelopeJson)) {
       throw new Error('HAYAKU 미러 원장 백업 저장 검증에 실패했습니다.');
     }
     const catalogKey = hayakuBackupCatalogKey(scope.scopeKey);
@@ -6605,15 +7127,7 @@
     const entries = previous?.schema === HAYAKU_BACKUP_CATALOG_SCHEMA && Array.isArray(previous.entries)
       ? previous.entries.filter(entry => entry?.backupId !== backupId)
       : [];
-    entries.push({
-      backupId,
-      storageKey,
-      createdAt,
-      checksum,
-      recordCount: envelope.recordCount,
-      slotHeadCount: envelope.slotHeadCount,
-      tombstoneCount: envelope.tombstoneCount
-    });
+    entries.push({ backupId, storageKey, createdAt, checksum, recordCount, slotHeadCount, tombstoneCount });
     const catalog = {
       schema: HAYAKU_BACKUP_CATALOG_SCHEMA,
       scopeKey: scope.scopeKey,
@@ -6631,9 +7145,10 @@
       catalogSaved,
       checksum,
       createdAt,
-      recordCount: envelope.recordCount,
-      slotHeadCount: envelope.slotHeadCount,
-      tombstoneCount: envelope.tombstoneCount
+      recordCount,
+      slotHeadCount,
+      tombstoneCount,
+      serializationMode: 'single_ledger_json'
     };
     Runtime.lastHayakuBackup = result;
     return result;
@@ -6710,7 +7225,10 @@
       ? await prepareLibraSessionHandoff({
         transferId,
         expectedRecords: libra.recordCount,
-        expectedWorldAdditional: libra.worldAdditionalCount
+        expectedWorldAdditional: libra.worldAdditionalCount,
+        expectedArchiveId: text(libraPreparation?.archiveId || ''),
+        expectedArchiveGeneration: Math.max(0, Number(libraPreparation?.archiveGeneration || 0) || 0),
+        expectedArchiveDigest: text(libraPreparation?.archiveDigest || '')
       })
       : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, prepared: false, records: 0, worldAdditional: 0, reason: 'no_libra_data' };
     if (preview.includeLibra && (
@@ -6783,6 +7301,7 @@
       memorySessionBridge: {
         schema: HANDOFF_SCHEMA,
         timelineContract: 'session_epoch_then_completed_pair_v1',
+        storageContract: 'shared_archive_reference_v1',
         transferId,
         sourceChatId: identity.chatId,
         sourceFlashbackScopeKey: text(flashback.sourceScope?.scopeKey || ''),
@@ -6805,6 +7324,12 @@
         gradiaStoryArcCount: gradia.storyArcCount,
         gradiaWriterDesignCount: gradia.writerDesignCount,
         gradiaNarrativeArchiveCount: gradia.narrativeArchiveCount,
+        libraArchiveId: text(libraPreparation?.archiveId || ''),
+        libraArchiveGeneration: Math.max(0, Number(libraPreparation?.archiveGeneration || 0) || 0),
+        libraArchiveDigest: text(libraPreparation?.archiveDigest || ''),
+        gradiaNarrativeArchiveId: text(gradiaPreparation?.narrativeArchiveId || ''),
+        gradiaNarrativeArchiveGeneration: Math.max(0, Number(gradiaPreparation?.narrativeArchiveGeneration || 0) || 0),
+        gradiaNarrativeArchiveDigest: text(gradiaPreparation?.narrativeArchiveDigest || ''),
         createdAt
       }
     };
@@ -6825,7 +7350,7 @@
       throw new Error('전환 준비 중 활성 캐릭터 또는 채팅이 바뀌었습니다.');
     }
     if (preview.includeLibra) {
-      const latestLibra = await readLibraSource(latest);
+      const latestLibra = await readLibraSource(latest, { includeRecords: false });
       if (!latestLibra.integrityOk
         || latestLibra.snapshotHash !== libra.snapshotHash
         || latestLibra.recordCount !== libra.recordCount
@@ -6834,7 +7359,7 @@
       }
     }
     if (preview.includeGradia) {
-      const latestGradia = await readGradiaSource(latest);
+      const latestGradia = await readGradiaSource(latest, { includePayload: false });
       if (!latestGradia.integrityOk
         || latestGradia.snapshotHash !== gradia.snapshotHash
         || latestGradia.storyArcCount !== gradia.storyArcCount
@@ -6858,7 +7383,10 @@
           targetChatId,
           transferId,
           expectedRecords: libra.recordCount,
-          expectedWorldAdditional: libra.worldAdditionalCount
+          expectedWorldAdditional: libra.worldAdditionalCount,
+          expectedArchiveId: text(libraPreparation?.archiveId || ''),
+          expectedArchiveGeneration: Math.max(0, Number(libraPreparation?.archiveGeneration || 0) || 0),
+          expectedArchiveDigest: text(libraPreparation?.archiveDigest || '')
         })
         : Promise.resolve({
           schema: LIBRA_HANDOFF_RECEIPT_SCHEMA,
@@ -6876,7 +7404,10 @@
           transferId,
           expectedStoryArc: gradia.storyArcCount,
           expectedWriterDesign: gradia.writerDesignCount,
-          expectedNarrativeArchive: gradia.narrativeArchiveCount
+          expectedNarrativeArchive: gradia.narrativeArchiveCount,
+          expectedNarrativeArchiveId: text(gradiaPreparation?.narrativeArchiveId || ''),
+          expectedNarrativeArchiveGeneration: Math.max(0, Number(gradiaPreparation?.narrativeArchiveGeneration || 0) || 0),
+          expectedNarrativeArchiveDigest: text(gradiaPreparation?.narrativeArchiveDigest || '')
         })
         : Promise.resolve({
           schema: GRADIA_HANDOFF_RECEIPT_SCHEMA,
@@ -6908,7 +7439,10 @@
         transferId,
         expectedStoryArc: gradia.storyArcCount,
         expectedWriterDesign: gradia.writerDesignCount,
-        expectedNarrativeArchive: gradia.narrativeArchiveCount
+        expectedNarrativeArchive: gradia.narrativeArchiveCount,
+        expectedNarrativeArchiveId: text(gradiaPreparation?.narrativeArchiveId || ''),
+        expectedNarrativeArchiveGeneration: Math.max(0, Number(gradiaPreparation?.narrativeArchiveGeneration || 0) || 0),
+        expectedNarrativeArchiveDigest: text(gradiaPreparation?.narrativeArchiveDigest || '')
       })
       : gradiaAdoptionInitial;
     const flashbackVerified = flashbackAdoption?.verified === true
@@ -6925,7 +7459,10 @@
       && text(libraAdoption?.targetChatId || '') === targetChatId
       && text(libraAdoption?.transferId || '') === transferId
       && Number(libraAdoption?.records || 0) === Number(libra.recordCount || 0)
-      && Number(libraAdoption?.worldAdditional || 0) === Number(libra.worldAdditionalCount || 0);
+      && Number(libraAdoption?.worldAdditional || 0) === Number(libra.worldAdditionalCount || 0)
+      && (!text(libraPreparation?.archiveId || '') || text(libraAdoption?.archiveId || '') === text(libraPreparation.archiveId))
+      && (!text(libraPreparation?.archiveDigest || '') || text(libraAdoption?.archiveDigest || '') === text(libraPreparation.archiveDigest))
+      && (!Number(libraPreparation?.archiveGeneration || 0) || Number(libraAdoption?.archiveGeneration || 0) === Number(libraPreparation.archiveGeneration));
     const gradiaRequired = preview.includeGradia === true;
     const gradiaVerified = gradiaAdoption?.verified === true
       && gradiaAdoption?.durable === true
@@ -6933,7 +7470,10 @@
       && text(gradiaAdoption?.transferId || '') === transferId
       && Number(gradiaAdoption?.storyArc || 0) === Number(gradia.storyArcCount || 0)
       && Number(gradiaAdoption?.writerDesign || 0) === Number(gradia.writerDesignCount || 0)
-      && Number(gradiaAdoption?.narrativeArchive || 0) === Number(gradia.narrativeArchiveCount || 0);
+      && Number(gradiaAdoption?.narrativeArchive || 0) === Number(gradia.narrativeArchiveCount || 0)
+      && (!text(gradiaPreparation?.narrativeArchiveId || '') || text(gradiaAdoption?.narrativeArchiveId || '') === text(gradiaPreparation.narrativeArchiveId))
+      && (!text(gradiaPreparation?.narrativeArchiveDigest || '') || text(gradiaAdoption?.narrativeArchiveDigest || '') === text(gradiaPreparation.narrativeArchiveDigest))
+      && (!Number(gradiaPreparation?.narrativeArchiveGeneration || 0) || Number(gradiaAdoption?.narrativeArchiveGeneration || 0) === Number(gradiaPreparation.narrativeArchiveGeneration));
     const liaVerified = !liaRequired || (
       liaAdoption?.schema === LIA_HANDOFF_RECEIPT_SCHEMA
       && liaAdoption?.verified === true
@@ -7174,7 +7714,7 @@
       <div><span>월드 에디셔널</span><strong>${formatNumber(result.worldAdditionalCount || worldAdditional.length)}</strong></div>
     </div>
     <div class="ledger-key"><span>LIBRA IPC</span><code>${escapeHtml(result.scope?.scopeKey || '')}</code><small>v${escapeHtml(result.pluginVersion || '?')}</small></div>
-    ${ordered.length > visible.length ? `<div class="settings-callout">최신 ${formatNumber(visible.length)}개만 화면에 표시합니다. JSON 내보내기에는 ${formatNumber(ordered.length)}개 전체가 포함됩니다.</div>` : ''}
+    ${result.viewerLimited ? `<div class="settings-callout">OOM 방지를 위해 최신 ${formatNumber(result.viewerLoadedRecords ?? visible.length)}개 레코드의 shard만 실제로 읽었습니다. 저장된 ${formatNumber(result.loadedRecords || ordered.length)}개 전체는 유지되며, 명시적 JSON 내보내기에서만 전체 조회를 시도합니다.</div>` : (ordered.length > visible.length ? `<div class="settings-callout">최신 ${formatNumber(visible.length)}개만 화면에 표시합니다.</div>` : '')}
     ${!memories.length ? '<div class="empty"><strong>아직 정본 메모리가 없습니다.</strong><span>LIBRA에서 5턴 분석이 완료되면 여기에 바로 표시됩니다.</span></div>' : ''}
     <div class="record-list">${visible.map(memory => {
       const info = libraMemoryViewerInfo(memory);
@@ -7210,8 +7750,9 @@
       : '';
     return `<div class="metrics">
       <div><span>저장 기억</span><strong>${formatNumber(result.loadedRecords)}</strong></div>
+      <div><span>표시 로드</span><strong>${formatNumber(result.viewerLoadedRecords ?? visible.length)}</strong></div>
       <div><span>응답 / 에피소드</span><strong>${formatNumber(responseRecords)} / ${formatNumber(episodeRecords)}</strong></div>
-      <div><span>Shard</span><strong>${formatNumber(result.shardCount - result.missingShards)} / ${formatNumber(result.shardCount)}</strong></div>
+      <div><span>조회 Shard</span><strong>${formatNumber(result.viewerScannedShards ?? result.shardCount)} / ${formatNumber(result.shardCount)}</strong></div>
       <div><span>추정 토큰</span><strong>${formatNumber(result.stats?.tokens || 0)}</strong></div>
     </div>
     <div class="ledger-key"><span>READ ONLY</span><code>${escapeHtml(result.manifestKey || '')}</code></div>
@@ -7262,15 +7803,16 @@
     const liveRecords = records.length - inheritedRecords;
     const updatedAt = result.ledger?.updatedAt ? new Date(result.ledger.updatedAt).toLocaleString() : '-';
     return `<div class="metrics">
-      <div><span>저장 패킷</span><strong>${formatNumber(records.length)}</strong></div>
-      <div><span>LIVE / 승계</span><strong>${formatNumber(liveRecords)} / ${formatNumber(inheritedRecords)}</strong></div>
-      <div><span>삭제됨</span><strong>${formatNumber(deletedRecords.length)}</strong></div>
+      <div><span>저장 패킷</span><strong>${formatNumber(result.recordCount || records.length)}</strong></div>
+      <div><span>현재 / Archive</span><strong>${formatNumber(result.localRecordCount ?? liveRecords)} / ${formatNumber(result.archiveRecordCount ?? inheritedRecords)}</strong></div>
+      <div><span>표시 로드</span><strong>${formatNumber(result.viewerLoadedRecords ?? records.length)}</strong></div>
+      <div><span>표시 삭제됨</span><strong>${formatNumber(deletedRecords.length)}</strong></div>
       <div><span>활성 / 전체 월드라인</span><strong>${formatNumber(activeNodes)} / ${formatNumber(nodes.length)}</strong></div>
-      <div><span>원장 크기</span><strong>${formatNumber(chars)} chars</strong></div>
+      <div><span>표시 본문</span><strong>${formatNumber(chars)} chars</strong></div>
     </div>
     <div class="ledger-key"><span>READ ONLY</span><code>${escapeHtml(result.scope.storageKey)}</code><small>갱신 ${escapeHtml(updatedAt)}</small></div>
     ${deletedRecords.length ? `<div class="settings-callout">사용자가 삭제한 패킷 ${formatNumber(deletedRecords.length)}개는 tombstone으로 보존되지만 활성 목록과 자동 누락 복구에서 제외됩니다.</div>` : ''}
-    ${ordered.length > visible.length ? `<div class="settings-callout">최신 ${formatNumber(visible.length)}개만 화면에 표시합니다. JSON 내보내기에는 tombstone을 포함한 원장 전체가 유지됩니다.</div>` : ''}
+    ${result.viewerLimited ? `<div class="settings-callout">OOM 방지를 위해 현재 원장과 최신 Archive layer에서 ${formatNumber(result.viewerLoadedRecords ?? visible.length)}개만 해제했습니다. 전체 ${formatNumber(result.recordCount || ordered.length)}개는 Archive에 그대로 보존됩니다.</div>` : (ordered.length > visible.length ? `<div class="settings-callout">최신 ${formatNumber(visible.length)}개만 화면에 표시합니다.</div>` : '')}
     <div class="record-list">${visible.map((record, actionIndex) => {
       const info = packetInfo(record);
       const inherited = record.inheritedSessionHistory === true || isPermanentSessionHistory(record);
@@ -7738,7 +8280,7 @@
   const refreshFlashback = async () => {
     const body = Runtime.root?.querySelector?.('#flashbackBody');
     if (!body) return null;
-    body.innerHTML = '<div class="empty"><strong>기억 조회 중</strong><span>Flashback manifest와 shard를 읽고 있습니다.</span></div>';
+    body.innerHTML = '<div class="empty"><strong>기억 조회 중</strong><span>Flashback manifest를 확인하고 최신 shard만 지연 로드하고 있습니다.</span></div>';
     try {
       const result = await readFlashbackViewer(await getCurrentContext());
       body.innerHTML = renderFlashback(result);
@@ -7752,7 +8294,7 @@
   const refreshHayaku = async () => {
     const body = Runtime.root?.querySelector?.('#hayakuBody');
     if (!body) return null;
-    body.innerHTML = '<div class="empty"><strong>원장 조회 중</strong><span>pluginStorage를 읽고 있습니다.</span></div>';
+    body.innerHTML = '<div class="empty"><strong>원장 조회 중</strong><span>HAYAKU 메타데이터를 확인하고 최신 Archive layer만 지연 해제하고 있습니다.</span></div>';
     try {
       const context = await getCurrentContext();
       const navigation = resolveTurnNavigationTarget(context.chat, Number.MAX_SAFE_INTEGER);
@@ -7769,7 +8311,7 @@
         ? `최대 ${formatNumber(navigation.maxTurn)}턴`
         : '완료된 턴 없음';
       let [result, pending, pendingIncremental] = await Promise.all([
-        readHayakuSource(context),
+        readHayakuViewerSource(context),
         readPendingColdStartCapsule(context),
         readPendingIncrementalRecoveryCapsule(context)
       ]);
@@ -7787,7 +8329,7 @@
         const adoption = await requestImmediateHayakuIncrementalRecoveryAdoption(pendingIncremental.capsule);
         adoptionChanged = adoption.verified === true || adoptionChanged;
       }
-      if (adoptionChanged) result = await readHayakuSource(context);
+      if (adoptionChanged) result = await readHayakuViewerSource(context);
       if (!result.available && pending.available) {
         body.innerHTML = `<div class="empty"><strong>콜드스타트 반영 대기</strong><span>패킷 ${formatNumber(pending.packets.length)}개가 검증 저장됐습니다.</span><span>다음 모델 요청의 시작 단계에서 HAYAKU가 원장에 반영하고 같은 요청부터 리콜합니다.</span></div>`;
       } else {
@@ -8459,9 +9001,9 @@
     resetProviderModelCache() { ProviderModelCache.clear(); return true; },
     testProvider: () => callProfile('primary', 'Return exactly MEMORY_SESSION_BRIDGE_PROVIDER_OK.', 'Connection test.', { maxTokens: 64, temperature: 0 }),
     readFlashbackViewer: async () => readFlashbackViewer(await getCurrentContext()),
-    readHayakuViewer: async () => readHayakuSource(await getCurrentContext()),
-    readLibraViewer: async () => await readLibraSource(await getCurrentContext()),
-    readGradiaSource: async () => await readGradiaSource(await getCurrentContext()),
+    readHayakuViewer: async () => readHayakuViewerSource(await getCurrentContext()),
+    readLibraViewer: async () => await readLibraSource(await getCurrentContext(), { includeRecords: true }),
+    readGradiaSource: async () => await readGradiaSource(await getCurrentContext(), { includePayload: true }),
     lastTransition: () => clone(Runtime.lastTransition, null),
     lastColdStart: () => clone(Runtime.lastColdStart, null),
     lastIncrementalRecovery: () => clone(Runtime.lastIncrementalRecovery, null),

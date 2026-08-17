@@ -1,7 +1,7 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.18
+//@version 1.9.27
 //@allowed-ipc libra
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
@@ -11,7 +11,16 @@
 //@description LIBRA, GRADIA, HAYAKU, Flashback, and LIA Live Persona continuity analysis and next-session handoff bridge
 //@author Hayaku
 
-/* v1.9.18 keeps RE:TRACE compatible with the storage-tier builds: the ordinary Flashback/HAYAKU viewers now page only the newest records without hydrating every historical archive layer, pluginStorage fallbacks can decode the immutable gzip archive wrappers, LIBRA/GRADIA handoff receipts are cross-checked against the prepared archive identity/digest, and summary-only runtime fallbacks remain summary-only.
+/* v1.9.27 removes the user-facing '필수/비필수' labels from the compatibility panel. Participation-aware safety checks remain internal: the panel now describes only connection/compatibility state, so optional plugin absence is not visually misread as a global installation requirement. */
+/* v1.9.26 fixes false HAYAKU '필수 누락' states: compatibility checks now bypass stale IPC cooldowns on retry, distinguish ledger-detected installation from an actually missing plugin, consume HAYAKU's shared compatibility beacon when available, and optionally verify enabled plugin metadata/source markers when the owner channel is temporarily unreachable. Required handoff still remains fail-closed until the live HAYAKU owner IPC answers. */
+/* v1.9.25 added a shared-runtime HAYAKU compatibility fallback after plugin-channel capability IPC failure. That fallback helps legacy/shared-realm hosts but API-v3 iframe isolation means it cannot by itself prove another plugin's runtime on normal isolated hosts; v1.9.26 supersedes that limitation with retry, storage-beacon, and installed-metadata diagnostics.
+ * v1.9.24 hardens WebRisu provider credential persistence without changing handoff behavior: the RE:TRACE provider profile remains durably stored in pluginStorage and is additionally mirrored to localPluginStorage/safeLocalStorage when available, every save is read back and verified, startup reconciles the newest verified copy into a missing backend, and explicit key clearing writes a newer empty state so stale local backups cannot resurrect a deleted credential.
+ * v1.9.23 changes compatibility gating from installed-peer strictness to active-handoff participation: an installed but unused/inactive peer with a missing or outdated compatibility contract is shown as a non-blocking warning, while only peers whose data/state is actually required for this transition can block next-session creation. Missing optional peers remain neutral, warning acknowledgement never bypasses a required-owner block, and the home compatibility panel now distinguishes handoff-safe optional warnings from blocking incompatibilities.
+ * v1.9.22 establishes RE:TRACE as the six-plugin compatibility hub. Flashback, HAYAKU, LIBRA, GRADIA, and LIA are discovered through retrace.peer_compatibility.v1 capability contracts rather than exact plugin versions; next-session handoff is blocked unless every installed/required peer advertises immutable-source, durable-readback, idempotent inheritance and returns a matching source-preservation receipt; the session home shows a live compatibility matrix and explicit warning acknowledgement; and future peer version bumps remain compatible as long as the protocol major, stable plugin ID, handoff contract, receipt schema, and required capabilities remain compatible.
+ * v1.9.21 makes Flashback next-session handoff fail-closed and source-preserving: RE:TRACE now requires the Flashback v0.11.3+ immutable-source contract before any owner mutation, snapshots the source manifest/shards/worldline before target creation and re-verifies them after adoption, accepts only v4 preservation receipts, rejects legacy compacted source scopes until restored, and writes a v2 bridge marker that explicitly forbids source mutation/compaction.
+ * v1.9.20 fixes long-session owner handoff completion after the LIBRA compatibility patch: Flashback IPC summary/adoption calls now have storage-safe timeouts instead of the old 1.8s/3s ceiling, a timed-out mutation is reconciled against the target Flashback manifest before being declared failed, summary reads can bypass a known-stalled IPC path and use the already-supported pluginStorage archive summary, and incomplete transition results now record the exact failing owner diagnostics.
+ * v1.9.19 restores current LIBRA next-session handoff compatibility: canonical-only LIBRA receipts no longer require the retired World Additional counters, transition consistency uses a canonical-memory fingerprint that is stable across archive preparation metadata writes, LIBRA owner IPC handoff operations receive long-storage-safe timeouts, and newly-created target chats get a bounded activation-settle window before owner adoption.
+ * v1.9.18 keeps RE:TRACE compatible with the storage-tier builds: the ordinary Flashback/HAYAKU viewers now page only the newest records without hydrating every historical archive layer, pluginStorage fallbacks can decode the immutable gzip archive wrappers, LIBRA/GRADIA handoff receipts are cross-checked against the prepared archive identity/digest, and summary-only runtime fallbacks remain summary-only.
  * v1.9.17 coordinates immutable shared-archive handoff for Flashback, HAYAKU,
  * LIBRA, and GRADIA Narrative Archive, and uses summary-only transition probes
  * so next-session validation checks archive ID/digest metadata without hydrating historical memory bodies, packet JSON, or vectors. */
@@ -20,9 +29,18 @@
   'use strict';
 
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.18';
-  const HANDOFF_SCHEMA = 'memory-session-bridge-v1';
+  const PLUGIN_VERSION = '1.9.27';
+  const HANDOFF_SCHEMA = 'memory-session-bridge-v2';
+  const HANDOFF_ACCEPTED_SCHEMAS = new Set(['memory-session-bridge-v1', HANDOFF_SCHEMA]);
   const HANDOFF_JOURNAL_SCHEMA = 'memory-session-bridge-handoff-journal-v1';
+  const RETRACE_PEER_COMPATIBILITY_SCHEMA = 'retrace.peer_compatibility.v1';
+  const RETRACE_PEER_PROTOCOL_MAJOR = 1;
+  const FLASHBACK_HANDOFF_RECEIPT_SCHEMA = 'flashback_memory.session_handoff_adoption.v4';
+  const HAYAKU_HANDOFF_RECEIPT_SCHEMA = 'hayaku.session_handoff.receipt.v1';
+  const HAYAKU_REQUIRED_HANDOFF_CONTRACT = 'hayaku.handoff_immutable_source.v1';
+  const LIBRA_REQUIRED_HANDOFF_CONTRACT = 'libra.handoff_immutable_source.v1';
+  const GRADIA_REQUIRED_HANDOFF_CONTRACT = 'gradia.handoff_immutable_source.v1';
+  const LIA_REQUIRED_HANDOFF_CONTRACT = 'lia.live_persona_handoff_immutable_source.v1';
   const LIBRA_PLUGIN_ID = 'libra';
   const LIBRA_IPC_SCHEMA = 'libra-retrace-ipc-v1';
   const LIBRA_IPC_REQUEST_CHANNEL = 'libra_memory_bridge_request_v1';
@@ -31,6 +49,11 @@
   const LIBRA_CAPABILITIES_SCHEMA = 'libra.retrace.capabilities.v1';
   const LIBRA_HANDOFF_RECEIPT_SCHEMA = 'libra.session_handoff.receipt.v1';
   const LIBRA_CHAT_HANDOFF_MARKER_SCHEMA = 'retrace.libra_handoff_marker.v1';
+  const LIBRA_IPC_TIMEOUT_MAX_MS = 120000;
+  const LIBRA_INSPECT_TIMEOUT_MS = 15000;
+  const LIBRA_PREPARE_TIMEOUT_MS = 90000;
+  const LIBRA_ADOPT_TIMEOUT_MS = 90000;
+  const LIBRA_VERIFY_TIMEOUT_MS = 60000;
   const GRADIA_PLUGIN_ID = 'serial_gradation_agents_for_rp';
   const GRADIA_IPC_SCHEMA = 'gradia-retrace-ipc-v1';
   const GRADIA_IPC_REQUEST_CHANNEL = 'gradia_retrace_bridge_request_v1';
@@ -50,10 +73,18 @@
   const FLASHBACK_IPC_SCHEMA = 'flashback-memory-bridge-ipc-v1';
   const FLASHBACK_IPC_REQUEST_CHANNEL = 'flashback_memory_bridge_request_v1';
   const FLASHBACK_IPC_RESPONSE_CHANNEL = 'flashback_memory_bridge_response_v1';
+  const FLASHBACK_IPC_TIMEOUT_MAX_MS = 120000;
+  const FLASHBACK_INSPECT_SUMMARY_TIMEOUT_MS = 8000;
+  const FLASHBACK_INSPECT_RECORDS_TIMEOUT_MS = 30000;
+  const FLASHBACK_ADOPT_TIMEOUT_MS = 90000;
+  const FLASHBACK_LATE_READBACK_TIMEOUT_MS = 6000;
+  const FLASHBACK_REQUIRED_HANDOFF_CONTRACT = 'flashback_memory.handoff_immutable_source.v2';
   const HAYAKU_PLUGIN_ID = 'hayaku_locator_continuity';
   const HAYAKU_IPC_SCHEMA = 'hayaku-memory-bridge-ipc-v1';
   const HAYAKU_IPC_REQUEST_CHANNEL = 'hayaku_memory_bridge_request_v1';
   const HAYAKU_IPC_RESPONSE_CHANNEL = 'hayaku_memory_bridge_response_v1';
+  const HAYAKU_RETRACE_COMPATIBILITY_BEACON_SCHEMA = 'hayaku.retrace_compatibility_beacon.v1';
+  const HAYAKU_RETRACE_COMPATIBILITY_BEACON_KEY = 'hayaku.v2.retrace_compatibility.v1';
   const HAYAKU_IPC_MUTATION_ACTIONS = new Set([
     'adopt_cold_start',
     'adopt_incremental_recovery',
@@ -77,6 +108,8 @@
   const HAYAKU_ARCHIVE_META_KEY_PREFIX = 'hayaku.v2.shared_archive_meta.';
   const HAYAKU_ARCHIVE_MAX_DEPTH = 256;
   const SETTINGS_KEY = 'memory_session_bridge:settings:v1';
+  const LOCAL_SETTINGS_BACKUP_KEY = 'memory_session_bridge:settings_local_backup:v1';
+  const SETTINGS_PERSISTENCE_SCHEMA = 'retrace.provider_settings_backup.v1';
   const COLD_START_PREFIX = 'memory_session_bridge:hayaku_cold_start:';
   const COLD_START_SCHEMA = 'memory-session-bridge-hayaku-cold-start-v1';
   const COLD_START_RUN_PREFIX = 'memory_session_bridge:hayaku_cold_start_run:';
@@ -122,6 +155,11 @@
     lastColdStart: null,
     lastIncrementalRecovery: null,
     lastHayakuBackup: null,
+    compatibilitySuite: null,
+    compatibilityCheckedAt: 0,
+    compatibilityAcknowledgedAt: 0,
+    compatibilityAutoRetryTimer: null,
+    compatibilityAutoRetryAttempt: 0,
     hayakuActionRecords: [],
     hayakuMaxTurn: 0,
     settings: null,
@@ -129,6 +167,9 @@
     providerModelLoading: new Set(),
     flashbackIpcRegistered: false,
     flashbackIpcPending: new Map(),
+    flashbackIpcLastSeenAt: 0,
+    flashbackIpcLastError: '',
+    flashbackIpcLastTimeoutAt: 0,
     hayakuIpcRegistered: false,
     hayakuIpcPending: new Map(),
     hayakuIpcUnavailableUntil: 0,
@@ -175,6 +216,147 @@
       if (a !== b) return a > b;
     }
     return true;
+  };
+
+  const RETRACE_REQUIRED_PEER_FEATURES = Object.freeze([
+    'inspect',
+    'nextSessionHandoff',
+    'sourceImmutableHandoff',
+    'durableTargetReadback',
+    'idempotentHandoff',
+    'inheritedStateUsable'
+  ]);
+
+  const RETRACE_PEER_REQUIREMENTS = Object.freeze({
+    flashback: Object.freeze({
+      key: 'flashback',
+      label: 'FLASHBACK',
+      pluginId: FLASHBACK_PLUGIN_ID,
+      handoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+      receiptSchema: FLASHBACK_HANDOFF_RECEIPT_SCHEMA,
+      peerRole: 'episodic_memory'
+    }),
+    hayaku: Object.freeze({
+      key: 'hayaku',
+      label: 'HAYAKU',
+      pluginId: HAYAKU_PLUGIN_ID,
+      handoffContract: HAYAKU_REQUIRED_HANDOFF_CONTRACT,
+      receiptSchema: HAYAKU_HANDOFF_RECEIPT_SCHEMA,
+      peerRole: 'packet_continuity_memory'
+    }),
+    libra: Object.freeze({
+      key: 'libra',
+      label: 'LIBRA',
+      pluginId: LIBRA_PLUGIN_ID,
+      handoffContract: LIBRA_REQUIRED_HANDOFF_CONTRACT,
+      receiptSchema: LIBRA_HANDOFF_RECEIPT_SCHEMA,
+      peerRole: 'canonical_long_term_memory'
+    }),
+    gradia: Object.freeze({
+      key: 'gradia',
+      label: 'GRADIA',
+      pluginId: GRADIA_PLUGIN_ID,
+      handoffContract: GRADIA_REQUIRED_HANDOFF_CONTRACT,
+      receiptSchema: GRADIA_HANDOFF_RECEIPT_SCHEMA,
+      peerRole: 'narrative_planning_state'
+    }),
+    lia: Object.freeze({
+      key: 'lia',
+      label: 'LIA',
+      pluginId: LIA_PLUGIN_ID,
+      handoffContract: LIA_REQUIRED_HANDOFF_CONTRACT,
+      receiptSchema: LIA_HANDOFF_RECEIPT_SCHEMA,
+      peerRole: 'live_persona_state'
+    })
+  });
+
+  const peerCompatibilityPayload = value => {
+    const source = value && typeof value === 'object' ? value : {};
+    const candidates = [
+      source.compatibility,
+      source.retraceCompatibility,
+      source.capabilities?.retraceCompatibility,
+      source.features?.retraceCompatibility,
+      source.ipcCapabilities?.retraceCompatibility,
+      source.runtime?.capabilities?.retraceCompatibility,
+      source
+    ];
+    return candidates.find(item => item && typeof item === 'object' && text(item.schema || '') === RETRACE_PEER_COMPATIBILITY_SCHEMA) || null;
+  };
+
+  const evaluatePeerCompatibility = (requirement, rawCompatibility, installed = true, options = {}) => {
+    const payload = peerCompatibilityPayload(rawCompatibility);
+    const required = options.required === true;
+    const errors = [];
+    if (!installed) {
+      return {
+        key: requirement.key,
+        label: requirement.label,
+        pluginId: requirement.pluginId,
+        installed: false,
+        required,
+        compatible: !required,
+        blocking: required,
+        status: required ? 'missing_required' : 'not_installed',
+        pluginVersion: '',
+        protocolMajor: 0,
+        handoffContract: '',
+        reason: required ? `${requirement.label}가 현재 세션 승계에 필요하지만 연결되지 않았습니다.` : `${requirement.label}가 설치/연결되지 않았습니다.`,
+        errors: required ? ['peer_not_installed'] : [],
+        compatibility: null
+      };
+    }
+    if (!payload) errors.push('compatibility_contract_missing');
+    if (payload && Number(payload.protocolMajor || 0) !== RETRACE_PEER_PROTOCOL_MAJOR) errors.push('protocol_major_mismatch');
+    if (payload && text(payload.pluginId || '') !== requirement.pluginId) errors.push('plugin_id_mismatch');
+    if (payload && requirement.peerRole && text(payload.peerRole || '') !== requirement.peerRole) errors.push('peer_role_mismatch');
+    for (const feature of RETRACE_REQUIRED_PEER_FEATURES) {
+      if (payload && payload.features?.[feature] !== true) errors.push(`feature_missing:${feature}`);
+    }
+    if (payload && text(payload.handoff?.contract || '') !== requirement.handoffContract) errors.push('handoff_contract_mismatch');
+    if (payload && !Array.isArray(payload.handoff?.receiptSchemas)) errors.push('receipt_schema_list_missing');
+    if (payload && Array.isArray(payload.handoff?.receiptSchemas)
+      && !payload.handoff.receiptSchemas.map(value => text(value)).includes(requirement.receiptSchema)) {
+      errors.push('receipt_schema_mismatch');
+    }
+    if (payload && payload.handoff?.sourceMutationAllowed !== false) errors.push('source_mutation_not_forbidden');
+    if (payload && payload.handoff?.sourceCompactionAllowed !== false) errors.push('source_compaction_not_forbidden');
+    if (payload && payload.handoff?.physicalCopyRequired !== false) errors.push('physical_copy_requirement_unsupported');
+    const compatible = errors.length === 0;
+    const blocking = required && !compatible;
+    return {
+      key: requirement.key,
+      label: requirement.label,
+      pluginId: requirement.pluginId,
+      installed: true,
+      required,
+      compatible,
+      blocking,
+      status: compatible ? 'compatible' : (blocking ? 'incompatible_required' : 'incompatible_optional'),
+      pluginVersion: text(payload?.pluginVersion || rawCompatibility?.pluginVersion || rawCompatibility?.version || ''),
+      protocolMajor: Number(payload?.protocolMajor || 0) || 0,
+      handoffContract: text(payload?.handoff?.contract || ''),
+      reason: compatible
+        ? `${requirement.label} 호환 계약이 확인되었습니다.`
+        : blocking
+          ? `${requirement.label}가 이번 승계에 필요하지만 호환 계약이 맞지 않습니다: ${errors.join(', ')}`
+          : `${requirement.label}가 설치되어 있지만 이번 승계에는 필요하지 않습니다. 호환 계약 불일치는 경고만 표시합니다: ${errors.join(', ')}`,
+      errors,
+      compatibility: payload ? clone(payload, {}) : null
+    };
+  };
+
+  const sourcePreservationReceiptMatches = (receipt, requirement, options = {}) => {
+    if (!receipt || typeof receipt !== 'object') return false;
+    const physicalField = text(options.physicalField || 'physicalCopies');
+    const physicalValue = Number(receipt?.[physicalField] || 0) || 0;
+    return text(receipt?.handoffContract || '') === requirement.handoffContract
+      && receipt?.sourcePreserved === true
+      && receipt?.sourceMutationAllowed === false
+      && receipt?.sourceCompactionAllowed === false
+      && text(receipt?.sourceFingerprintBefore || '').length > 0
+      && text(receipt?.sourceFingerprintBefore || '') === text(receipt?.sourceFingerprintAfter || '')
+      && physicalValue === 0;
   };
   const normalizedHayakuPacketMaxChars = value => {
     const number = Math.floor(Number(value));
@@ -426,6 +608,73 @@
     } catch (error) {
       warn(`storage write failed: ${key}`, error);
       return false;
+    }
+  };
+
+  let localSettingsStorePromise = null;
+  const getLocalSettingsStore = async () => {
+    if (!localSettingsStorePromise) {
+      localSettingsStorePromise = (async () => {
+        for (const candidate of baseApiCandidates()) {
+          try {
+            if (typeof candidate?.getLocalPluginStorage === 'function') {
+              const store = await candidate.getLocalPluginStorage();
+              if (store?.getItem && store?.setItem) return { store, structured: true };
+            }
+          } catch (_) {}
+          try {
+            if (candidate?.safeLocalStorage?.getItem && candidate?.safeLocalStorage?.setItem) return { store: candidate.safeLocalStorage, structured: false };
+          } catch (_) {}
+        }
+        return { store: null, structured: false };
+      })();
+    }
+    return await localSettingsStorePromise;
+  };
+
+  const settingsPersistenceState = raw => {
+    if (raw == null || raw === '') return { present: false, savedAt: 0, settings: null };
+    let parsed = raw;
+    if (typeof parsed === 'string') {
+      try { parsed = JSON.parse(parsed); } catch (_) { return { present: false, savedAt: 0, settings: null }; }
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { present: false, savedAt: 0, settings: null };
+    if (parsed.schema === SETTINGS_PERSISTENCE_SCHEMA && parsed.settings && typeof parsed.settings === 'object') {
+      return { present: true, savedAt: Math.max(0, Number(parsed.savedAt || 0) || 0), settings: parsed.settings };
+    }
+    const savedAt = Math.max(0, Number(parsed?._credentialPersistence?.savedAt || 0) || 0);
+    return { present: Boolean(parsed.primary || parsed.aux), savedAt, settings: parsed };
+  };
+
+  const settingsPersistenceEnvelope = (settings, savedAt = Date.now()) => ({
+    schema: SETTINGS_PERSISTENCE_SCHEMA,
+    version: 1,
+    savedAt: Math.max(0, Number(savedAt || Date.now()) || Date.now()),
+    settings,
+  });
+
+  const readLocalSettingsBackup = async () => {
+    try {
+      const holder = await getLocalSettingsStore();
+      if (!holder.store?.getItem) return { present: false, savedAt: 0, settings: null, available: false };
+      return { ...settingsPersistenceState(await holder.store.getItem(LOCAL_SETTINGS_BACKUP_KEY)), available: true };
+    } catch (_) {
+      return { present: false, savedAt: 0, settings: null, available: false };
+    }
+  };
+
+  const writeLocalSettingsBackup = async (settings, savedAt = Date.now()) => {
+    try {
+      const holder = await getLocalSettingsStore();
+      if (!holder.store?.setItem || !holder.store?.getItem) return { attempted: false, verified: false };
+      const envelope = settingsPersistenceEnvelope(settings, savedAt);
+      await holder.store.setItem(LOCAL_SETTINGS_BACKUP_KEY, holder.structured ? envelope : JSON.stringify(envelope));
+      const readback = settingsPersistenceState(await holder.store.getItem(LOCAL_SETTINGS_BACKUP_KEY));
+      const expected = normalizeSettings(settings);
+      const actual = normalizeSettings(readback.settings || {});
+      return { attempted: true, verified: readback.present && JSON.stringify(actual) === JSON.stringify(expected) };
+    } catch (_) {
+      return { attempted: true, verified: false };
     }
   };
 
@@ -765,12 +1014,37 @@
   };
   const loadSettings = async force => {
     if (!force && Runtime.settings) return Runtime.settings;
-    Runtime.settings = normalizeSettings(parseJson(await storageGet(SETTINGS_KEY), {}));
+    const pluginRaw = await storageGet(SETTINGS_KEY);
+    const pluginState = settingsPersistenceState(pluginRaw);
+    const localState = await readLocalSettingsBackup();
+    let chosen = pluginState.present ? pluginState : (localState.present ? localState : null);
+    if (pluginState.present && localState.present) {
+      if (pluginState.savedAt && localState.savedAt) chosen = pluginState.savedAt >= localState.savedAt ? pluginState : localState;
+      else if (!pluginState.savedAt && localState.savedAt) chosen = pluginState;
+      else chosen = pluginState;
+    }
+    const settings = normalizeSettings(chosen?.settings || {});
+    Runtime.settings = settings;
+    const savedAt = Math.max(pluginState.savedAt, localState.savedAt, Date.now());
+    const pluginNormalized = pluginState.present ? normalizeSettings(pluginState.settings || {}) : null;
+    if (!pluginState.present || JSON.stringify(pluginNormalized) !== JSON.stringify(settings)) {
+      const payload = { ...settings, _credentialPersistence: { schema: SETTINGS_PERSISTENCE_SCHEMA, savedAt } };
+      await storageSet(SETTINGS_KEY, JSON.stringify(payload));
+    }
+    const localNormalized = localState.present ? normalizeSettings(localState.settings || {}) : null;
+    if (!localState.present || JSON.stringify(localNormalized) !== JSON.stringify(settings)) await writeLocalSettingsBackup(settings, savedAt);
     return Runtime.settings;
   };
   const saveSettings = async value => {
     const settings = normalizeSettings(value);
-    if (!await storageSet(SETTINGS_KEY, JSON.stringify(settings))) throw new Error('프로바이더 설정을 저장하지 못했습니다.');
+    const savedAt = Date.now();
+    const payload = { ...settings, _credentialPersistence: { schema: SETTINGS_PERSISTENCE_SCHEMA, savedAt } };
+    if (!await storageSet(SETTINGS_KEY, JSON.stringify(payload))) throw new Error('프로바이더 설정을 저장하지 못했습니다.');
+    const pluginReadback = settingsPersistenceState(await storageGet(SETTINGS_KEY));
+    if (!pluginReadback.present || JSON.stringify(normalizeSettings(pluginReadback.settings || {})) !== JSON.stringify(settings)) {
+      throw new Error('프로바이더 설정 pluginStorage readback 검증에 실패했습니다.');
+    }
+    await writeLocalSettingsBackup(settings, savedAt);
     Runtime.settings = settings;
     return settings;
   };
@@ -1851,9 +2125,17 @@
         if (!pending) return;
         if (text(response.action || '').trim() !== pending.action) return;
         Runtime.flashbackIpcPending.delete(requestId);
+        Runtime.flashbackIpcLastSeenAt = Date.now();
+        Runtime.flashbackIpcLastError = response.ok === true ? '' : text(response.error || 'Flashback IPC request failed.');
         clearTimeout(pending.timer);
         if (response.ok === true) pending.resolve(response.result);
-        else pending.reject(new Error(text(response.error || 'Flashback IPC request failed.')));
+        else {
+          const error = new Error(Runtime.flashbackIpcLastError || 'Flashback IPC request failed.');
+          error.code = 'FLASHBACK_IPC_REJECTED';
+          error.remoteReachable = true;
+          error.action = pending.action;
+          pending.reject(error);
+        }
       }
     );
     Runtime.flashbackIpcRegistered = true;
@@ -1872,12 +2154,15 @@
       throw error;
     }
     const requestId = uuid();
-    const timeoutMs = Math.max(250, Math.min(15000, Number(options.timeoutMs || 2500) || 2500));
+    const timeoutMs = Math.max(400, Math.min(FLASHBACK_IPC_TIMEOUT_MAX_MS, Number(options.timeoutMs || 4000) || 4000));
     return await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         Runtime.flashbackIpcPending.delete(requestId);
         const error = new Error(`Flashback IPC timed out after ${timeoutMs}ms.`);
         error.code = 'FLASHBACK_IPC_TIMEOUT';
+        error.action = text(action || '').trim();
+        Runtime.flashbackIpcLastTimeoutAt = Date.now();
+        Runtime.flashbackIpcLastError = error.message;
         reject(error);
       }, timeoutMs);
       Runtime.flashbackIpcPending.set(requestId, { resolve, reject, timer, action, at: Date.now() });
@@ -1896,6 +2181,7 @@
         if (!pending) return;
         Runtime.flashbackIpcPending.delete(requestId);
         clearTimeout(pending.timer);
+        Runtime.flashbackIpcLastError = text(error?.message || error);
         reject(error);
       });
     });
@@ -1938,7 +2224,7 @@
   };
 
   const requestHayakuIpc = async (action, payload = {}, options = {}) => {
-    if (Date.now() < Number(Runtime.hayakuIpcUnavailableUntil || 0)) {
+    if (options.ignoreCooldown !== true && Date.now() < Number(Runtime.hayakuIpcUnavailableUntil || 0)) {
       const error = new Error('HAYAKU IPC is temporarily unavailable after a recent timeout.');
       error.code = 'HAYAKU_IPC_UNAVAILABLE';
       throw error;
@@ -1958,7 +2244,7 @@
     return await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         Runtime.hayakuIpcPending.delete(requestId);
-        Runtime.hayakuIpcUnavailableUntil = Date.now() + 10000;
+        if (options.suppressCooldown !== true) Runtime.hayakuIpcUnavailableUntil = Date.now() + 10000;
         const error = new Error(`HAYAKU IPC timed out after ${timeoutMs}ms.`);
         error.code = 'HAYAKU_IPC_TIMEOUT';
         reject(error);
@@ -2030,7 +2316,7 @@
       throw error;
     }
     const requestId = uuid();
-    const timeoutMs = Math.max(400, Math.min(30000, Number(options.timeoutMs || 4000) || 4000));
+    const timeoutMs = Math.max(400, Math.min(LIBRA_IPC_TIMEOUT_MAX_MS, Number(options.timeoutMs || 4000) || 4000));
     return await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         Runtime.libraIpcPending.delete(requestId);
@@ -2308,6 +2594,7 @@
       && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptMatches(receipt, options)
+      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.gradia, { physicalField: 'physicalNarrativeArchiveCopies' })
       && gradiaOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
   };
 
@@ -2328,6 +2615,7 @@
       && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptMatches(receipt, options)
+      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.gradia, { physicalField: 'physicalNarrativeArchiveCopies' })
       && gradiaOwnerReceiptMatches(receipt, transport, 'adopt_session_handoff');
   };
 
@@ -2348,6 +2636,7 @@
       && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptMatches(receipt, options)
+      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.gradia, { physicalField: 'physicalNarrativeArchiveCopies' })
       && gradiaOwnerReceiptMatches(receipt, transport, 'verify_session_handoff');
   };
 
@@ -2541,7 +2830,8 @@
       && text(receipt?.forkedFromScopeKey || '') === sourceScopeKey
       && text(receipt?.forkedFromLivePersonaId || '') === sourceLivePersonaId
       && text(receipt?.handoffSourceChatId || '') === sourceChatId
-      && text(receipt?.handoffTransferId || '') === transferId;
+      && text(receipt?.handoffTransferId || '') === transferId
+      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.lia, { physicalField: 'physicalCopies' });
   };
 
   const adoptLiaLivePersonaHandoff = async options => {
@@ -2643,14 +2933,16 @@
         return {
           api: candidate,
           inspect: (...args) => candidate.memory.inspect(...args),
-          adopt
+          adopt,
+          runtime: typeof candidate.runtime === 'function' ? (...args) => candidate.runtime(...args) : null
         };
       }
       if (typeof candidate?.inspectMemoryLedger === 'function') {
         return {
           api: candidate,
           inspect: (...args) => candidate.inspectMemoryLedger(...args),
-          adopt
+          adopt,
+          runtime: typeof candidate.runtime === 'function' ? (...args) => candidate.runtime(...args) : null
         };
       }
       // v0.9.14 compatibility while users update Flashback and the bridge
@@ -2659,11 +2951,203 @@
         return {
           api: candidate,
           inspect: (...args) => candidate._test.debugRecords(...args),
-          adopt
+          adopt,
+          runtime: typeof candidate.runtime === 'function' ? (...args) => candidate.runtime(...args) : null
         };
       }
     }
     return null;
+  };
+
+  const inspectFlashbackNonDestructiveHandoffCapability = async () => {
+    let raw = null;
+    let source = 'none';
+    let errorText = '';
+    const runtime = activeFlashbackRuntime();
+    if (typeof runtime?.runtime === 'function') {
+      try {
+        const snapshot = await Promise.resolve(runtime.runtime());
+        raw = snapshot?.capabilities?.retraceCompatibility
+          || snapshot?.capabilities
+          || snapshot;
+        source = 'same_realm_runtime';
+      } catch (error) {
+        errorText = text(error?.message || error);
+      }
+    }
+    if (!peerCompatibilityPayload(raw)) {
+      try {
+        raw = await requestFlashbackIpc('capabilities', {}, { timeoutMs: FLASHBACK_INSPECT_SUMMARY_TIMEOUT_MS });
+        source = 'flashback_plugin_ipc';
+      } catch (error) {
+        errorText = text(error?.message || error);
+      }
+    }
+    if (!peerCompatibilityPayload(raw)) {
+      try {
+        raw = await requestFlashbackIpc('inspect', { includeRecords: false }, { timeoutMs: FLASHBACK_INSPECT_SUMMARY_TIMEOUT_MS });
+        source = 'flashback_plugin_ipc_inspect';
+      } catch (error) {
+        errorText = errorText || text(error?.message || error);
+      }
+    }
+    const evaluated = evaluatePeerCompatibility(RETRACE_PEER_REQUIREMENTS.flashback, raw, Boolean(peerCompatibilityPayload(raw)), { required: true });
+    return {
+      supported: evaluated.compatible,
+      pluginVersion: evaluated.pluginVersion,
+      capabilities: clone(raw?.capabilities || raw || {}, {}),
+      compatibility: clone(evaluated.compatibility, null),
+      source,
+      handoffContract: evaluated.handoffContract,
+      sourcePreserving: evaluated.compatible,
+      sourceCompactionAllowed: evaluated.compatible ? false : null,
+      reason: evaluated.compatible ? 'flashback_universal_compatibility_contract' : evaluated.reason,
+      errors: evaluated.errors,
+      error: errorText
+    };
+  };
+
+  const flashbackSourceStorageIntegritySnapshotForRetrace = async scopeKey => {
+    const key = text(scopeKey || '').trim();
+    if (!key) throw new Error('flashback_source_integrity_scope_missing');
+    const prefix = `${FLASHBACK_SCOPE_PREFIX}${flashbackKeyHash(key)}`;
+    const manifestKey = `${prefix}:manifest:v2`;
+    const rawManifest = await storageGet(manifestKey);
+    const manifest = parseJson(rawManifest, null);
+    if (!manifest || text(manifest.scopeKey || '') !== key) {
+      throw new Error('flashback_source_manifest_missing');
+    }
+    const shardCount = Math.max(0, Number(manifest.shardCount || 0) || 0);
+    const commitId = text(manifest.commitId || '').trim();
+    const shards = [];
+    let missingShards = 0;
+    for (let index = 0; index < shardCount; index += 1) {
+      const suffix = String(index).padStart(4, '0');
+      const commitKey = commitId
+        ? `${prefix}:records:commit:${commitId}:shard:${suffix}`
+        : `${prefix}:records:shard:${suffix}`;
+      let storageKey = commitKey;
+      let raw = await storageGet(storageKey);
+      if ((raw == null || raw === '') && commitId) {
+        const legacyKey = `${prefix}:records:shard:${suffix}`;
+        const legacyRaw = await storageGet(legacyKey);
+        if (legacyRaw != null && legacyRaw !== '') {
+          storageKey = legacyKey;
+          raw = legacyRaw;
+        }
+      }
+      const present = raw != null && raw !== '';
+      if (!present) missingShards += 1;
+      const serialized = typeof raw === 'string' ? raw : JSON.stringify(raw ?? null);
+      shards.push({ index, storageKey, present, hash: present ? flashbackKeyHash(serialized) : '' });
+    }
+    const worldlineKey = `${prefix}:turn_worldline:v1`;
+    const rawWorldline = await storageGet(worldlineKey);
+    const archiveRef = normalizeFlashbackArchiveRefForRetrace(manifest.archiveRef);
+    const legacyCompacted = Boolean(
+      archiveRef
+      && shardCount === 0
+      && Math.max(0, Number(archiveRef.recordCount || 0) || 0) > 0
+      && text(manifest.archiveCompactedAt || '').trim()
+    );
+    const core = {
+      scopeKey: key,
+      manifestHash: flashbackKeyHash(typeof rawManifest === 'string' ? rawManifest : JSON.stringify(rawManifest ?? null)),
+      commitId,
+      count: Math.max(0, Number(manifest.count || 0) || 0),
+      shardCount,
+      archiveRef,
+      worldlineHash: rawWorldline == null || rawWorldline === ''
+        ? ''
+        : flashbackKeyHash(typeof rawWorldline === 'string' ? rawWorldline : JSON.stringify(rawWorldline)),
+      shards,
+      missingShards,
+      legacyCompacted
+    };
+    return { ...core, fingerprint: flashbackKeyHash(JSON.stringify(core)) };
+  };
+
+  const compareFlashbackSourceStorageIntegrityForRetrace = (before = {}, after = {}) => {
+    const changed = [];
+    for (const key of ['manifestHash', 'commitId', 'count', 'shardCount', 'worldlineHash', 'missingShards', 'legacyCompacted']) {
+      if (JSON.stringify(before?.[key]) !== JSON.stringify(after?.[key])) changed.push(key);
+    }
+    if (JSON.stringify(before?.archiveRef || null) !== JSON.stringify(after?.archiveRef || null)) changed.push('archiveRef');
+    if (JSON.stringify(before?.shards || []) !== JSON.stringify(after?.shards || [])) changed.push('shards');
+    return {
+      identical: changed.length === 0 && text(before?.fingerprint || '') === text(after?.fingerprint || ''),
+      changed
+    };
+  };
+
+  const verifyFlashbackSessionHandoffFromStorage = async (options = {}) => {
+    const targetChatId = text(options.targetChatId || '').trim();
+    const transferId = text(options.transferId || '').trim();
+    const sourceScopeKey = text(options.sourceScopeKey || '').trim();
+    const expectedRecords = Math.max(0, Number(options.expectedRecords || 0) || 0);
+    const base = {
+      schema: 'flashback_memory.session_handoff_adoption.v4',
+      ok: false, available: false, attempted: false, adopted: false, verified: false, durable: false,
+      handoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+      sourceMutationAllowed: false, sourceCompactionAllowed: false, sourcePreserved: false,
+      targetChatId, transferId, sourceScopeKey, records: 0, expectedRecords, transport: 'plugin_storage_readback'
+    };
+    try {
+      const context = await getCurrentContext();
+      if (contextIdentity(context).chatId !== targetChatId) return { ...base, reason: 'target_chat_not_active' };
+      const inspected = await readFlashbackSource(context, { includeRecords: false, skipRuntime: true, skipIpc: true });
+      const manifest = inspected?.manifest && typeof inspected.manifest === 'object' ? inspected.manifest : {};
+      const targetScope = inspected?.sourceScope && typeof inspected.sourceScope === 'object' ? inspected.sourceScope : {};
+      const targetMatches = !targetScope.chatId || text(targetScope.chatId || '').trim() === targetChatId;
+      const transferMatches = text(manifest.copyTransferId || '').trim() === transferId;
+      const sourceMatches = !sourceScopeKey || text(manifest.copiedFromScopeKey || '').trim() === sourceScopeKey;
+      const expectedMatches = Number(manifest.copyExpectedRecordCount || 0) === expectedRecords;
+      const records = Math.max(0, Number(inspected?.records || manifest.count || 0) || 0);
+      const recordsMatch = records === expectedRecords;
+      const adoptionMode = text(manifest.copyAdoptionMode || '').trim();
+      const modeMatches = adoptionMode === 'shared_archive';
+      const contractMatches = text(manifest.handoffContract || '') === FLASHBACK_REQUIRED_HANDOFF_CONTRACT
+        && manifest.sourcePreservationRequired === true;
+      const archiveVerified = manifest.archiveVerified !== false && inspected?.integrityOk !== false;
+      let sourceStorageAfter = null;
+      let sourceStoragePreserved = false;
+      const sourceStorageBefore = options.sourceStorageIntegrityBefore && typeof options.sourceStorageIntegrityBefore === 'object'
+        ? options.sourceStorageIntegrityBefore
+        : null;
+      if (sourceScopeKey && sourceStorageBefore?.fingerprint) {
+        sourceStorageAfter = await flashbackSourceStorageIntegritySnapshotForRetrace(sourceScopeKey);
+        sourceStoragePreserved = compareFlashbackSourceStorageIntegrityForRetrace(sourceStorageBefore, sourceStorageAfter).identical;
+      }
+      const verified = targetMatches
+        && manifest.copyAdoptedComplete === true
+        && transferMatches && sourceMatches && expectedMatches && recordsMatch
+        && modeMatches && contractMatches && archiveVerified && sourceStoragePreserved;
+      return {
+        ...base, ok: verified, available: true, attempted: true, adopted: false, verified, durable: verified, records,
+        sourcePreserved: sourceStoragePreserved,
+        targetScopeKey: text(targetScope.scopeKey || ''), copyAdoptionMode: adoptionMode,
+        archiveId: text(manifest?.archiveRef?.archiveId || ''), archiveDigest: text(manifest?.archiveRef?.digest || ''),
+        archiveGeneration: Math.max(0, Number(manifest?.archiveRef?.generation || 0) || 0),
+        sourceStorageFingerprintBefore: text(sourceStorageBefore?.fingerprint || ''),
+        sourceStorageFingerprintAfter: text(sourceStorageAfter?.fingerprint || ''),
+        reason: verified ? 'flashback_handoff_storage_readback_verified_non_destructive' : 'flashback_handoff_storage_readback_not_ready',
+        diagnostics: { targetMatches, transferMatches, sourceMatches, expectedMatches, recordsMatch, modeMatches, contractMatches, archiveVerified, sourceStoragePreserved }
+      };
+    } catch (error) {
+      return { ...base, reason: 'flashback_handoff_storage_readback_failed', error: text(error?.message || error) };
+    }
+  };
+
+  const waitForFlashbackSessionHandoffReadback = async (options = {}, timeoutMs = FLASHBACK_LATE_READBACK_TIMEOUT_MS) => {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs || 0) || 0);
+    let last = null;
+    do {
+      last = await verifyFlashbackSessionHandoffFromStorage(options);
+      if (last?.verified === true && last?.durable === true) return last;
+      if (Date.now() >= deadline) break;
+      await delay(300);
+    } while (Date.now() <= deadline);
+    return last;
   };
 
   const adoptFlashbackSessionHandoff = async (options = {}) => {
@@ -2680,8 +3164,66 @@
         verified: true,
         adopted: false,
         durable: true,
+        sourcePreserved: true,
+        handoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+        sourceMutationAllowed: false,
+        sourceCompactionAllowed: false,
         records: 0,
         reason: 'no_flashback_records'
+      };
+    }
+
+    const capability = await inspectFlashbackNonDestructiveHandoffCapability();
+    if (!capability.supported) {
+      return {
+        ok: false, available: Boolean(runtime) || Runtime.flashbackIpcRegistered, attempted: false,
+        verified: false, adopted: false, durable: false, sourcePreserved: true,
+        records: 0, expectedRecords,
+        handoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+        requiredCompatibilitySchema: RETRACE_PEER_COMPATIBILITY_SCHEMA,
+        pluginVersion: capability.pluginVersion,
+        reason: 'flashback_non_destructive_handoff_required',
+        diagnostics: capability
+      };
+    }
+    if (!sourceScopeKey) {
+      return {
+        ok: false, available: true, attempted: false, verified: false, adopted: false, durable: false,
+        sourcePreserved: true, records: 0, expectedRecords,
+        handoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+        reason: 'flashback_source_scope_missing'
+      };
+    }
+
+    let sourceStorageBefore = await flashbackSourceStorageIntegritySnapshotForRetrace(sourceScopeKey);
+    const expectedSourceFingerprint = text(options.expectedSourceStorageFingerprint || '').trim();
+    if (sourceStorageBefore.legacyCompacted) {
+      return {
+        ok: false, available: true, attempted: false, verified: false, adopted: false, durable: false,
+        sourcePreserved: true, records: 0, expectedRecords,
+        handoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+        sourceStorageFingerprintBefore: sourceStorageBefore.fingerprint,
+        reason: 'flashback_source_legacy_compacted_restore_required'
+      };
+    }
+    if (sourceStorageBefore.missingShards > 0) {
+      return {
+        ok: false, available: true, attempted: false, verified: false, adopted: false, durable: false,
+        sourcePreserved: true, records: 0, expectedRecords,
+        handoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+        sourceStorageFingerprintBefore: sourceStorageBefore.fingerprint,
+        reason: 'flashback_source_storage_incomplete',
+        diagnostics: { missingShards: sourceStorageBefore.missingShards }
+      };
+    }
+    if (expectedSourceFingerprint && expectedSourceFingerprint !== sourceStorageBefore.fingerprint) {
+      return {
+        ok: false, available: true, attempted: false, verified: false, adopted: false, durable: false,
+        sourcePreserved: true, records: 0, expectedRecords,
+        handoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+        sourceStorageFingerprintBefore: sourceStorageBefore.fingerprint,
+        expectedSourceStorageFingerprint: expectedSourceFingerprint,
+        reason: 'flashback_source_changed_before_owner_adoption'
       };
     }
 
@@ -2689,19 +3231,26 @@
     const defaultAttempts = typeof runtime?.adopt === 'function' ? 8 : 2;
     const attempts = Math.max(1, Math.min(10, Number(options.attempts || defaultAttempts) || defaultAttempts));
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const request = {
+        targetChatId, transferId, sourceScopeKey, expectedRecords,
+        requiredHandoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+        requireSourcePreservation: true,
+        allowSourceMutation: false,
+        allowSourceCompaction: false,
+        sourceStorageFingerprint: sourceStorageBefore.fingerprint
+      };
       try {
-        const request = { targetChatId, transferId, sourceScopeKey, expectedRecords };
         let transport = '';
         if (typeof runtime?.adopt === 'function') {
           last = await runtime.adopt(request);
           transport = 'same_realm_runtime';
         } else {
           last = await requestFlashbackIpc('adopt_session_handoff', request, {
-            timeoutMs: Math.max(800, Number(options.ipcTimeoutMs || 3000) || 3000)
+            timeoutMs: Math.max(5000, Math.min(FLASHBACK_IPC_TIMEOUT_MAX_MS, Number(options.ipcTimeoutMs || FLASHBACK_ADOPT_TIMEOUT_MS) || FLASHBACK_ADOPT_TIMEOUT_MS))
           });
           transport = 'risu_plugin_ipc';
         }
-        const strictReceipt = ['flashback_memory.session_handoff_adoption.v2', 'flashback_memory.session_handoff_adoption.v3'].includes(text(last?.schema || ''));
+        const strictReceipt = text(last?.schema || '') === 'flashback_memory.session_handoff_adoption.v4';
         const identityMatches = text(last?.targetChatId || '') === targetChatId
           && text(last?.transferId || '') === transferId
           && text(last?.sourceScopeKey || '') === sourceScopeKey
@@ -2712,11 +3261,28 @@
           && text(last?.ownerPluginId || '') === FLASHBACK_PLUGIN_ID
           && text(last?.authorizedRequester || '') === 'flashback_hayaku_bridge'
         );
+        const preservationReceipt = text(last?.schema || '') === FLASHBACK_HANDOFF_RECEIPT_SCHEMA
+          && sourcePreservationReceiptMatches(last, RETRACE_PEER_REQUIREMENTS.flashback, { physicalField: 'physicalCopies' })
+          && Number(last?.compactedSourceRecords || 0) === 0;
+        const sourceStorageAfter = await flashbackSourceStorageIntegritySnapshotForRetrace(sourceScopeKey);
+        const sourceStorageComparison = compareFlashbackSourceStorageIntegrityForRetrace(sourceStorageBefore, sourceStorageAfter);
+        if (!sourceStorageComparison.identical) {
+          return {
+            ...(last && typeof last === 'object' ? last : {}),
+            ok: false, available: true, attempted: true, attempts: attempt,
+            verified: false, durable: false, sourcePreserved: false,
+            reason: 'SOURCE_MUTATION_DETECTED',
+            sourceStorageFingerprintBefore: sourceStorageBefore.fingerprint,
+            sourceStorageFingerprintAfter: sourceStorageAfter.fingerprint,
+            diagnostics: { changed: sourceStorageComparison.changed }
+          };
+        }
         const receiptMatches = strictReceipt
           && last?.verified === true
           && last?.durable === true
           && identityMatches
-          && ownerMatches;
+          && ownerMatches
+          && preservationReceipt;
         if (receiptMatches) {
           return {
             ...last,
@@ -2726,20 +3292,44 @@
             attempts: attempt,
             verified: true,
             durable: true,
-            transport
+            sourcePreserved: true,
+            transport,
+            sourceStorageFingerprintBefore: sourceStorageBefore.fingerprint,
+            sourceStorageFingerprintAfter: sourceStorageAfter.fingerprint
           };
+        }
+        const readback = await waitForFlashbackSessionHandoffReadback({
+          ...request,
+          sourceStorageIntegrityBefore: sourceStorageBefore
+        }, Math.min(1800, FLASHBACK_LATE_READBACK_TIMEOUT_MS));
+        if (readback?.verified === true && readback?.durable === true && readback?.sourcePreserved === true) {
+          return { ...readback, ok: true, attempted: true, attempts: attempt, transport: readback.transport || 'plugin_storage_readback_after_ipc' };
         }
       } catch (error) {
         last = {
           ok: false,
           verified: false,
           durable: false,
+          sourcePreserved: true,
           reason: text(error?.code || error?.message || error) || 'flashback_adoption_failed',
           error: text(error?.message || error)
         };
+        if (['FLASHBACK_IPC_TIMEOUT', 'FLASHBACK_IPC_UNAVAILABLE'].includes(text(error?.code || ''))) {
+          const readback = await waitForFlashbackSessionHandoffReadback({
+            targetChatId, transferId, sourceScopeKey, expectedRecords,
+            sourceStorageIntegrityBefore: sourceStorageBefore
+          }, FLASHBACK_LATE_READBACK_TIMEOUT_MS);
+          if (readback?.verified === true && readback?.durable === true && readback?.sourcePreserved === true) {
+            return { ...readback, ok: true, attempted: true, attempts: attempt, transport: 'plugin_storage_readback_after_ipc_timeout' };
+          }
+        }
       }
-      if (attempt < attempts) await delay(100);
+      if (attempt < attempts) await delay(Math.min(900, 250 * attempt));
     }
+    const sourceStorageAfter = await flashbackSourceStorageIntegritySnapshotForRetrace(sourceScopeKey).catch(() => null);
+    const sourceStorageComparison = sourceStorageAfter
+      ? compareFlashbackSourceStorageIntegrityForRetrace(sourceStorageBefore, sourceStorageAfter)
+      : { identical: false, changed: ['source_readback_failed'] };
     return {
       ...(last && typeof last === 'object' ? last : {}),
       ok: false,
@@ -2749,8 +3339,13 @@
       verified: false,
       adopted: false,
       durable: false,
+      sourcePreserved: sourceStorageComparison.identical,
       records: Math.max(0, Number(last?.records || 0) || 0),
-      reason: text(last?.reason || 'flashback_adoption_not_verified')
+      handoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+      sourceStorageFingerprintBefore: sourceStorageBefore.fingerprint,
+      sourceStorageFingerprintAfter: text(sourceStorageAfter?.fingerprint || ''),
+      reason: text(last?.reason || 'flashback_adoption_not_verified'),
+      diagnostics: { sourceChanged: sourceStorageComparison.changed }
     };
   };
 
@@ -2796,6 +3391,8 @@
       recordsIncluded,
       ...(runtimeItems == null ? {} : { runtimeItems }),
       runtimeStats: inspected?.stats && typeof inspected.stats === 'object' ? inspected.stats : null,
+      pluginVersion: text(inspected?.version || inspected?.pluginVersion || ''),
+      capabilities: inspected?.capabilities && typeof inspected.capabilities === 'object' ? clone(inspected.capabilities, {}) : {},
       missingShards,
       corruptShards,
       recordCountMismatch,
@@ -2905,7 +3502,9 @@
     const identity = contextIdentity(context);
     const includeRecords = options?.includeRecords !== false;
     const runtime = activeFlashbackRuntime();
-    if (runtime) {
+    const skipRuntime = options?.skipRuntime === true;
+    const skipIpc = options?.skipIpc === true;
+    if (runtime && !skipRuntime) {
       try {
         const inspected = await runtime.inspect(null, { includeRecords });
         const normalized = flashbackSourceFromInspection(inspected, identity, 'flashback_runtime_api');
@@ -2921,8 +3520,10 @@
       }
     }
 
-    try {
-      const inspected = await requestFlashbackIpc('inspect', { includeRecords }, { timeoutMs: includeRecords ? 3000 : 1800 });
+    if (!skipIpc) try {
+      const inspected = await requestFlashbackIpc('inspect', { includeRecords }, {
+        timeoutMs: includeRecords ? FLASHBACK_INSPECT_RECORDS_TIMEOUT_MS : FLASHBACK_INSPECT_SUMMARY_TIMEOUT_MS
+      });
       const normalized = flashbackSourceFromInspection(inspected, identity, 'flashback_plugin_ipc');
       if (normalized && (!includeRecords || Array.isArray(normalized.runtimeItems))) return normalized;
       warn('Flashback IPC ledger scope or requested record payload unavailable; falling back to pluginStorage', {
@@ -3908,6 +4509,11 @@
         adopted: false,
         durable: true,
         records: 0,
+        handoffContract: HAYAKU_REQUIRED_HANDOFF_CONTRACT,
+        sourcePreserved: true,
+        sourceMutationAllowed: false,
+        sourceCompactionAllowed: false,
+        physicalCopies: 0,
         reason: 'no_hayaku_records'
       };
     }
@@ -3955,8 +4561,10 @@
         && text(last?.transferId || '') === transferId
         && text(last?.sourceScopeKey || '') === sourceScopeKey;
       const recordsMatch = Math.max(0, Number(last?.records || 0) || 0) === expectedRecords;
+      const preservationReceipt = text(last?.schema || '') === HAYAKU_HANDOFF_RECEIPT_SCHEMA
+        && sourcePreservationReceiptMatches(last, RETRACE_PEER_REQUIREMENTS.hayaku, { physicalField: 'physicalCopies' });
       if (last?.verified === true && last?.durable === true
-        && ownerReceipt && identityMatches && recordsMatch) {
+        && ownerReceipt && identityMatches && recordsMatch && preservationReceipt) {
           return {
             ...last,
             ok: true,
@@ -6781,13 +7389,22 @@
     const partialCount = Math.max(0, Number(source?.counts?.partialMemories ?? (recordsIncluded
       ? memories.filter(memory => memory?.pipeline?.status === 'partial').length
       : memoryRefs.filter(memory => text(memory?.pipelineStatus || '') === 'partial').length)) || 0);
+    const canonicalRows = (recordsIncluded ? memories : memoryRefs).map(memory => [
+      text(memory.memoryId || ''), Number(memory.revision || 0), text(memory.sourceDigest || ''),
+      Math.max(0, Number(memory?.turnRange?.start || 0) || 0), Math.max(0, Number(memory?.turnRange?.end || 0) || 0),
+      Number(memory.sessionEpoch || 0), memory?.inheritedSessionHistory === true,
+      text(memory.status || ''), text(memory?.pipeline?.status || memory?.pipelineStatus || ''),
+      stableHash64(text(memory.text || memory.summary || ''))
+    ]);
+    // LIBRA archive preparation is allowed to attach archiveCanonicalId/archiveRef
+    // metadata to the same canonical records. This fingerprint intentionally excludes
+    // those transport fields so a valid prepare_session_handoff cannot invalidate the
+    // transition's own source-stability check.
+    const canonicalStateHash = text(source.canonicalStateHash || source.canonicalSnapshotHash || '')
+      || stableHash64(JSON.stringify({ scopeKey: text(scope.scopeKey || ''), memories: canonicalRows }));
     const fallbackSnapshotHash = stableHash64(JSON.stringify({
       scopeKey: text(scope.scopeKey || ''),
-      memories: (recordsIncluded ? memories : memoryRefs).map(memory => [
-        text(memory.memoryId || ''), Number(memory.revision || 0), text(memory.sourceDigest || ''),
-        Number(memory.sessionEpoch || 0), text(memory.status || ''), text(memory.key || ''),
-        stableHash64(text(memory.text || memory.summary || ''))
-      ]),
+      memories: canonicalRows,
       worldAdditional: recordsIncluded
         ? worldAdditional.map(item => [text(item.itemId || ''), text(item.status || ''), stableHash64(text(item.content || ''))])
         : worldAdditionalRefs.map(item => text(typeof item === 'string' ? item : item?.itemId || item?.key || ''))
@@ -6817,6 +7434,7 @@
       inheritedRecordCount: inheritedCount,
       partialRecordCount: partialCount,
       worldAdditionalCount,
+      canonicalStateHash,
       snapshotHash,
       inspectedAt: source.inspectedAt || ''
     };
@@ -6828,7 +7446,7 @@
     const probe = await probeLibraIpc({ timeoutMs: 1800, attempts: 2 });
     if (probe.available) {
       try {
-        const inspected = await requestLibraIpc('inspect', { includeRecords }, { timeoutMs: includeRecords ? 12000 : 5000 });
+        const inspected = await requestLibraIpc('inspect', { includeRecords }, { timeoutMs: includeRecords ? Math.max(30000, LIBRA_INSPECT_TIMEOUT_MS) : LIBRA_INSPECT_TIMEOUT_MS });
         const normalized = normalizeLibraInspection(inspected, identity, 'libra_plugin_ipc');
         normalized.capabilities = clone(probe.capabilities, {});
         normalized.probe = clone(probe, {});
@@ -6886,6 +7504,23 @@
     && Number(receipt[field]) === expected
   );
 
+  // World Additional was retired from current LIBRA handoff. Keep only a strict
+  // compatibility bridge for older LIBRA builds: a missing counter is valid when
+  // RE:TRACE expects zero, while any non-zero legacy transfer must still prove both
+  // counters exactly. This does not recreate World Additional storage or transport.
+  const libraLegacyOptionalCountMatches = (receipt, field, expected) => {
+    const wanted = Math.max(0, Number(expected || 0) || 0);
+    const hasField = Boolean(receipt && Object.prototype.hasOwnProperty.call(receipt, field));
+    if (!hasField) return wanted === 0;
+    return Number.isInteger(Number(receipt[field])) && Number(receipt[field]) === wanted;
+  };
+
+  const libraLegacyWorldAdditionalMatches = (receipt, options = {}) => {
+    const expected = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
+    return libraLegacyOptionalCountMatches(receipt, 'worldAdditional', expected)
+      && libraLegacyOptionalCountMatches(receipt, 'expectedWorldAdditional', expected);
+  };
+
   const libraOwnerReceiptMatches = (receipt, transport, mutation) => (
     transport !== 'libra_plugin_ipc'
     || (
@@ -6894,6 +7529,462 @@
       && text(receipt?.mutation || '') === mutation
     )
   );
+
+
+
+  const readHayakuCompatibilityBeacon = async () => {
+    const raw = await storageGet(HAYAKU_RETRACE_COMPATIBILITY_BEACON_KEY);
+    const parsed = parseJson(raw, null);
+    if (!parsed || parsed.schema !== HAYAKU_RETRACE_COMPATIBILITY_BEACON_SCHEMA) return null;
+    if (text(parsed.pluginId || '') !== HAYAKU_PLUGIN_ID) return null;
+    const compatibility = peerCompatibilityPayload(parsed);
+    if (!compatibility) return null;
+    return {
+      raw: compatibility,
+      pluginVersion: text(parsed.pluginVersion || compatibility.pluginVersion || ''),
+      ownerIpcRegistered: parsed.ownerIpc?.registered === true,
+      writtenAt: Math.max(0, Number(parsed.writtenAt || 0) || 0),
+      source: 'plugin_storage_beacon'
+    };
+  };
+
+  const staticHayakuCompatibilityFromPluginMetadata = plugin => {
+    if (!plugin || text(plugin.name || '') !== HAYAKU_PLUGIN_ID || plugin.enabled === false) return null;
+    const script = text(plugin.script || '');
+    if (!script) return null;
+    const requiredMarkers = [
+      'retrace.peer_compatibility.v1',
+      'hayaku.handoff_immutable_source.v1',
+      'hayaku.session_handoff.receipt.v1',
+      'sourceImmutableHandoff: true',
+      'durableTargetReadback: true',
+      'idempotentHandoff: true',
+      'inheritedStateUsable: true',
+      'sourceMutationAllowed: false',
+      'sourceCompactionAllowed: false',
+      'physicalCopyRequired: false'
+    ];
+    if (!requiredMarkers.every(marker => script.includes(marker))) return null;
+    return {
+      schema: RETRACE_PEER_COMPATIBILITY_SCHEMA,
+      protocolMajor: RETRACE_PEER_PROTOCOL_MAJOR,
+      protocolMinor: 0,
+      pluginId: HAYAKU_PLUGIN_ID,
+      pluginVersion: text(plugin.versionOfPlugin || plugin.pluginVersion || ''),
+      peerRole: 'packet_continuity_memory',
+      features: {
+        inspect: true,
+        nextSessionHandoff: true,
+        sourceImmutableHandoff: true,
+        durableTargetReadback: true,
+        idempotentHandoff: true,
+        inheritedStateUsable: true
+      },
+      handoff: {
+        contract: HAYAKU_REQUIRED_HANDOFF_CONTRACT,
+        receiptSchemas: [HAYAKU_HANDOFF_RECEIPT_SCHEMA],
+        sourceMutationAllowed: false,
+        sourceCompactionAllowed: false,
+        physicalCopyRequired: false
+      }
+    };
+  };
+
+  const inspectInstalledHayakuMetadata = async () => {
+    const api = liveApi(['getDatabase']);
+    if (typeof api?.getDatabase !== 'function') return null;
+    try {
+      const db = await api.getDatabase(['plugins']);
+      const plugins = Array.isArray(db?.plugins) ? db.plugins : [];
+      const plugin = plugins.find(item => text(item?.name || '') === HAYAKU_PLUGIN_ID) || null;
+      if (!plugin) return null;
+      return {
+        installed: true,
+        enabled: plugin.enabled !== false,
+        pluginVersion: text(plugin.versionOfPlugin || plugin.pluginVersion || ''),
+        allowedIPC: Array.isArray(plugin.allowedIPC) ? plugin.allowedIPC.map(value => text(value)) : [],
+        raw: staticHayakuCompatibilityFromPluginMetadata(plugin),
+        source: 'risu_plugin_metadata'
+      };
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const probeHayakuRuntimeCompatibility = async () => {
+    const candidates = [];
+    try {
+      candidates.push(
+        globalThis?.HAYAKU,
+        globalThis?.__pluginApis__?.HAYAKU,
+        globalThis?.__pluginApis__?.hayaku
+      );
+    } catch (_) {}
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      let raw = peerCompatibilityPayload(candidate);
+      if (!raw && typeof candidate.runtime === 'function') {
+        try { raw = peerCompatibilityPayload(await Promise.resolve(candidate.runtime())); } catch (_) {}
+      }
+      if (!raw) continue;
+      return {
+        raw,
+        pluginVersion: text(raw?.pluginVersion || candidate?.version || ''),
+        runtime: candidate
+      };
+    }
+    return null;
+  };
+
+  const probeUniversalPeerCompatibility = async (key, options = {}) => {
+    const requirement = RETRACE_PEER_REQUIREMENTS[key];
+    const timeoutMs = Math.max(700, Math.min(8000, Number(options.timeoutMs || 2400) || 2400));
+    const required = options.required === true;
+    let raw = null;
+    let installed = false;
+    let transport = 'none';
+    let errorText = '';
+    let ownerReachable = false;
+    let pluginVersionHint = '';
+    let sourceDetected = options.sourceEvidence === true;
+    try {
+      if (key === 'flashback') {
+        raw = await requestFlashbackIpc('capabilities', {}, { timeoutMs });
+        installed = true;
+        ownerReachable = true;
+        transport = 'flashback_plugin_ipc';
+      } else if (key === 'hayaku') {
+        const attempts = options.forceProbe === true ? 3 : 2;
+        let lastError = null;
+        for (let attempt = 1; attempt <= attempts && !raw; attempt += 1) {
+          try {
+            raw = await requestHayakuIpc('capabilities', {}, {
+              timeoutMs,
+              ignoreCooldown: options.forceProbe === true || attempt > 1,
+              suppressCooldown: attempt < attempts
+            });
+            installed = true;
+            ownerReachable = true;
+            transport = 'hayaku_plugin_ipc';
+            Runtime.hayakuIpcUnavailableUntil = 0;
+          } catch (error) {
+            lastError = error;
+            if (attempt < attempts) await delay(Math.min(700, 250 * attempt));
+          }
+        }
+        if (!raw && lastError) throw lastError;
+      } else if (key === 'libra') {
+        const probe = await probeLibraIpc({ timeoutMs, attempts: 1 });
+        installed = probe.available === true || probe.reachable === true;
+        ownerReachable = installed;
+        raw = probe.capabilities;
+        transport = 'libra_plugin_ipc';
+        errorText = text(probe.error || '');
+      } else if (key === 'gradia') {
+        const probe = await probeGradiaIpc({ timeoutMs, attempts: 1 });
+        installed = probe.available === true || probe.reachable === true;
+        ownerReachable = installed;
+        raw = probe.capabilities;
+        transport = 'gradia_plugin_ipc';
+        errorText = text(probe.error || '');
+      } else if (key === 'lia') {
+        raw = await requestLiaIpc('capabilities', {}, { timeoutMs });
+        installed = true;
+        ownerReachable = true;
+        transport = 'lia_plugin_ipc';
+      }
+    } catch (error) {
+      const code = text(error?.code || '');
+      errorText = text(error?.message || error);
+      installed = [
+        'FLASHBACK_IPC_REJECTED',
+        'HAYAKU_IPC_REJECTED',
+        'LIBRA_IPC_REJECTED',
+        'GRADIA_IPC_REJECTED',
+        'LIA_IPC_REJECTED'
+      ].includes(code) || error?.remoteReachable === true;
+      ownerReachable = installed;
+    }
+
+    if (key === 'hayaku' && !raw) {
+      // API v3 plugins normally live in isolated iframes, so cross-plugin globalThis
+      // is only a legacy/shared-realm fallback, never the primary discovery path.
+      const runtimeProbe = await probeHayakuRuntimeCompatibility().catch(() => null);
+      if (runtimeProbe?.raw) {
+        raw = runtimeProbe.raw;
+        installed = true;
+        ownerReachable = true;
+        pluginVersionHint = runtimeProbe.pluginVersion;
+        transport = 'hayaku_runtime_compatibility';
+      }
+    }
+    if (key === 'hayaku' && !raw) {
+      const beacon = await readHayakuCompatibilityBeacon().catch(() => null);
+      if (beacon?.raw) {
+        raw = beacon.raw;
+        installed = true;
+        pluginVersionHint = beacon.pluginVersion;
+        transport = 'hayaku_plugin_storage_beacon';
+      }
+    }
+    if (key === 'hayaku' && !raw && options.inspectInstalledMetadata === true) {
+      const metadata = await inspectInstalledHayakuMetadata().catch(() => null);
+      if (metadata?.installed) {
+        installed = true;
+        pluginVersionHint = metadata.pluginVersion;
+        if (metadata.raw) {
+          raw = metadata.raw;
+          transport = 'hayaku_static_contract_attestation';
+        } else if (transport === 'none') {
+          transport = 'hayaku_plugin_metadata';
+        }
+      }
+    }
+    if (key === 'hayaku' && sourceDetected) {
+      installed = true;
+      if (transport === 'none') transport = 'hayaku_storage_detected';
+    }
+
+    let evaluated = evaluatePeerCompatibility(requirement, raw, installed, { required });
+    if (pluginVersionHint && !evaluated.pluginVersion) evaluated.pluginVersion = pluginVersionHint;
+    if (key === 'hayaku') {
+      const contractCompatible = evaluated.compatible === true;
+      // A beacon/static contract can identify the installed build, but a required
+      // handoff still needs the live owner channel to perform and verify mutation.
+      if (required && installed && ownerReachable !== true) {
+        evaluated = {
+          ...evaluated,
+          compatible: false,
+          blocking: true,
+          status: contractCompatible ? 'owner_unreachable_required' : 'detected_unreachable_required',
+          reason: contractCompatible
+            ? `HAYAKU 설치 및 호환 계약은 확인됐지만 owner IPC가 응답하지 않습니다. 호환성 다시 확인을 눌러 재연결을 시도해 주세요.`
+            : `HAYAKU 데이터/설치는 감지됐지만 owner IPC에서 호환 계약을 확인하지 못했습니다. 플러그인이 실행 중인지 확인한 뒤 호환성 다시 확인을 눌러 주세요.`,
+          errors: [...new Set([...(evaluated.errors || []), 'owner_ipc_unreachable'])],
+          contractCompatible
+        };
+      } else {
+        evaluated = { ...evaluated, contractCompatible, ownerReachable };
+      }
+    }
+    return {
+      ...evaluated,
+      sourceDetected,
+      ownerReachable,
+      transport,
+      error: errorText
+    };
+  };
+
+  const compatibilityRequiredForPreview = (preview = {}) => ({
+    flashback: Math.max(0, Number(preview?.flashback?.loadedRecords ?? preview?.flashback?.records ?? 0) || 0) > 0,
+    hayaku: preview?.includeHayaku === true && Math.max(0, Number(preview?.hayakuRecordCount || 0) || 0) > 0,
+    libra: preview?.includeLibra === true,
+    gradia: preview?.includeGradia === true,
+    lia: isLiaLivePersonaId(preview?.identity?.personaId)
+  });
+
+  const inspectCompatibilitySuite = async (previewValue = null, options = {}) => {
+    const preview = previewValue || Runtime.lastPreview || await inspectTransition();
+    const required = compatibilityRequiredForPreview(preview);
+    const entries = await Promise.all(Object.keys(RETRACE_PEER_REQUIREMENTS).map(key => (
+      probeUniversalPeerCompatibility(key, {
+        required: required[key] === true,
+        timeoutMs: options.timeoutMs,
+        forceProbe: options.forceProbe === true,
+        inspectInstalledMetadata: options.forceProbe === true,
+        sourceEvidence: key === 'hayaku' && (
+          required.hayaku === true
+          || preview?.hayaku?.available === true
+          || Math.max(0, Number(preview?.hayakuRecordCount || 0) || 0) > 0
+        )
+      })
+    )));
+    const self = {
+      key: 'retrace',
+      label: 'RE:TRACE',
+      pluginId: 'flashback_hayaku_bridge',
+      installed: true,
+      required: true,
+      compatible: true,
+      blocking: false,
+      status: 'compatible',
+      pluginVersion: PLUGIN_VERSION,
+      protocolMajor: RETRACE_PEER_PROTOCOL_MAJOR,
+      handoffContract: 'compatibility_hub',
+      reason: '호환성 허브가 준비되었습니다.',
+      errors: []
+    };
+    const peers = [self, ...entries];
+    const blocking = entries.filter(entry => entry.blocking === true);
+    const warnings = entries.filter(entry => entry.installed === true && entry.compatible !== true && entry.blocking !== true);
+    const suite = {
+      schema: 'retrace.compatibility_suite.v1',
+      protocolMajor: RETRACE_PEER_PROTOCOL_MAJOR,
+      compatible: blocking.length === 0,
+      handoffAllowed: blocking.length === 0,
+      blocking,
+      warnings,
+      peers,
+      required,
+      checkedAt: Date.now()
+    };
+    Runtime.compatibilitySuite = suite;
+    Runtime.compatibilityCheckedAt = suite.checkedAt;
+    return suite;
+  };
+
+  const renderCompatibilitySuite = suiteValue => {
+    const root = Runtime.root;
+    const panel = root?.querySelector?.('#compatibilityPanel');
+    if (!panel) return;
+    const suite = suiteValue || Runtime.compatibilitySuite;
+    if (!suite) {
+      panel.className = 'compatibility-panel checking';
+      panel.innerHTML = '<div class="compatibility-head"><div><strong>플러그인 호환성</strong><span>연동 계약을 확인하는 중입니다.</span></div><em>CHECKING</em></div>';
+      return;
+    }
+    const warningCount = Math.max(0, Number(suite.warnings?.length || 0) || 0);
+    const statusText = suite.compatible
+      ? (warningCount ? '승계 가능 · 경고' : '호환됨')
+      : '승계 차단';
+    const statusClass = suite.compatible
+      ? (warningCount ? 'compat-warn' : 'compat-ok')
+      : 'compat-bad';
+    const rows = (suite.peers || []).map(peer => {
+      const state = peer.status === 'owner_unreachable_required'
+        ? '연결 재확인 필요'
+        : peer.status === 'detected_unreachable_required'
+          ? '설치 감지 · 연결 실패'
+          : peer.installed === false && peer.required !== true
+            ? '미연결'
+            : peer.installed === false
+              ? '연결 안 됨'
+              : peer.compatible
+                ? '정상'
+                : peer.blocking
+                  ? '호환 불일치 · 차단'
+                  : '호환 불일치 · 현재 미사용';
+      const rowClass = peer.installed === false && peer.required !== true ? 'muted' : peer.compatible ? 'ok' : peer.blocking ? 'bad' : 'muted';
+      const version = peer.pluginVersion ? `v${escapeHtml(peer.pluginVersion)}` : '-';
+      return `<div class="compat-row ${rowClass}">
+        <div class="compat-name"><strong>${escapeHtml(peer.label)}</strong><span>${version}</span></div>
+        <div class="compat-state">${escapeHtml(state)}</div>
+        <small>${escapeHtml(peer.reason || '')}</small>
+      </div>`;
+    }).join('');
+    const warning = !suite.compatible
+      ? `이번 승계에 필요한 플러그인 중 호환성 문제가 ${formatNumber(suite.blocking?.length || 0)}개 있어 승계를 차단합니다. 경고 확인은 표시만 확인할 뿐 안전장치를 우회하지 않습니다.`
+      : warningCount
+        ? `이번 승계에 사용되지 않는 설치 플러그인 ${formatNumber(warningCount)}개에서 호환 계약 불일치가 감지됐습니다. 현재 승계에는 참여하지 않으므로 진행할 수 있지만, 해당 플러그인의 데이터가 있는 세션에서는 업데이트가 필요합니다.`
+        : '이번 승계에 필요한 모든 플러그인이 공통 비파괴 승계 계약을 만족합니다. 미설치 또는 사용하지 않는 플러그인은 승계를 막지 않습니다.';
+    panel.className = `compatibility-panel ${statusClass}`;
+    panel.innerHTML = `<div class="compatibility-head"><div><strong>6개 플러그인 호환성</strong><span>${escapeHtml(warning)}</span></div><em>${escapeHtml(statusText)}</em></div>
+      <div class="compat-grid">${rows}</div>
+      <div class="compat-actions"><button id="refreshCompatibility" class="btn" type="button">호환성 다시 확인</button>${(!suite.compatible || warningCount) ? '<button id="ackCompatibility" class="btn" type="button">경고 확인</button>' : ''}</div>`;
+    bindCompatibilityControls();
+  };
+
+  const bindCompatibilityControls = () => {
+    const root = Runtime.root;
+    const refresh = root?.querySelector?.('#refreshCompatibility');
+    if (refresh && refresh.dataset.bound !== 'true') {
+      refresh.dataset.bound = 'true';
+      refresh.addEventListener('click', async () => {
+        if (Runtime.busy) return;
+        setBusy(true);
+        try {
+          Runtime.hayakuIpcUnavailableUntil = 0;
+          cancelCompatibilityAutoRetry();
+          Runtime.compatibilityAutoRetryAttempt = 0;
+          const preview = await inspectTransition();
+          const suite = await inspectCompatibilitySuite(preview, { timeoutMs: 3200, forceProbe: true });
+          renderCompatibilitySuite(suite);
+        } catch (error) {
+          const panel = Runtime.root?.querySelector?.('#compatibilityPanel');
+          if (panel) panel.innerHTML = `<div class="compatibility-head"><div><strong>플러그인 호환성</strong><span>${escapeHtml(error?.message || error)}</span></div><em>ERROR</em></div>`;
+        } finally {
+          setBusy(false);
+        }
+      });
+    }
+    const acknowledge = root?.querySelector?.('#ackCompatibility');
+    if (acknowledge && acknowledge.dataset.bound !== 'true') {
+      acknowledge.dataset.bound = 'true';
+      acknowledge.addEventListener('click', () => {
+        Runtime.compatibilityAcknowledgedAt = Date.now();
+        const panel = Runtime.root?.querySelector?.('#compatibilityPanel');
+        panel?.classList?.add('acknowledged');
+        acknowledge.textContent = '경고 확인됨';
+        acknowledge.disabled = true;
+      });
+    }
+  };
+
+  const cancelCompatibilityAutoRetry = () => {
+    if (Runtime.compatibilityAutoRetryTimer) clearTimeout(Runtime.compatibilityAutoRetryTimer);
+    Runtime.compatibilityAutoRetryTimer = null;
+  };
+
+  const hayakuCompatibilityNeedsOwnerRetry = suite => {
+    const peer = (suite?.peers || []).find(item => item?.key === 'hayaku');
+    if (!peer || peer.required !== true) return false;
+    return peer.ownerReachable !== true && (
+      peer.sourceDetected === true
+      || peer.installed === true
+      || ['missing_required', 'owner_unreachable_required', 'detected_unreachable_required'].includes(peer.status)
+    );
+  };
+
+  const scheduleCompatibilityAutoRetry = previewValue => {
+    if (!Runtime.visible || !Runtime.root) return;
+    if (Runtime.compatibilityAutoRetryAttempt >= 3) return;
+    cancelCompatibilityAutoRetry();
+    const attempt = Runtime.compatibilityAutoRetryAttempt + 1;
+    Runtime.compatibilityAutoRetryAttempt = attempt;
+    const delayMs = [0, 1800, 4200, 8200][attempt] || 8200;
+    Runtime.compatibilityAutoRetryTimer = setTimeout(async () => {
+      Runtime.compatibilityAutoRetryTimer = null;
+      if (!Runtime.visible || Runtime.busy) {
+        scheduleCompatibilityAutoRetry(previewValue);
+        return;
+      }
+      try {
+        Runtime.hayakuIpcUnavailableUntil = 0;
+        const preview = previewValue || Runtime.lastPreview || await inspectTransition();
+        const suite = await inspectCompatibilitySuite(preview, { timeoutMs: 3400, forceProbe: true });
+        renderCompatibilitySuite(suite);
+        if (hayakuCompatibilityNeedsOwnerRetry(suite)) scheduleCompatibilityAutoRetry(preview);
+        else Runtime.compatibilityAutoRetryAttempt = 0;
+      } catch (_) {
+        scheduleCompatibilityAutoRetry(previewValue);
+      }
+    }, delayMs);
+  };
+
+  const refreshCompatibility = async (previewValue = null) => {
+    const panel = Runtime.root?.querySelector?.('#compatibilityPanel');
+    if (panel) {
+      panel.className = 'compatibility-panel checking';
+      panel.innerHTML = '<div class="compatibility-head"><div><strong>6개 플러그인 호환성</strong><span>공통 승계 계약과 버전 독립 호환성을 확인하는 중입니다.</span></div><em>CHECKING</em></div>';
+    }
+    try {
+      const suite = await inspectCompatibilitySuite(previewValue, { timeoutMs: 2800 });
+      renderCompatibilitySuite(suite);
+      if (hayakuCompatibilityNeedsOwnerRetry(suite)) scheduleCompatibilityAutoRetry(previewValue);
+      else {
+        cancelCompatibilityAutoRetry();
+        Runtime.compatibilityAutoRetryAttempt = 0;
+      }
+      return suite;
+    } catch (error) {
+      if (panel) {
+        panel.className = 'compatibility-panel compat-bad';
+        panel.innerHTML = `<div class="compatibility-head"><div><strong>호환성 검사 실패</strong><span>${escapeHtml(error?.message || error)}</span></div><em>ERROR</em></div>`;
+      }
+      throw error;
+    }
+  };
 
   const libraArchiveReceiptMatches = (receipt, options) => {
     const expectedArchiveId = text(options?.expectedArchiveId || '').trim();
@@ -6907,7 +7998,6 @@
 
   const libraPreparationReceiptMatches = (receipt, options, transport) => {
     const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
-    const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
     return receipt?.schema === LIBRA_HANDOFF_RECEIPT_SCHEMA
       && receipt?.action === 'prepared'
       && receipt?.prepared === true
@@ -6915,20 +8005,19 @@
       && text(receipt?.transferId || '') === text(options?.transferId || '')
       && libraReceiptCountMatches(receipt, 'records', expectedRecords)
       && libraReceiptCountMatches(receipt, 'expectedRecords', expectedRecords)
-      && libraReceiptCountMatches(receipt, 'worldAdditional', expectedWorldAdditional)
-      && libraReceiptCountMatches(receipt, 'expectedWorldAdditional', expectedWorldAdditional)
+      && libraLegacyWorldAdditionalMatches(receipt, options)
       && text(receipt?.archiveId || '').trim().length > 0
       && Number.isInteger(Number(receipt?.archiveGeneration))
       && Number(receipt.archiveGeneration) >= 1
       && text(receipt?.archiveDigest || '').trim().length > 0
       && libraReceiptCountMatches(receipt, 'archiveRecordCount', expectedRecords)
       && libraArchiveReceiptMatches(receipt, options)
+      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.libra, { physicalField: 'physicalMemoryCopies' })
       && libraOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
   };
 
   const libraAdoptionReceiptMatches = (receipt, options, transport) => {
     const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
-    const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
     return receipt?.schema === LIBRA_HANDOFF_RECEIPT_SCHEMA
       && receipt?.action === 'adopted'
       && receipt?.adopted === true
@@ -6938,15 +8027,14 @@
       && text(receipt?.transferId || '') === text(options?.transferId || '')
       && libraReceiptCountMatches(receipt, 'records', expectedRecords)
       && libraReceiptCountMatches(receipt, 'expectedRecords', expectedRecords)
-      && libraReceiptCountMatches(receipt, 'worldAdditional', expectedWorldAdditional)
-      && libraReceiptCountMatches(receipt, 'expectedWorldAdditional', expectedWorldAdditional)
+      && libraLegacyWorldAdditionalMatches(receipt, options)
       && libraArchiveReceiptMatches(receipt, options)
+      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.libra, { physicalField: 'physicalMemoryCopies' })
       && libraOwnerReceiptMatches(receipt, transport, 'adopt_session_handoff');
   };
 
   const libraVerificationReceiptMatches = (receipt, options, transport) => {
     const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
-    const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
     return receipt?.schema === LIBRA_HANDOFF_RECEIPT_SCHEMA
       && receipt?.action === 'verified'
       && receipt?.verified === true
@@ -6955,16 +8043,21 @@
       && text(receipt?.transferId || '') === text(options?.transferId || '')
       && libraReceiptCountMatches(receipt, 'records', expectedRecords)
       && libraReceiptCountMatches(receipt, 'expectedRecords', expectedRecords)
-      && libraReceiptCountMatches(receipt, 'worldAdditional', expectedWorldAdditional)
-      && libraReceiptCountMatches(receipt, 'expectedWorldAdditional', expectedWorldAdditional)
+      && libraLegacyWorldAdditionalMatches(receipt, options)
       && libraArchiveReceiptMatches(receipt, options)
+      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.libra, { physicalField: 'physicalMemoryCopies' })
       && libraOwnerReceiptMatches(receipt, transport, 'verify_session_handoff');
+  };
+
+  const withLegacyLibraWorldAdditionalExpectation = (options = {}, count = 0) => {
+    const expected = Math.max(0, Number(count || 0) || 0);
+    return expected > 0 ? { ...options, expectedWorldAdditional: expected } : { ...options };
   };
 
   const prepareLibraSessionHandoff = async options => {
     const runtime = activeLibraRuntime();
     try {
-      const result = await requestLibraIpc('prepare_session_handoff', options || {}, { timeoutMs: 6000 });
+      const result = await requestLibraIpc('prepare_session_handoff', options || {}, { timeoutMs: LIBRA_PREPARE_TIMEOUT_MS });
       if (!libraPreparationReceiptMatches(result, options, 'libra_plugin_ipc')) {
         throw new Error('LIBRA handoff preparation receipt is invalid.');
       }
@@ -6983,10 +8076,9 @@
 
   const adoptLibraSessionHandoff = async options => {
     const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
-    const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
     const runtime = activeLibraRuntime();
     try {
-      const result = await requestLibraIpc('adopt_session_handoff', options || {}, { timeoutMs: 12000 });
+      const result = await requestLibraIpc('adopt_session_handoff', options || {}, { timeoutMs: LIBRA_ADOPT_TIMEOUT_MS });
       return { ...result, transport: 'libra_plugin_ipc' };
     } catch (error) {
       if (runtime && typeof runtime.adoptSessionHandoff === 'function') {
@@ -7000,7 +8092,7 @@
       return {
         schema: LIBRA_HANDOFF_RECEIPT_SCHEMA,
         action: 'adopted', adopted: false, verified: false, durable: false,
-        records: 0, expectedRecords, worldAdditional: 0, expectedWorldAdditional,
+        records: 0, expectedRecords,
         targetChatId: text(options?.targetChatId || ''),
         transferId: text(options?.transferId || ''), transport: 'unavailable',
         reason: text(error?.message || error || 'libra_handoff_adoption_failed')
@@ -7009,8 +8101,6 @@
   };
 
   const adoptLibraSessionHandoffDurable = async options => {
-    const expectedRecords = Math.max(0, Number(options?.expectedRecords || 0) || 0);
-    const expectedWorldAdditional = Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0);
     let last = null;
     const maxAttempts = 4;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -7035,18 +8125,17 @@
       schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: true, durable: true,
       adopted: false, records: 0, expectedRecords: 0, reason: 'no_libra_data'
     };
-    const payload = {
+    const payload = withLegacyLibraWorldAdditionalExpectation({
       transferId: text(options?.transferId || ''),
       targetChatId: text(options?.targetChatId || ''),
       expectedRecords: Math.max(0, Number(options?.expectedRecords || 0) || 0),
-      expectedWorldAdditional: Math.max(0, Number(options?.expectedWorldAdditional || 0) || 0),
       expectedArchiveId: text(options?.expectedArchiveId || ''),
       expectedArchiveGeneration: Math.max(0, Number(options?.expectedArchiveGeneration || 0) || 0),
       expectedArchiveDigest: text(options?.expectedArchiveDigest || '')
-    };
+    }, options?.expectedWorldAdditional);
     const runtime = activeLibraRuntime();
     try {
-      const result = await requestLibraIpc('verify_session_handoff', payload, { timeoutMs: 6000 });
+      const result = await requestLibraIpc('verify_session_handoff', payload, { timeoutMs: LIBRA_VERIFY_TIMEOUT_MS });
       const receiptMatches = libraVerificationReceiptMatches(result, payload, 'libra_plugin_ipc');
       return receiptMatches
         ? { ...result, transport: 'libra_plugin_ipc' }
@@ -7065,7 +8154,6 @@
       return {
         schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: false, durable: false,
         records: 0, expectedRecords: payload.expectedRecords,
-        worldAdditional: 0, expectedWorldAdditional: payload.expectedWorldAdditional,
         targetChatId: payload.targetChatId,
         transferId: payload.transferId, transport: 'unavailable',
         reason: text(error?.message || error || 'libra_handoff_verification_failed')
@@ -7229,7 +8317,7 @@
     const journal = bridge?.handoffJournal && typeof bridge.handoffJournal === 'object'
       ? bridge.handoffJournal
       : null;
-    if (!bridge || bridge.schema !== HANDOFF_SCHEMA || !journal || journal.schema !== HANDOFF_JOURNAL_SCHEMA) {
+    if (!bridge || !HANDOFF_ACCEPTED_SCHEMAS.has(text(bridge.schema || '')) || !journal || journal.schema !== HANDOFF_JOURNAL_SCHEMA) {
       return { available: false, reason: 'handoff_journal_absent', targetChatId, bridge: null, journal: null };
     }
     const identityMatches = text(bridge.targetChatId || '') === targetChatId
@@ -7342,14 +8430,13 @@
     const libraRequired = bridge.includeLibra === true;
     const gradiaRequired = bridge.includeGradia === true;
     const liaRequired = bridge.includeLiaLivePersona === true && isLiaLivePersonaId(sourceLivePersonaId);
-    const libraOptions = {
+    const libraOptions = withLegacyLibraWorldAdditionalExpectation({
       targetChatId, transferId,
       expectedRecords: libraRecords,
-      expectedWorldAdditional: libraWorldAdditional,
       expectedArchiveId: text(bridge.libraArchiveId || ''),
       expectedArchiveGeneration: Math.max(0, Number(bridge.libraArchiveGeneration || 0) || 0),
       expectedArchiveDigest: text(bridge.libraArchiveDigest || '')
-    };
+    }, libraWorldAdditional);
     const gradiaOptions = {
       targetChatId, transferId,
       expectedStoryArc: gradiaStoryArc,
@@ -7363,7 +8450,8 @@
       adoptFlashbackSessionHandoff({
         targetChatId, transferId,
         sourceScopeKey: text(bridge.sourceFlashbackScopeKey || ''),
-        expectedRecords: flashbackRequired ? flashbackRecords : 0
+        expectedRecords: flashbackRequired ? flashbackRecords : 0,
+        expectedSourceStorageFingerprint: text(bridge.sourceFlashbackFingerprint || '')
       }),
       adoptHayakuSessionHandoff({
         targetChatId, transferId,
@@ -7372,7 +8460,7 @@
       }),
       libraRequired
         ? adoptLibraSessionHandoffDurable(libraOptions)
-        : Promise.resolve({ schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: true, durable: true, records: 0, expectedRecords: 0, worldAdditional: 0, expectedWorldAdditional: 0, reason: 'no_libra_data' }),
+        : Promise.resolve({ schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: true, durable: true, records: 0, expectedRecords: 0, reason: 'no_libra_data' }),
       gradiaRequired
         ? adoptGradiaSessionHandoffDurable(gradiaOptions)
         : Promise.resolve({ schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: true, durable: true, storyArc: 0, expectedStoryArc: 0, writerDesign: 0, expectedWriterDesign: 0, narrativeArchive: 0, expectedNarrativeArchive: 0, reason: 'no_gradia_data' }),
@@ -7383,7 +8471,7 @@
     // both mutation and verification.
     const libraVerification = libraRequired
       ? await verifyDurableLibraSessionHandoff({ included: true, ...libraOptions })
-      : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: true, durable: true, records: 0, expectedRecords: 0, worldAdditional: 0, expectedWorldAdditional: 0, reason: 'no_libra_data' };
+      : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: true, durable: true, records: 0, expectedRecords: 0, reason: 'no_libra_data' };
     const gradiaAdoption = gradiaRequired && gradiaAdoptionInitial?.verified !== true
       ? await verifyDurableGradiaSessionHandoff({ included: true, ...gradiaOptions })
       : gradiaAdoptionInitial;
@@ -7392,6 +8480,8 @@
       flashbackAdoption?.ok === true
       && flashbackAdoption?.verified === true
       && flashbackAdoption?.durable === true
+      && flashbackAdoption?.sourcePreserved === true
+      && text(flashbackAdoption?.handoffContract || '') === FLASHBACK_REQUIRED_HANDOFF_CONTRACT
       && Number(flashbackAdoption?.records || 0) === flashbackRecords
     );
     const hayakuVerified = !hayakuRequired || (
@@ -7418,7 +8508,7 @@
       liaRequired, liaVerified
     });
     const ownerStatus = {
-      flashback: { required: flashbackRequired, verified: flashbackVerified, durable: flashbackAdoption?.durable === true, reason: text(flashbackAdoption?.reason || ''), receipt: clone(flashbackAdoption, {}) },
+      flashback: { required: flashbackRequired, verified: flashbackVerified, durable: flashbackAdoption?.durable === true, sourcePreserved: flashbackAdoption?.sourcePreserved === true, reason: text(flashbackAdoption?.reason || ''), receipt: clone(flashbackAdoption, {}) },
       hayaku: { required: hayakuRequired, verified: hayakuVerified, durable: hayakuAdoption?.durable === true, reason: text(hayakuAdoption?.reason || ''), receipt: clone(hayakuAdoption, {}) },
       libra: { required: libraRequired, verified: libraVerified, durable: libraVerification?.durable === true, reason: text(libraVerification?.reason || libraAdoption?.reason || ''), receipt: clone(libraVerification, {}) },
       gradia: { required: gradiaRequired, verified: gradiaVerified, durable: gradiaAdoption?.durable === true, reason: text(gradiaAdoption?.reason || ''), receipt: clone(gradiaAdoption, {}) },
@@ -7433,6 +8523,12 @@
       completedAt: ok ? Date.now() : 0,
       lastError: ok ? '' : 'one_or_more_required_owner_handoffs_not_verified'
     });
+    if (!ok) {
+      const failedOwners = Object.entries(ownerStatus)
+        .filter(([, status]) => status?.required === true && status?.verified !== true)
+        .map(([owner, status]) => ({ owner, reason: text(status?.reason || 'not_verified'), receipt: clone(status?.receipt, {}) }));
+      warn('Next-session handoff remains incomplete', { targetChatId, transferId, attempt, failedOwners });
+    }
     const result = {
       ok,
       schema: HANDOFF_SCHEMA,
@@ -7501,6 +8597,21 @@
     return await promise;
   };
 
+  const waitForActiveNextSessionChat = async (targetChatId, timeoutMs = 5000) => {
+    const wanted = text(targetChatId || '').trim();
+    const deadline = Date.now() + Math.max(500, Number(timeoutMs || 5000) || 5000);
+    let lastChatId = '';
+    do {
+      try {
+        const current = await getCurrentContext();
+        lastChatId = contextIdentity(current).chatId;
+        if (lastChatId === wanted) return { active: true, chatId: lastChatId };
+      } catch (_) {}
+      await delay(80);
+    } while (Date.now() < deadline);
+    return { active: false, chatId: lastChatId };
+  };
+
   const continueToNextSession = async () => {
     const pending = await inspectPendingNextSessionHandoff();
     if (pending.pending) {
@@ -7511,6 +8622,14 @@
     }
     const preview = await inspectTransition();
     const { context, identity, flashback, hayaku, libra, gradia, pendingColdStart } = preview;
+    const compatibilitySuite = await inspectCompatibilitySuite(preview, { timeoutMs: 3800, forceProbe: true });
+    if (!compatibilitySuite.compatible) {
+      const blocking = (compatibilitySuite.blocking || []).map(item => `${item.label}: ${item.reason}`).join(' / ');
+      const error = new Error(`RE:TRACE 호환성 검사를 통과하지 못해 다음 세션 승계를 중단했습니다. ${blocking}`);
+      error.code = 'RETRACE_PEER_COMPATIBILITY_BLOCKED';
+      error.compatibilitySuite = compatibilitySuite;
+      throw error;
+    }
     if (!identity.chatId) throw new Error('현재 채팅에 안정적인 id가 없습니다.');
     if (flashback.integrityOk === false) {
       throw new Error(`Flashback 원장이 완전하지 않아 다음 세션 승계를 중단했습니다. ${JSON.stringify({
@@ -7521,6 +8640,28 @@
         corruptShards: Math.max(0, Number(flashback.corruptShards || 0) || 0),
         recordCountMismatch: flashback.recordCountMismatch === true
       })}`);
+    }
+    const flashbackRecordCountForHandoff = Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0);
+    let flashbackHandoffCapability = null;
+    let flashbackSourceIntegrity = null;
+    if (flashbackRecordCountForHandoff > 0) {
+      flashbackHandoffCapability = await inspectFlashbackNonDestructiveHandoffCapability();
+      if (!flashbackHandoffCapability.supported) {
+        throw new Error(`Flashback의 공통 비파괴 승계 계약을 확인할 수 없어 승계를 중단했습니다. 버전 번호가 아니라 ${RETRACE_PEER_COMPATIBILITY_SCHEMA} 계약을 확인합니다. ${JSON.stringify({
+          pluginVersion: flashbackHandoffCapability.pluginVersion,
+          requiredContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+          reason: flashbackHandoffCapability.reason
+        })}`);
+      }
+      const sourceScopeKey = text(flashback.sourceScope?.scopeKey || '').trim();
+      if (!sourceScopeKey) throw new Error('Flashback 원본 scope를 확인할 수 없어 다음 세션 승계를 중단했습니다.');
+      flashbackSourceIntegrity = await flashbackSourceStorageIntegritySnapshotForRetrace(sourceScopeKey);
+      if (flashbackSourceIntegrity.legacyCompacted) {
+        throw new Error('Flashback 원본이 구형 handoff에 의해 archive-only로 compact된 상태입니다. Flashback v0.11.3의 원본 복구를 먼저 완료한 뒤 다시 시도하세요.');
+      }
+      if (flashbackSourceIntegrity.missingShards > 0) {
+        throw new Error(`Flashback 원본 shard가 ${flashbackSourceIntegrity.missingShards}개 누락되어 비파괴 승계를 시작하지 않습니다.`);
+      }
     }
     if (libra.pluginAvailable && libra.integrityOk === false) {
       const inspectionFailed = ['libra_inspect_timeout', 'libra_inspect_failed'].includes(text(libra.reason));
@@ -7539,29 +8680,22 @@
         narrativeArchive: gradia.narrativeArchiveCount, integrity: gradia.integrity, errors: gradia.errors || []
       })}`);
     }
-    const gradiaArchiveHandoffSupported = gradia?.capabilities?.features?.narrativeArchiveHandoff === true;
-    if (gradia.pluginAvailable
-      && versionAtLeast(gradia.pluginVersion, '0.25.32')
-      && !versionAtLeast(gradia.pluginVersion, '0.25.37')
-      && !gradiaArchiveHandoffSupported) {
-      throw new Error(`GRADIA ${gradia.pluginVersion || '0.25.32-0.25.36'} includes Narrative Archive but does not expose durable Archive session handoff. Update GRADIA to v0.25.37 or later before creating the next session.`);
-    }
     const targetChatId = uuid();
     const transferId = uuid();
     const createdAt = Date.now();
     const sourceLivePersonaId = text(identity.personaId || '').trim();
     const liaRequired = isLiaLivePersonaId(sourceLivePersonaId);
+    const libraPrepareOptions = withLegacyLibraWorldAdditionalExpectation({
+      transferId,
+      expectedRecords: libra.recordCount
+    }, libra.worldAdditionalCount);
     const libraPreparation = preview.includeLibra
-      ? await prepareLibraSessionHandoff({
-        transferId,
-        expectedRecords: libra.recordCount,
-        expectedWorldAdditional: libra.worldAdditionalCount
-      })
-      : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, prepared: false, records: 0, worldAdditional: 0, reason: 'no_libra_data' };
+      ? await prepareLibraSessionHandoff(libraPrepareOptions)
+      : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, prepared: false, records: 0, reason: 'no_libra_data' };
     if (preview.includeLibra && (
       libraPreparation.prepared !== true
       || Number(libraPreparation.records || 0) !== Number(libra.recordCount || 0)
-      || Number(libraPreparation.worldAdditional || 0) !== Number(libra.worldAdditionalCount || 0)
+      || !libraLegacyWorldAdditionalMatches(libraPreparation, libraPrepareOptions)
     )) {
       throw new Error(`LIBRA next-session handoff preparation failed before creating the new chat: ${libraPreparation.reason || 'record_count_mismatch'}`);
     }
@@ -7607,7 +8741,7 @@
           transferId, sourceChatId: identity.chatId, targetChatId,
           sourceScopeKey: text(libra.scope?.scopeKey || ''),
           recordCount: libra.recordCount,
-          worldAdditionalCount: libra.worldAdditionalCount,
+          ...(Number(libra.worldAdditionalCount || 0) > 0 ? { worldAdditionalCount: libra.worldAdditionalCount } : {}),
           archiveId: text(libraPreparation?.archiveId || ''),
           archiveGeneration: Math.max(0, Number(libraPreparation?.archiveGeneration || 0) || 0),
           archiveDigest: text(libraPreparation?.archiveDigest || ''),
@@ -7631,10 +8765,18 @@
       memorySessionBridge: {
         schema: HANDOFF_SCHEMA,
         timelineContract: 'session_epoch_then_completed_pair_v1',
-        storageContract: 'shared_archive_reference_v1',
+        storageContract: 'immutable_source_shared_archive_reference_v2',
+        compatibilitySchema: RETRACE_PEER_COMPATIBILITY_SCHEMA,
+        compatibilityProtocolMajor: RETRACE_PEER_PROTOCOL_MAJOR,
+        handoffContract: FLASHBACK_REQUIRED_HANDOFF_CONTRACT,
+        sourcePreservationRequired: true,
+        sourceMutationAllowed: false,
+        sourceCompactionAllowed: false,
         transferId,
         sourceChatId: identity.chatId,
         sourceFlashbackScopeKey: text(flashback.sourceScope?.scopeKey || ''),
+        sourceFlashbackFingerprint: text(flashbackSourceIntegrity?.fingerprint || ''),
+        sourceFlashbackOwnerVersion: text(flashbackHandoffCapability?.pluginVersion || flashback.pluginVersion || ''),
         sourceHayakuScopeKey: text(hayaku.scope?.scopeKey || ''),
         sourceLibraScopeKey: text(libra.scope?.scopeKey || ''),
         sourceGradiaStoryArcScopeKey: text(gradia.scope?.storyArcScopeKey || ''),
@@ -7650,7 +8792,7 @@
         flashbackRecordCount: Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0),
         hayakuRecordCount: preview.hayakuRecordCount,
         libraRecordCount: libra.recordCount,
-        libraWorldAdditionalCount: libra.worldAdditionalCount,
+        ...(Number(libra.worldAdditionalCount || 0) > 0 ? { libraWorldAdditionalCount: libra.worldAdditionalCount } : {}),
         gradiaStoryArcCount: gradia.storyArcCount,
         gradiaWriterDesignCount: gradia.writerDesignCount,
         gradiaNarrativeArchiveCount: gradia.narrativeArchiveCount,
@@ -7702,12 +8844,21 @@
     if (latestIdentity.characterId !== identity.characterId || latestIdentity.chatId !== identity.chatId) {
       throw new Error('전환 준비 중 활성 캐릭터 또는 채팅이 바뀌었습니다.');
     }
+    if (flashbackSourceIntegrity?.fingerprint) {
+      const latestFlashbackSourceIntegrity = await flashbackSourceStorageIntegritySnapshotForRetrace(text(flashback.sourceScope?.scopeKey || ''));
+      const sourceComparison = compareFlashbackSourceStorageIntegrityForRetrace(flashbackSourceIntegrity, latestFlashbackSourceIntegrity);
+      if (!sourceComparison.identical) {
+        throw new Error(`Flashback 원본이 다음 세션 준비 중 변경되어 승계를 중단했습니다. ${JSON.stringify({ changed: sourceComparison.changed })}`);
+      }
+    }
     if (preview.includeLibra) {
       const latestLibra = await readLibraSource(latest, { includeRecords: false });
+      const legacyWorldAdditionalChanged = Math.max(0, Number(libra.worldAdditionalCount || 0) || 0) > 0
+        && latestLibra.worldAdditionalCount !== libra.worldAdditionalCount;
       if (!latestLibra.integrityOk
-        || latestLibra.snapshotHash !== libra.snapshotHash
+        || latestLibra.canonicalStateHash !== libra.canonicalStateHash
         || latestLibra.recordCount !== libra.recordCount
-        || latestLibra.worldAdditionalCount !== libra.worldAdditionalCount) {
+        || legacyWorldAdditionalChanged) {
         throw new Error('LIBRA canonical memory changed during handoff preparation. Run the transition again.');
       }
     }
@@ -7722,6 +8873,19 @@
       }
     }
     const writer = await saveCharacter(nextCharacter, context.characterIndex);
+    const activation = await waitForActiveNextSessionChat(targetChatId, 5000);
+    if (!activation.active) {
+      throw new Error(`새 RE:TRACE 세션은 저장되었지만 대상 채팅 활성화가 아직 완료되지 않았습니다. 새 세션을 선택한 뒤 이어서 실행하세요. target=${targetChatId} active=${activation.chatId || '(unknown)'}`);
+    }
+    if (flashbackSourceIntegrity?.fingerprint) {
+      const activatedFlashbackSourceIntegrity = await flashbackSourceStorageIntegritySnapshotForRetrace(text(flashback.sourceScope?.scopeKey || ''));
+      const sourceComparison = compareFlashbackSourceStorageIntegrityForRetrace(flashbackSourceIntegrity, activatedFlashbackSourceIntegrity);
+      if (!sourceComparison.identical) {
+        const error = new Error(`Flashback 원본이 새 세션 활성화 과정에서 변경되었습니다. owner handoff를 실행하지 않습니다. ${JSON.stringify({ changed: sourceComparison.changed })}`);
+        error.code = 'SOURCE_MUTATION_DETECTED';
+        throw error;
+      }
+    }
     const persistedPending = await inspectPendingNextSessionHandoff({ targetChatId });
     if (!persistedPending.available
       || !persistedPending.pending
@@ -8138,11 +9302,18 @@
       .settings-feature-group{margin-bottom:11px}.settings-feature-group-head{display:grid;gap:3px;margin-bottom:12px}.settings-feature-group-head h4{margin:0;font-size:15px}.settings-feature-group-head p{margin:0;color:var(--lra-text-3)}.settings-feature-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 14px}.fld{display:grid;gap:5px}.fld[hidden]{display:none!important}.fld span{font-weight:650}.fld small{color:var(--lra-text-3)}.fld input,.fld select,.fld textarea,.provider-model-catalog select{width:100%;min-height:34px;padding:6px 9px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface);color:var(--lra-text);font:12px inherit}.fld textarea{min-height:76px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.fld input:focus,.fld select:focus,.fld textarea:focus,.provider-model-catalog select:focus{outline:0;border-color:var(--lra-primary);box-shadow:inset 0 0 0 1px var(--lra-primary)}.field-wide,.profile-actions{grid-column:1/-1}.settings-callout{padding:10px 11px;border:1px solid color-mix(in srgb,var(--lra-primary) 18%,var(--lra-line));border-radius:10px;background:var(--lra-primary-soft);color:var(--lra-text-2)}.provider-model-catalog{display:grid;gap:8px;padding:10px 11px;border:1px solid var(--lra-line);border-radius:12px;background:var(--lra-surface-2)}.provider-model-catalog-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.provider-model-catalog-head>span{font-weight:750}.provider-model-catalog-head>em{font-style:normal;padding:2px 7px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px;font-weight:800}.provider-model-actions{display:flex;align-items:center;gap:7px}.provider-model-catalog small{color:var(--lra-text-3)}.provider-model-catalog select[hidden]{display:none!important}.provider-advanced{padding:10px 11px;border:1px solid var(--lra-line);border-radius:12px;background:var(--lra-surface-2)}.provider-advanced summary{cursor:pointer;font-weight:750;color:var(--lra-text-2)}.provider-danger-zone{border-color:color-mix(in srgb,var(--lra-red) 22%,var(--lra-line))}.advanced-grid{margin-top:12px}.reasoning-hint{padding:9px 10px;border:1px solid var(--lra-line);border-radius:9px;background:var(--lra-surface);color:var(--lra-text-3)}.advanced-note{display:grid;gap:2px;padding:9px 10px;border:1px solid var(--lra-line);border-radius:9px;background:var(--lra-surface);color:var(--lra-text-3)}.advanced-note strong{color:var(--lra-text);font-size:11px}.advanced-note-warning{border-color:color-mix(in srgb,var(--lra-red) 24%,var(--lra-line));background:color-mix(in srgb,var(--lra-red) 5%,var(--lra-surface))}
       .analysis-console{display:grid;gap:11px}.analysis-console-head{display:flex;align-items:center;gap:10px}.analysis-console-head strong{font-size:14px}.analysis-console-head span{margin-left:auto;padding:3px 8px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:10px;font-weight:800}.analysis-progress-track{height:9px;overflow:hidden;border-radius:999px;background:var(--lra-surface-2);border:1px solid var(--lra-line)}.analysis-progress-bar{height:100%;width:0;background:linear-gradient(90deg,var(--lra-primary),#8869e9);transition:width .25s ease}.analysis-progress-summary{display:flex;justify-content:space-between;gap:12px;color:var(--lra-text-2);font-size:11px}.analysis-console-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px}.analysis-console-metrics div{padding:8px;border:1px solid var(--lra-line);border-radius:10px;background:var(--lra-surface-2);display:grid;gap:2px}.analysis-console-metrics span{color:var(--lra-text-3);font-size:9px}.analysis-console-metrics b{font-size:12px}.analysis-current{padding:9px 10px;border-radius:10px;background:var(--lra-primary-soft);color:var(--lra-primary);font-weight:700;white-space:pre-line}.analysis-log{max-height:190px;overflow:auto;margin:0;padding:9px 11px;border:1px solid var(--lra-line);border-radius:10px;background:#111622;color:#d8e0f0;font:10px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word}.analysis-log .log-time{color:#8492aa}.analysis-log .log-error{color:#ff9ca4}.analysis-console-card[data-state="failed"]{border-color:color-mix(in srgb,var(--lra-red) 35%,var(--lra-line))}.analysis-console-card[data-state="completed"]{border-color:color-mix(in srgb,var(--lra-green) 35%,var(--lra-line))}
       .empty{min-height:220px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;color:var(--lra-text-3);border:1px dashed var(--lra-line);border-radius:14px}.empty strong{color:var(--lra-text)}.busy .status-dot{background:var(--lra-primary)}
+      .compatibility-panel{border:1px solid var(--lra-line);border-radius:16px;padding:14px;background:var(--lra-surface);display:flex;flex-direction:column;gap:12px;margin-bottom:14px}
+      .compatibility-panel.compat-ok{border-color:color-mix(in srgb,var(--lra-green) 42%,var(--lra-line));background:color-mix(in srgb,var(--lra-green) 5%,var(--lra-surface))}
+      .compatibility-panel.compat-warn{border-color:color-mix(in srgb,#d8a52f 48%,var(--lra-line));background:color-mix(in srgb,#d8a52f 6%,var(--lra-surface))}
+      .compatibility-panel.compat-bad{border-color:color-mix(in srgb,#d75050 48%,var(--lra-line));background:color-mix(in srgb,#d75050 6%,var(--lra-surface))}
+      .compatibility-panel.acknowledged{opacity:.82}
+      .compatibility-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.compatibility-head>div{display:flex;flex-direction:column;gap:4px}.compatibility-head strong{font-size:15px}.compatibility-head span{font-size:12px;color:var(--lra-text-2);line-height:1.55}.compatibility-head em{font-style:normal;font-size:11px;font-weight:800;white-space:nowrap;padding:5px 8px;border-radius:999px;background:var(--lra-surface-3)}
+      .compat-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.compat-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 10px;padding:9px 10px;border:1px solid var(--lra-line);border-radius:11px;background:var(--lra-surface-2)}.compat-row small{grid-column:1/-1;color:var(--lra-text-2);line-height:1.4}.compat-row.bad{border-color:color-mix(in srgb,#d75050 46%,var(--lra-line))}.compat-row.muted{opacity:.68}.compat-name{display:flex;align-items:center;gap:6px;min-width:0}.compat-name>span{font-size:11px;color:var(--lra-text-2)}.compat-state{font-size:11px;font-weight:800}.compat-row.ok .compat-state{color:var(--lra-green)}.compat-row.bad .compat-state{color:#b83d3d}.compat-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
       @media(max-width:820px){.session-handoff-flow{grid-template-columns:1fr 1fr}.bridge{grid-template-columns:78px minmax(0,1fr)}.side{padding:10px 7px}.nav-group-label,.nav>span:not(.ic),.scope-card,.version{display:none}.nav{justify-content:center;padding:6px}.panel{padding:18px 14px 70px}.flow,.metrics{grid-template-columns:1fr 1fr}}
       @media(max-width:560px){.session-handoff-flow{grid-template-columns:1fr}.bridge{height:100dvh;max-height:100dvh;border-radius:0;grid-template-columns:64px minmax(0,1fr);grid-template-rows:62px minmax(0,1fr)}.top{padding:0 10px}.brand span,.global-status{display:none}.flow,.metrics,.settings-feature-grid,.packet-sections,.analysis-console-metrics{grid-template-columns:1fr}.ledger-key small{display:none}.field-wide,.profile-actions{grid-column:1}}
     </style>
     <div class="bridge${Runtime.busy ? ' busy' : ''}">
-      <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>LIBRA · HAYAKU · Flashback · LIA Continuity</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="closeBridge" class="btn">닫기</button></div></header>
+      <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>FLASHBACK · HAYAKU · LIBRA · GRADIA · LIA Compatibility Hub</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="closeBridge" class="btn">닫기</button></div></header>
       <aside class="side">
         <div class="nav-group-label">Operations</div>
         <button class="nav ${Runtime.activeTab === 'session' ? 'active' : ''}" data-tab="session"><span class="ic">↪</span><span>다음 세션</span></button>
@@ -8157,10 +9328,11 @@
       </aside>
       <main class="main">
         <section class="panel ${Runtime.activeTab === 'session' ? 'active' : ''}" data-panel="session">
-          <div class="panel-heading"><div><h2>다음 세션</h2><p>LIBRA, GRADIA, HAYAKU, Flashback의 연속성 데이터를 새 채팅으로 함께 승계합니다.</p></div></div>
-          <div class="card"><div class="heading"><div><strong>대화 이어가기</strong><span>새 채팅 저장 직후 세 시스템의 승계 계약과 영속 반영을 검증합니다.</span></div><em class="badge">원본 보존</em></div>
-            <div class="flow session-handoff-flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · GRADIA</b><small>Story Arc의 다음 5턴 비트·Writer/OOC·Narrative Archive를 새 세션 기준으로 재결속</small></div><div><b>3 · Flashback</b><small>이전 기억을 영구 과거로 즉시 채택·검증</small></div><div><b>4 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>5 · LIA</b><small>활성 Live Persona를 새 채팅 전용 Persona로 Fork·재바인딩</small></div><div><b>6 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
-            <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">LIBRA는 공식 IPC로 pluginStorage 정본을 이전 세션 영구 기억에 채택합니다. GRADIA는 Story Arc를 새 세션의 로컬 TURN 1~5 기준으로 재기준화하고 Writer/OOC를 독립 스코프로 옮기며, Narrative Archive는 과거 세션의 휴면 서사 기록으로 승계합니다. Flashback과 HAYAKU도 각 공식 채택 경로를 사용합니다.</p>
+          <div class="panel-heading"><div><h2>다음 세션</h2><p>RE:TRACE가 FLASHBACK, HAYAKU, LIBRA, GRADIA, LIA의 호환 계약과 원본 보존을 확인한 뒤 새 세션을 승계합니다.</p></div></div>
+          <div id="compatibilityPanel" class="compatibility-panel checking"><div class="compatibility-head"><div><strong>6개 플러그인 호환성</strong><span>공통 승계 계약을 확인하는 중입니다.</span></div><em>CHECKING</em></div></div>
+          <div class="card"><div class="heading"><div><strong>대화 이어가기</strong><span>새 채팅 저장 전후로 다섯 owner 플러그인의 비파괴 승계 계약과 영속 반영을 검증합니다.</span></div><em class="badge">원본 보존</em></div>
+            <div class="flow session-handoff-flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · GRADIA</b><small>Story Arc의 다음 5턴 비트·Writer/OOC·Narrative Archive를 새 세션 기준으로 재결속</small></div><div><b>3 · Flashback</b><small>원본은 그대로 보존하고 immutable archive reference만 새 세션에 연결·검증</small></div><div><b>4 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>5 · LIA</b><small>활성 Live Persona를 새 채팅 전용 Persona로 Fork·재바인딩</small></div><div><b>6 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
+            <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">모든 owner는 RE:TRACE 공통 호환 계약을 통과해야 합니다. 승계 과정은 원본 세션의 정본/원장/벡터/바인딩을 삭제·비우기·compact·이동하지 않으며, 새 세션은 immutable archive/reference 또는 안전한 fork를 통해 과거 기억을 실제 조회 가능한 상태로 이어받습니다.</p>
             <div class="actions"><button id="refreshTransition" class="btn">다시 확인</button><button id="createSession" class="btn primary">다음 세션 만들기</button></div>
           </div>
         </section>
@@ -8308,6 +9480,7 @@
           .map(([owner]) => owner)
           .join(', ');
         node.textContent = `미완료 다음 세션 handoff가 있습니다. 같은 target/transfer로 재시도합니다.\n실패 또는 미검증 owner: ${failedOwners || '확인 중'}`;
+        await refreshCompatibility(preview).catch(error => warn('compatibility refresh failed', error));
         return preview;
       }
       if (scopeNode) scopeNode.textContent = compact(preview.context?.chat?.name || preview.identity.chatId || '현재 채팅', 44);
@@ -8332,6 +9505,7 @@
             : `GRADIA 연결됨 · 승계할 Story Arc/Writer/Narrative Archive 상태 없음 (${preview.gradia.reason})`
           : 'GRADIA IPC 연결 없음 · GRADIA v0.25.25+ 필요';
       node.textContent = `${libraLine}\n${gradiaLine}\n${flashbackLine}\n${hayakuLine}`;
+      await refreshCompatibility(preview).catch(error => warn('compatibility refresh failed', error));
       return preview;
     } catch (error) {
       node.textContent = `확인 실패: ${error?.message || error}`;
@@ -8698,6 +9872,7 @@
       });
     }
     root.querySelector('#refreshTransition')?.addEventListener('click', () => refreshTransition());
+    bindCompatibilityControls();
     root.querySelector('#refreshColdStart')?.addEventListener('click', () => refreshColdStart());
     root.querySelector('#refreshIncrementalRecovery')?.addEventListener('click', () => refreshIncrementalRecovery());
     root.querySelector('#refreshLibra')?.addEventListener('click', () => refreshLibra());
@@ -9038,6 +10213,13 @@
       setBusy(true);
       try {
         const preview = await inspectTransition();
+        const compatibilitySuite = await inspectCompatibilitySuite(preview, { timeoutMs: 3800, forceProbe: true });
+        renderCompatibilitySuite(compatibilitySuite);
+        if (!compatibilitySuite.compatible) {
+          const blocking = (compatibilitySuite.blocking || []).map(item => `${item.label}: ${item.reason}`).join('\n');
+          globalThis.alert?.(`다음 세션 승계를 시작할 수 없습니다.\n\n${blocking}\n\nRE:TRACE 홈 상단의 호환성 패널에서 각 플러그인의 계약 상태를 확인하세요.`);
+          return;
+        }
         if (preview.pendingHandoff?.pending) {
           const retryMessage = '미완료 다음 세션 handoff를 같은 target/transfer로 다시 검증합니다. 새 채팅은 추가로 만들지 않습니다.\n\n계속할까요?';
           if (typeof globalThis.confirm === 'function' && !globalThis.confirm(retryMessage)) return;
@@ -9067,7 +10249,14 @@
         if (typeof globalThis.confirm === 'function' && !globalThis.confirm(message)) return;
         const result = await continueToNextSession();
         if (!result.ok) {
-          globalThis.alert?.(`새 채팅은 보존되었지만 필수 owner handoff가 아직 미완료입니다. 같은 버튼으로 동일 target/transfer를 재시도할 수 있습니다.\ntransferId: ${result.transferId}`);
+          const failedOwners = [
+            result.flashbackVerified ? '' : result.flashbackRecords > 0 ? `Flashback: ${result.flashbackAdoption?.reason || 'not_verified'}` : '',
+            result.hayakuVerified ? '' : result.hayakuRecords > 0 ? `HAYAKU: ${result.hayakuAdoption?.reason || 'not_verified'}` : '',
+            result.libraVerified ? '' : result.libraScheduled ? `LIBRA: ${result.libraVerification?.reason || result.libraAdoption?.reason || 'not_verified'}` : '',
+            result.gradiaVerified ? '' : result.gradiaScheduled ? `GRADIA: ${result.gradiaAdoption?.reason || 'not_verified'}` : '',
+            result.liaVerified ? '' : result.liaRequired ? `LIA: ${result.liaAdoption?.reason || 'not_verified'}` : ''
+          ].filter(Boolean);
+          globalThis.alert?.(`새 채팅은 보존되었지만 일부 승계 대상의 owner handoff가 아직 미완료입니다. 같은 버튼으로 동일 target/transfer를 재시도할 수 있습니다.\ntransferId: ${result.transferId}${failedOwners.length ? `\n\n${failedOwners.join('\n')}` : ''}`);
           await refreshTransition();
           return;
         }
@@ -9199,6 +10388,7 @@
     showUi,
     closeUi,
     inspectTransition,
+    inspectCompatibility: inspectCompatibilitySuite,
     continueToNextSession,
     inspectPendingNextSessionHandoff,
     resumeNextSessionHandoff,
@@ -9236,6 +10426,9 @@
     _test: {
       fnv1a, flashbackKeyHash, flashbackShardChecksum, stableHash64, flashbackShardStorageKey, hayakuScopeFor, contextIdentity,
       requestFlashbackIpc, flashbackSourceFromInspection,
+      inspectFlashbackNonDestructiveHandoffCapability,
+      flashbackSourceStorageIntegritySnapshotForRetrace, compareFlashbackSourceStorageIntegrityForRetrace,
+      verifyFlashbackSessionHandoffFromStorage,
       requestHayakuIpc,
       normalizeHayakuPacketAuthoringProfile, fallbackHayakuPacketAuthoringProfile,
       buildBridgeHayakuAuthoringPrompt, bridgeHayakuPromptSet,
@@ -9251,6 +10444,7 @@
       validateBridgeCapsulePacketSet, bridgePacketHasSemanticPayload, priorTurnContextForChunk,
       requestLibraIpc, probeLibraIpc, normalizeLibraInspection, readLibraSource,
       requestGradiaIpc, probeGradiaIpc, normalizeGradiaInspection, readGradiaSource,
+      peerCompatibilityPayload, evaluatePeerCompatibility, inspectCompatibilitySuite, probeUniversalPeerCompatibility, sourcePreservationReceiptMatches,
       requestLiaIpc, adoptLiaLivePersonaHandoff, liaAdoptionReceiptMatches, isLiaLivePersonaId,
       prepareLibraSessionHandoff, adoptLibraSessionHandoff, adoptLibraSessionHandoffDurable, verifyDurableLibraSessionHandoff,
       prepareGradiaSessionHandoff, adoptGradiaSessionHandoff, adoptGradiaSessionHandoffDurable, verifyDurableGradiaSessionHandoff,
@@ -9290,6 +10484,7 @@
     await unloadApi.onUnload(async () => {
       Runtime.visible = false;
       stopAnalysisRefreshTimer();
+      cancelCompatibilityAutoRetry();
       for (const pending of Runtime.flashbackIpcPending.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error('RE:TRACE unloaded before Flashback IPC completed.'));

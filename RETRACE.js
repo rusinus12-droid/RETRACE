@@ -1,7 +1,7 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.27
+//@version 1.9.35
 //@allowed-ipc libra
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
@@ -11,6 +11,14 @@
 //@description LIBRA, GRADIA, HAYAKU, Flashback, and LIA Live Persona continuity analysis and next-session handoff bridge
 //@author Hayaku
 
+/* v1.9.35 fixes RE:TRACE runtime version reporting and hardens current-chat resolution against RisuAI's transient chat selection race. getCurrentChatIndex() may briefly throw while the host's character/chat page is switching; RE:TRACE now treats that as a soft host-context miss, falls back to the already-read character.chatPage when valid, retries the indexed resolver with short bounded delays, and only fails after both indexed and direct context paths are unavailable. This prevents the compatibility/transition panel from showing Cannot read properties of undefined (reading 'chatPage') while preserving exact character/chat identity checks before handoff writes. */
+/* v1.9.34 gives GRADIA next-session owner handoff storage-safe IPC budgets instead of the old 6s prepare/verify ceiling: prepare/adopt now allow up to 90s and verify up to 60s, the GRADIA IPC transport cap is raised to 120s, and owner-side rejected receipts are no longer redundantly retried through the shared-runtime fallback. This prevents a healthy but storage-busy GRADIA prepare_session_handoff from aborting before target chat creation while preserving fail-closed receipt validation. */
+/* v1.9.33 hardens LIBRA handoff error handling: remote owner rejections such as SOURCE_MUTATION_DETECTED are no longer retried through the same runtime API, while genuine IPC transport failures may still fall back. LIBRA IPC remote error codes are preserved when available so diagnostics distinguish transport failure from owner-side fail-closed safety checks. */
+/* v1.9.32 makes FLASHBACK summary inspection fail-fast instead of waiting 8 seconds on every RE:TRACE refresh: summary IPC now uses a short timeout, concurrent summary reads share one in-flight request, a one-minute circuit breaker skips repeated stalled inspect calls and goes straight to the already-supported pluginStorage summary, expected summary timeouts are recorded in the debug export without noisy repeated console warnings, and any successful FLASHBACK inspect closes the circuit immediately. Full-record and handoff mutation timeouts remain unchanged. */
+/* v1.9.31 fixes the in-panel confirmation regression introduced by v1.9.30: setBusy(true) no longer disables the RE:TRACE dialog confirm/cancel controls, and showRetraceDialog() force-enables its own controls before display so '승계 시작' remains clickable while background actions stay locked. */
+/* v1.9.30 removes native window.confirm/window.alert dependencies from RE:TRACE UI actions and replaces them with an in-panel DOM dialog, preventing Tauri dialog IPC from being blocked by about:srcdoc CSP before continueToNextSession() can run. It also classifies already-materialized HAYAKU recovery_snapshot slot heads even after the RE:TRACE recovery capsule has been consumed, so a 9 current + 4 recovery ledger is displayed and handed off as Total 13 / Current 9 / Recovery 4 instead of Total 13 / Current 13 / Recovery 0. */
+/* v1.9.29 reconciles stale HAYAKU handoff journals against the already-verified target pluginStorage archive before retrying owner IPC, so a target that HAYAKU has durably adopted is no longer reported forever as an unverified owner. It also adds a privacy-scrubbed RE:TRACE debug-log exporter to the top bar; the export is read-only, redacts credentials, omits raw chat/memory bodies, and includes current handoff journal, owner counts, HAYAKU durable readback, IPC health, compatibility state, and recent warnings. */
+/* v1.9.28 makes RE:TRACE account for its own HAYAKU incremental-recovery capsules as first-class recovery_snapshot memory in both the read-only HAYAKU viewer and next-session handoff planning. Recovery adoption is now verified from durable packet bodies/turn coverage instead of trusting lastRecoveryId alone; viewer accounting shows Current/Recovery/Archive separately and can project any verified-but-not-yet-materialized recovery packets read-only; transition expectedRecords includes missing recovery capsule entries without mutating the source session, so HAYAKU owner handoff can archive the full current+recovery set and verify the exact total. */
 /* v1.9.27 removes the user-facing '필수/비필수' labels from the compatibility panel. Participation-aware safety checks remain internal: the panel now describes only connection/compatibility state, so optional plugin absence is not visually misread as a global installation requirement. */
 /* v1.9.26 fixes false HAYAKU '필수 누락' states: compatibility checks now bypass stale IPC cooldowns on retry, distinguish ledger-detected installation from an actually missing plugin, consume HAYAKU's shared compatibility beacon when available, and optionally verify enabled plugin metadata/source markers when the owner channel is temporarily unreachable. Required handoff still remains fail-closed until the live HAYAKU owner IPC answers. */
 /* v1.9.25 added a shared-runtime HAYAKU compatibility fallback after plugin-channel capability IPC failure. That fallback helps legacy/shared-realm hosts but API-v3 iframe isolation means it cannot by itself prove another plugin's runtime on normal isolated hosts; v1.9.26 supersedes that limitation with retry, storage-beacon, and installed-metadata diagnostics.
@@ -29,7 +37,7 @@
   'use strict';
 
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.27';
+  const PLUGIN_VERSION = '1.9.35';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v2';
   const HANDOFF_ACCEPTED_SCHEMAS = new Set(['memory-session-bridge-v1', HANDOFF_SCHEMA]);
   const HANDOFF_JOURNAL_SCHEMA = 'memory-session-bridge-handoff-journal-v1';
@@ -62,6 +70,11 @@
   const GRADIA_CAPABILITIES_SCHEMA = 'gradia.retrace.capabilities.v1';
   const GRADIA_HANDOFF_RECEIPT_SCHEMA = 'gradia.session_handoff.receipt.v1';
   const GRADIA_CHAT_HANDOFF_MARKER_SCHEMA = 'retrace.gradia_handoff_marker.v1';
+  const GRADIA_IPC_TIMEOUT_MAX_MS = 120000;
+  const GRADIA_INSPECT_TIMEOUT_MS = 15000;
+  const GRADIA_PREPARE_TIMEOUT_MS = 90000;
+  const GRADIA_ADOPT_TIMEOUT_MS = 90000;
+  const GRADIA_VERIFY_TIMEOUT_MS = 60000;
   const LIA_PLUGIN_ID = 'lia_persona_linker';
   const LIA_IPC_SCHEMA = 'lia-persona-handoff-ipc-v1';
   const LIA_IPC_REQUEST_CHANNEL = 'lia_persona_handoff_request_v1';
@@ -74,7 +87,9 @@
   const FLASHBACK_IPC_REQUEST_CHANNEL = 'flashback_memory_bridge_request_v1';
   const FLASHBACK_IPC_RESPONSE_CHANNEL = 'flashback_memory_bridge_response_v1';
   const FLASHBACK_IPC_TIMEOUT_MAX_MS = 120000;
-  const FLASHBACK_INSPECT_SUMMARY_TIMEOUT_MS = 8000;
+  const FLASHBACK_INSPECT_SUMMARY_TIMEOUT_MS = 1800;
+  const FLASHBACK_INSPECT_SUMMARY_CIRCUIT_MS = 60000;
+  const FLASHBACK_CAPABILITY_TIMEOUT_MS = 8000;
   const FLASHBACK_INSPECT_RECORDS_TIMEOUT_MS = 30000;
   const FLASHBACK_ADOPT_TIMEOUT_MS = 90000;
   const FLASHBACK_LATE_READBACK_TIMEOUT_MS = 6000;
@@ -170,6 +185,13 @@
     flashbackIpcLastSeenAt: 0,
     flashbackIpcLastError: '',
     flashbackIpcLastTimeoutAt: 0,
+    flashbackInspectCircuitUntil: 0,
+    flashbackInspectCircuitTrips: 0,
+    flashbackInspectFallbackCount: 0,
+    flashbackInspectLastFallbackAt: 0,
+    flashbackInspectLastFallbackReason: '',
+    flashbackInspectIpcSuccesses: 0,
+    flashbackInspectSummaryPromise: null,
     hayakuIpcRegistered: false,
     hayakuIpcPending: new Map(),
     hayakuIpcUnavailableUntil: 0,
@@ -185,6 +207,10 @@
     liaIpcPending: new Map(),
     liaIpcLastError: '',
     handoffResumePromises: new Map(),
+    dialogResolver: null,
+    dialogKeyHandler: null,
+    dialogSequence: 0,
+    lastUiDialog: null,
     warnings: []
   };
 
@@ -2037,32 +2063,75 @@
     return normalized;
   };
 
+  const currentContextHostCall = async (label, operation, fallback = null) => {
+    try {
+      return await Promise.resolve().then(operation);
+    } catch (error) {
+      const detail = compact(error?.message || error || '', 180);
+      const chatSelectionRace = /(?:chatPage|reading ['"]chatPage['"]|undefined.*chatPage)/i.test(detail);
+      Runtime.warnings.push({
+        at: Date.now(),
+        message: chatSelectionRace ? 'Current chat selection was transient; retrying context resolution' : 'Current chat host call failed; using fallback',
+        detail: `${text(label)}: ${detail}`
+      });
+      Runtime.warnings = Runtime.warnings.slice(-30);
+      return fallback;
+    }
+  };
+
   const getCurrentContext = async () => {
     const indexed = liveApi(['getCurrentCharacterIndex', 'getCurrentChatIndex', 'getCharacterFromIndex', 'getChatFromIndex']);
     if (indexed) {
-      const [characterIndexRaw, chatIndexRaw] = await Promise.all([
-        indexed.getCurrentCharacterIndex(),
-        indexed.getCurrentChatIndex()
-      ]);
-      const characterIndex = Number(characterIndexRaw);
-      const chatIndex = Number(chatIndexRaw);
-      if (Number.isInteger(characterIndex) && characterIndex >= 0 && Number.isInteger(chatIndex) && chatIndex >= 0) {
-        const [character, chat] = await Promise.all([
-          indexed.getCharacterFromIndex(characterIndex),
-          indexed.getChatFromIndex(characterIndex, chatIndex)
-        ]);
-        if (character && chat) return { character, chat, characterIndex, chatIndex, source: 'indexed' };
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const characterIndexRaw = await currentContextHostCall(
+          attempt ? `retry${attempt}:getCurrentCharacterIndex` : 'getCurrentCharacterIndex',
+          () => indexed.getCurrentCharacterIndex(),
+          -1
+        );
+        const characterIndex = Number(characterIndexRaw);
+        if (Number.isInteger(characterIndex) && characterIndex >= 0) {
+          const character = await currentContextHostCall(
+            attempt ? `retry${attempt}:getCharacterFromIndex` : 'getCharacterFromIndex',
+            () => indexed.getCharacterFromIndex(characterIndex),
+            null
+          );
+          const chatIndexRaw = await currentContextHostCall(
+            attempt ? `retry${attempt}:getCurrentChatIndex` : 'getCurrentChatIndex',
+            () => indexed.getCurrentChatIndex(),
+            -1
+          );
+          let chatIndex = Number(chatIndexRaw);
+          let usedCharacterChatPageFallback = false;
+          if ((!Number.isInteger(chatIndex) || chatIndex < 0) && character) {
+            const characterChatPage = Number(character?.chatPage);
+            if (Number.isInteger(characterChatPage) && characterChatPage >= 0) {
+              chatIndex = characterChatPage;
+              usedCharacterChatPageFallback = true;
+            }
+          }
+          if (character && Number.isInteger(chatIndex) && chatIndex >= 0) {
+            let chat = await currentContextHostCall(
+              attempt ? `retry${attempt}:getChatFromIndex` : 'getChatFromIndex',
+              () => indexed.getChatFromIndex(characterIndex, chatIndex),
+              null
+            );
+            if (!chat && Array.isArray(character?.chats)) chat = character.chats[chatIndex] || null;
+            if (chat) return { character, chat, characterIndex, chatIndex, source: usedCharacterChatPageFallback ? 'indexed_character_chatPage_fallback' : 'indexed' };
+          }
+        }
+        if (attempt < 2) await delay(attempt === 0 ? 45 : 120);
       }
     }
     const direct = liveApi(['getCharacter']) || liveApi(['getChar']) || liveApi();
     const character = typeof direct?.getCharacter === 'function'
-      ? await direct.getCharacter()
+      ? await currentContextHostCall('direct:getCharacter', () => direct.getCharacter(), null)
       : typeof direct?.getChar === 'function'
-        ? await direct.getChar()
+        ? await currentContextHostCall('direct:getChar', () => direct.getChar(), null)
         : null;
     if (!character) throw new Error('현재 캐릭터를 불러올 수 없습니다.');
-    const chats = Array.isArray(character.chats) ? character.chats : [];
-    const chatIndex = Number.isInteger(character.chatPage) ? character.chatPage : 0;
+    const chats = Array.isArray(character?.chats) ? character.chats : [];
+    const directChatPage = Number(character?.chatPage);
+    const chatIndex = Number.isInteger(directChatPage) && directChatPage >= 0 ? directChatPage : 0;
     const chat = chats[chatIndex] || chats[0] || null;
     if (!chat) throw new Error('현재 채팅을 불러올 수 없습니다.');
     return { character, chat, characterIndex: -1, chatIndex, source: 'character' };
@@ -2127,6 +2196,10 @@
         Runtime.flashbackIpcPending.delete(requestId);
         Runtime.flashbackIpcLastSeenAt = Date.now();
         Runtime.flashbackIpcLastError = response.ok === true ? '' : text(response.error || 'Flashback IPC request failed.');
+        if (response.ok === true && pending.action === 'inspect') {
+          Runtime.flashbackInspectCircuitUntil = 0;
+          Runtime.flashbackInspectIpcSuccesses += 1;
+        }
         clearTimeout(pending.timer);
         if (response.ok === true) pending.resolve(response.result);
         else {
@@ -2294,6 +2367,7 @@
         else {
           const error = new Error(Runtime.libraIpcLastError || 'LIBRA IPC request failed.');
           error.code = 'LIBRA_IPC_REJECTED';
+          error.remoteCode = text(response.errorCode || '').trim();
           error.remoteReachable = true;
           error.action = pending.action;
           pending.reject(error);
@@ -2389,7 +2463,7 @@
       throw error;
     }
     const requestId = uuid();
-    const timeoutMs = Math.max(400, Math.min(30000, Number(options.timeoutMs || 4000) || 4000));
+    const timeoutMs = Math.max(400, Math.min(GRADIA_IPC_TIMEOUT_MAX_MS, Number(options.timeoutMs || 4000) || 4000));
     return await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         Runtime.gradiaIpcPending.delete(requestId);
@@ -2508,7 +2582,7 @@
     const probe = await probeGradiaIpc({ timeoutMs: 1800, attempts: 2 });
     if (probe.available) {
       try {
-        const inspected = await requestGradiaIpc('inspect', { includePayload }, { timeoutMs: 8000 });
+        const inspected = await requestGradiaIpc('inspect', { includePayload }, { timeoutMs: GRADIA_INSPECT_TIMEOUT_MS });
         const normalized = normalizeGradiaInspection(inspected, identity, 'gradia_plugin_ipc');
         normalized.capabilities = clone(probe.capabilities, {});
         normalized.probe = clone(probe, {});
@@ -2643,11 +2717,16 @@
   const prepareGradiaSessionHandoff = async options => {
     const runtime = activeGradiaRuntime();
     try {
-      const result = await requestGradiaIpc('prepare_session_handoff', options || {}, { timeoutMs: 6000 });
+      const result = await requestGradiaIpc('prepare_session_handoff', options || {}, { timeoutMs: GRADIA_PREPARE_TIMEOUT_MS });
       if (!gradiaPreparationReceiptMatches(result, options, 'gradia_plugin_ipc')) throw new Error('GRADIA handoff preparation receipt is invalid.');
       return { ...result, transport: 'gradia_plugin_ipc' };
     } catch (error) {
-      if (runtime && typeof runtime.prepareSessionHandoff === 'function') {
+      // A live GRADIA owner rejection is authoritative. Do not issue the same
+      // mutation again through a shared-runtime fallback; only transport-level
+      // timeout/unavailability may fall back when such a runtime actually exists.
+      const code = text(error?.code || '').trim();
+      const ownerRejected = error?.remoteReachable === true || code === 'GRADIA_IPC_REJECTED';
+      if (!ownerRejected && runtime && typeof runtime.prepareSessionHandoff === 'function') {
         const result = await runtime.prepareSessionHandoff(options || {});
         if (!gradiaPreparationReceiptMatches(result, options, 'gradia_runtime_api')) throw new Error('GRADIA runtime handoff preparation receipt is invalid.');
         return { ...result, transport: 'gradia_runtime_api' };
@@ -2662,10 +2741,12 @@
     const expectedNarrativeArchive = Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0);
     const runtime = activeGradiaRuntime();
     try {
-      const result = await requestGradiaIpc('adopt_session_handoff', options || {}, { timeoutMs: 12000 });
+      const result = await requestGradiaIpc('adopt_session_handoff', options || {}, { timeoutMs: GRADIA_ADOPT_TIMEOUT_MS });
       return { ...result, transport: 'gradia_plugin_ipc' };
     } catch (error) {
-      if (runtime && typeof runtime.adoptSessionHandoff === 'function') {
+      const code = text(error?.code || '').trim();
+      const ownerRejected = error?.remoteReachable === true || code === 'GRADIA_IPC_REJECTED';
+      if (!ownerRejected && runtime && typeof runtime.adoptSessionHandoff === 'function') {
         try { return { ...(await runtime.adoptSessionHandoff(options || {})), transport: 'gradia_runtime_api' }; }
         catch (runtimeError) { error = runtimeError; }
       }
@@ -2708,12 +2789,14 @@
     };
     const runtime = activeGradiaRuntime();
     try {
-      const result = await requestGradiaIpc('verify_session_handoff', payload, { timeoutMs: 6000 });
+      const result = await requestGradiaIpc('verify_session_handoff', payload, { timeoutMs: GRADIA_VERIFY_TIMEOUT_MS });
       return gradiaVerificationReceiptMatches(result, payload, 'gradia_plugin_ipc')
         ? { ...result, transport: 'gradia_plugin_ipc' }
         : { ...result, verified: false, durable: false, transport: 'gradia_plugin_ipc', reason: 'gradia_handoff_receipt_mismatch' };
     } catch (error) {
-      if (runtime && typeof runtime.verifySessionHandoff === 'function') {
+      const code = text(error?.code || '').trim();
+      const ownerRejected = error?.remoteReachable === true || code === 'GRADIA_IPC_REJECTED';
+      if (!ownerRejected && runtime && typeof runtime.verifySessionHandoff === 'function') {
         try {
           const result = await runtime.verifySessionHandoff(payload);
           return gradiaVerificationReceiptMatches(result, payload, 'gradia_runtime_api')
@@ -2977,7 +3060,7 @@
     }
     if (!peerCompatibilityPayload(raw)) {
       try {
-        raw = await requestFlashbackIpc('capabilities', {}, { timeoutMs: FLASHBACK_INSPECT_SUMMARY_TIMEOUT_MS });
+        raw = await requestFlashbackIpc('capabilities', {}, { timeoutMs: FLASHBACK_CAPABILITY_TIMEOUT_MS });
         source = 'flashback_plugin_ipc';
       } catch (error) {
         errorText = text(error?.message || error);
@@ -3498,6 +3581,19 @@
     };
   };
 
+  const requestFlashbackLedgerInspection = async includeRecords => {
+    if (includeRecords) {
+      return await requestFlashbackIpc('inspect', { includeRecords: true }, { timeoutMs: FLASHBACK_INSPECT_RECORDS_TIMEOUT_MS });
+    }
+    if (Runtime.flashbackInspectSummaryPromise) return await Runtime.flashbackInspectSummaryPromise;
+    const task = requestFlashbackIpc('inspect', { includeRecords: false }, { timeoutMs: FLASHBACK_INSPECT_SUMMARY_TIMEOUT_MS });
+    Runtime.flashbackInspectSummaryPromise = task;
+    try { return await task; }
+    finally {
+      if (Runtime.flashbackInspectSummaryPromise === task) Runtime.flashbackInspectSummaryPromise = null;
+    }
+  };
+
   const readFlashbackSource = async (context, options = {}) => {
     const identity = contextIdentity(context);
     const includeRecords = options?.includeRecords !== false;
@@ -3520,10 +3616,15 @@
       }
     }
 
-    if (!skipIpc) try {
-      const inspected = await requestFlashbackIpc('inspect', { includeRecords }, {
-        timeoutMs: includeRecords ? FLASHBACK_INSPECT_RECORDS_TIMEOUT_MS : FLASHBACK_INSPECT_SUMMARY_TIMEOUT_MS
-      });
+    const summaryInspectCircuitOpen = !includeRecords
+      && Runtime.flashbackInspectCircuitUntil > Date.now();
+    if (summaryInspectCircuitOpen) {
+      Runtime.flashbackInspectFallbackCount += 1;
+      Runtime.flashbackInspectLastFallbackAt = Date.now();
+      Runtime.flashbackInspectLastFallbackReason = 'summary_ipc_circuit_open';
+    }
+    if (!skipIpc && !summaryInspectCircuitOpen) try {
+      const inspected = await requestFlashbackLedgerInspection(includeRecords);
       const normalized = flashbackSourceFromInspection(inspected, identity, 'flashback_plugin_ipc');
       if (normalized && (!includeRecords || Array.isArray(normalized.runtimeItems))) return normalized;
       warn('Flashback IPC ledger scope or requested record payload unavailable; falling back to pluginStorage', {
@@ -3533,7 +3634,21 @@
         recordsIncluded: inspected?.recordsIncluded === true
       });
     } catch (error) {
-      if (text(error?.code || '') !== 'FLASHBACK_IPC_UNAVAILABLE') {
+      const code = text(error?.code || '');
+      if (!includeRecords && code === 'FLASHBACK_IPC_TIMEOUT') {
+        const nowAt = Date.now();
+        Runtime.flashbackInspectCircuitUntil = nowAt + FLASHBACK_INSPECT_SUMMARY_CIRCUIT_MS;
+        Runtime.flashbackInspectCircuitTrips += 1;
+        Runtime.flashbackInspectFallbackCount += 1;
+        Runtime.flashbackInspectLastFallbackAt = nowAt;
+        Runtime.flashbackInspectLastFallbackReason = 'summary_ipc_timeout';
+        Runtime.warnings.push({
+          at: nowAt,
+          message: 'Flashback IPC summary timed out; pluginStorage fallback circuit opened',
+          detail: compact(error?.message || error || '', 240)
+        });
+        Runtime.warnings = Runtime.warnings.slice(-30);
+      } else if (code !== 'FLASHBACK_IPC_UNAVAILABLE') {
         warn('Flashback IPC ledger inspection unavailable; using pluginStorage fallback', error);
       }
     }
@@ -4059,7 +4174,7 @@
     const includeRecords = options?.includeRecords !== false;
     if (!scope.available) return { available: false, reason: scope.reason, records: [], recordCount: 0, scope };
 
-    try {
+    if (options?.skipOwnerInspect !== true) try {
       const inspected = await requestHayakuIpc('inspect', { includeRecords }, { timeoutMs: includeRecords ? 2600 : 1500 });
       const inspectedLedger = inspected?.ledger && typeof inspected.ledger === 'object'
         ? inspected.ledger
@@ -4097,7 +4212,7 @@
       }
     }
 
-    const runtime = activeHayakuRuntime('inspect');
+    const runtime = options?.skipOwnerInspect === true ? null : activeHayakuRuntime('inspect');
     if (runtime) {
       try {
         const inspected = await runtime.ledger.inspect({ includeRecords });
@@ -4473,6 +4588,273 @@
     };
   };
 
+  const hayakuIncrementalRecoveryEntryProjection = (capsule, entry, index = 0) => {
+    const body = text(typeof entry === 'string' ? entry : entry?.body).trim();
+    if (!body) return null;
+    const ordinal = Math.max(1, Number(typeof entry === 'string' ? index + 1 : entry?.ordinal || index + 1) || index + 1);
+    const scopeKey = text(capsule?.scopeKey || '').trim();
+    const recoveryId = text(capsule?.recoveryId || capsule?.runId || '').trim();
+    const sourceHash = text(capsule?.sourceHash || '').trim();
+    const parsedPacket = parseJson(body, null);
+    const packetMeta = parsedPacket?.meta || {};
+    const sourceRange = packetMeta?.source_turn_range || packetMeta?.sourceTurnRange || {};
+    const targetPairIndex = Math.max(1, Number(
+      (typeof entry === 'string' ? 0 : entry?.targetPairIndex)
+      ?? sourceRange?.end
+      ?? sourceRange?.end_turn
+      ?? packetMeta?.source_turn_index
+      ?? packetMeta?.sourceTurnIndex
+      ?? 1
+    ) || 1);
+    const startTurn = Math.max(1, Number((typeof entry === 'string' ? 0 : entry?.startTurn) ?? sourceRange?.start ?? sourceRange?.start_turn ?? targetPairIndex) || targetPairIndex);
+    const endTurn = Math.max(startTurn, Number((typeof entry === 'string' ? 0 : entry?.endTurn) ?? sourceRange?.end ?? sourceRange?.end_turn ?? targetPairIndex) || targetPairIndex);
+    const bodyHash = stableHash64(body);
+    const chunkHash = text(typeof entry === 'string' ? '' : entry?.chunkHash || '').trim();
+    const incrementalRecoveryId = stableHash64([
+      scopeKey,
+      recoveryId,
+      ordinal,
+      targetPairIndex,
+      chunkHash,
+      bodyHash
+    ].join('\u0001'));
+    return {
+      identity: incrementalRecoveryId,
+      body,
+      bodyHash,
+      ordinal,
+      targetPairIndex,
+      startTurn,
+      endTurn,
+      recoveryId,
+      sourceHash,
+      record: {
+        recordId: `retrace_capsule:${incrementalRecoveryId}:recovery_snapshot`,
+        hash: bodyHash,
+        raw: body,
+        packetType: 'recovery_snapshot',
+        targetPairIndex,
+        recordState: 'active',
+        memoryClass: 'live',
+        captureSource: 'bridge_incremental_recovery_capsule_readonly',
+        sourcePriority: 1,
+        inheritedSessionHistory: false,
+        incrementalRecoveryId,
+        incrementalRecoveryRunId: recoveryId,
+        incrementalRecoverySourceHash: sourceHash,
+        recoveryTurnStart: startTurn,
+        recoveryTurnEnd: endTurn,
+        requestSequence: ordinal,
+        capturedAt: Math.max(0, Number(capsule?.createdAt || 0) || 0) + ordinal,
+        retraceVirtualRecovery: true,
+        retraceReadOnly: true
+      }
+    };
+  };
+
+  const hayakuLocalPacketTypeCounts = ledgerValue => {
+    const ledger = ledgerValue && typeof ledgerValue === 'object' ? ledgerValue : {};
+    const localLedger = { ...ledger, archiveRef: null };
+    const effective = effectiveHayakuRecords(localLedger);
+    const classify = records => {
+      let current = 0;
+      let recovery = 0;
+      let other = 0;
+      for (const record of records) {
+        const packetType = text(record?.packetType || 'current_snapshot').trim().toLowerCase();
+        if (packetType === 'recovery_snapshot') recovery += 1;
+        else if (packetType === 'current_snapshot') current += 1;
+        else other += 1;
+      }
+      return { total: records.length, current, recovery, other };
+    };
+    if (effective.length) return { ...classify(effective), source: 'effective_records' };
+    const heads = (Array.isArray(ledger?.slotHeads) ? ledger.slotHeads : [])
+      .filter(head => ['active', 'unbound'].includes(text(head?.state || '').trim().toLowerCase()));
+    if (heads.length) {
+      const bySlot = new Map();
+      for (const head of heads) {
+        const slotId = text(head?.slotId || '').trim();
+        if (!slotId) continue;
+        bySlot.set(slotId, head);
+      }
+      const projected = Array.from(bySlot.values()).map(head => ({
+        packetType: text(head?.packetType || '').trim().toLowerCase() || (
+          text(head?.slotId || '').includes('recovery_snapshot') ? 'recovery_snapshot' : 'current_snapshot'
+        )
+      }));
+      return { ...classify(projected), source: 'slot_heads' };
+    }
+    const migrationRecovery = Math.max(0, Number(
+      ledger?.migration?.nativeCopyRecoveryExamined
+      || ledger?.migration?.nativeCopyRecoverySourceRecords
+      || 0
+    ) || 0);
+    return {
+      total: 0,
+      current: 0,
+      recovery: migrationRecovery,
+      other: 0,
+      source: migrationRecovery > 0 ? 'migration_recovery_metadata' : 'unavailable'
+    };
+  };
+
+  const hayakuIncrementalRecoveryAccounting = async (hayaku, pendingIncremental, options = {}) => {
+    const baseRecordCount = Math.max(0, Number(
+      options?.baseRecordCount
+      ?? hayaku?.recordCount
+      ?? hayaku?.records?.length
+      ?? 0
+    ) || 0);
+    const archiveRecordCount = Math.max(0, Number(
+      hayaku?.archiveRecordCount
+      ?? hayaku?.ledger?.archiveRecords
+      ?? hayaku?.archiveRef?.recordCount
+      ?? 0
+    ) || 0);
+    const localRecordCountBase = Math.max(0, baseRecordCount - archiveRecordCount);
+    const localTypeCounts = hayakuLocalPacketTypeCounts(hayaku?.ledger || hayaku);
+    const typeCountsUsable = localTypeCounts.total > 0 && (localRecordCountBase <= 0 || localTypeCounts.total <= localRecordCountBase);
+    const durableRecoveryCount = Math.min(
+      localRecordCountBase,
+      Math.max(0, Number(localTypeCounts.recovery || 0) || 0)
+    );
+    const durableCurrentCount = typeCountsUsable
+      ? Math.min(Math.max(0, localRecordCountBase - durableRecoveryCount), Math.max(0, Number(localTypeCounts.current || 0) || 0))
+      : Math.max(0, localRecordCountBase - durableRecoveryCount);
+    const base = {
+      available: pendingIncremental?.available === true || durableRecoveryCount > 0,
+      baseRecordCount,
+      logicalRecordCount: baseRecordCount,
+      localRecordCount: localRecordCountBase,
+      archiveRecordCount,
+      currentSnapshotRecordCount: durableCurrentCount,
+      recoveryRecordCount: durableRecoveryCount,
+      recoveryExpectedCount: durableRecoveryCount,
+      recoveryDurableCount: durableRecoveryCount,
+      missingRecoveryCount: 0,
+      replacedEffectiveCount: 0,
+      durableVerified: durableRecoveryCount > 0,
+      virtualRecords: [],
+      localPacketTypeCounts: localTypeCounts,
+      reason: durableRecoveryCount > 0
+        ? 'materialized_recovery_classified'
+        : (pendingIncremental?.available === true ? 'recovery_accounting_pending' : 'recovery_capsule_absent')
+    };
+    // A consumed/cleaned-up RE:TRACE capsule must not erase the type identity of
+    // recovery_snapshot records that are already durable in the HAYAKU ledger.
+    if (pendingIncremental?.available !== true || !pendingIncremental?.capsule) return base;
+    const capsule = pendingIncremental.capsule;
+    const validation = validateBridgeCapsulePacketSet(capsule);
+    if (!validation.valid) return { ...base, reason: validation.reason || 'recovery_capsule_invalid' };
+    const projections = validation.entries.map((entry, index) => hayakuIncrementalRecoveryEntryProjection(capsule, entry, index)).filter(Boolean);
+    const scopeKey = text(capsule.scopeKey || pendingIncremental?.scope?.scopeKey || hayaku?.scope?.scopeKey || '').trim();
+    const rawLedger = scopeKey ? parseJson(await storageGet(`${HAYAKU_LEDGER_PREFIX}${scopeKey}`), null) : null;
+    const effectiveLocal = rawLedger && typeof rawLedger === 'object'
+      ? effectiveHayakuRecords({ ...rawLedger, archiveRef: null })
+      : [];
+    const recoveryId = text(capsule.recoveryId || capsule.runId || '').trim();
+    const sourceHash = text(capsule.sourceHash || '').trim();
+    const allDurableRecovery = effectiveLocal.filter(record => (
+      text(record?.packetType || '').trim().toLowerCase() === 'recovery_snapshot'
+      && record?.inheritedSessionHistory !== true
+      && !isPermanentSessionHistory(record)
+    ));
+    const activeRecovery = allDurableRecovery.filter(record => (
+      text(record?.captureSource || '').trim() === 'bridge_incremental_recovery'
+      && text(record?.recordState || '').trim() === 'active'
+      && (!recoveryId || text(record?.incrementalRecoveryRunId || '').trim() === recoveryId)
+      && (!sourceHash || text(record?.incrementalRecoverySourceHash || '').trim() === sourceHash)
+    ));
+    const representedIds = new Set(activeRecovery.map(record => text(record?.incrementalRecoveryId || '').trim()).filter(Boolean));
+    const representedFallback = new Set(activeRecovery.filter(record => !text(record?.incrementalRecoveryId || '').trim()).map(record => [
+      text(record?.hash || stableHash64(text(record?.raw || ''))).trim(),
+      Math.max(1, Number(record?.targetPairIndex || 1) || 1)
+    ].join('\u0001')));
+    const missing = projections.filter(item => (
+      !representedIds.has(item.identity)
+      && !representedFallback.has([item.bodyHash, item.targetPairIndex].join('\u0001'))
+    ));
+    const replacementIds = new Set((Array.isArray(capsule?.replacementRecordIds) ? capsule.replacementRecordIds : [])
+      .map(value => text(value || '').trim()).filter(Boolean));
+    const replacedEffective = effectiveLocal.filter(record => replacementIds.has(text(record?.recordId || '').trim()));
+    const replacedEffectiveCount = replacedEffective.length;
+    const replacedRecoveryCount = replacedEffective.filter(record => text(record?.packetType || '').trim().toLowerCase() === 'recovery_snapshot').length;
+    const replacedCurrentCount = replacedEffective.filter(record => text(record?.packetType || 'current_snapshot').trim().toLowerCase() === 'current_snapshot').length;
+    const durableVerification = await verifyDurableHayakuIncrementalRecovery(capsule).catch(() => ({ verified: false, records: activeRecovery.length }));
+    const logicalRecordCount = Math.max(0, baseRecordCount - replacedEffectiveCount + missing.length);
+    const localRecordCount = Math.max(0, logicalRecordCount - archiveRecordCount);
+    const effectiveCurrent = effectiveLocal.filter(record => (
+      text(record?.packetType || 'current_snapshot').trim().toLowerCase() === 'current_snapshot'
+      && record?.inheritedSessionHistory !== true
+      && !isPermanentSessionHistory(record)
+    )).length;
+    const expectedRecoveryCount = projections.length;
+    const recoveryRecordCount = Math.max(0, allDurableRecovery.length - replacedRecoveryCount + missing.length);
+    const currentSnapshotRecordCount = Math.max(0, effectiveCurrent - replacedCurrentCount);
+    return {
+      ...base,
+      logicalRecordCount,
+      localRecordCount,
+      currentSnapshotRecordCount,
+      recoveryRecordCount,
+      recoveryExpectedCount: Math.max(recoveryRecordCount, expectedRecoveryCount),
+      recoveryDurableCount: allDurableRecovery.length,
+      missingRecoveryCount: missing.length,
+      replacedEffectiveCount,
+      durableVerified: durableVerification?.verified === true,
+      durableVerification,
+      virtualRecords: missing.map(item => item.record),
+      recoveryId,
+      sourceHash,
+      scopeKey,
+      localPacketTypeCounts: hayakuLocalPacketTypeCounts(rawLedger || hayaku?.ledger || hayaku),
+      reason: durableVerification?.verified === true
+        ? 'recovery_capsule_durable'
+        : missing.length
+          ? 'recovery_capsule_projected_readonly'
+          : 'recovery_capsule_present_not_fully_verified'
+    };
+  };
+
+  const mergeHayakuRecoveryAccountingForViewer = async (result, pendingIncremental) => {
+    if (!result || pendingIncremental?.available !== true) return result;
+    const accounting = await hayakuIncrementalRecoveryAccounting(result, pendingIncremental);
+    const virtualRecords = Array.isArray(accounting.virtualRecords) ? accounting.virtualRecords : [];
+    if (!virtualRecords.length) {
+      return {
+        ...result,
+        recordCount: accounting.logicalRecordCount,
+        localRecordCount: accounting.localRecordCount,
+        archiveRecordCount: accounting.archiveRecordCount,
+        currentSnapshotRecordCount: accounting.currentSnapshotRecordCount,
+        recoveryRecordCount: accounting.recoveryRecordCount,
+        pendingRecoveryRecordCount: accounting.missingRecoveryCount,
+        recoveryDurableVerified: accounting.durableVerified,
+        recoveryAccounting: accounting
+      };
+    }
+    const existingAll = Array.isArray(result.allRecords) ? result.allRecords : (Array.isArray(result.records) ? result.records : []);
+    const existingEffective = Array.isArray(result.records) ? result.records : existingAll;
+    const allRecords = [...existingAll, ...virtualRecords].sort(compareHayakuTimelineRecords);
+    const records = [...existingEffective, ...virtualRecords].sort(compareHayakuTimelineRecords);
+    return {
+      ...result,
+      allRecords,
+      records,
+      recordCount: accounting.logicalRecordCount,
+      localRecordCount: accounting.localRecordCount,
+      archiveRecordCount: accounting.archiveRecordCount,
+      currentSnapshotRecordCount: accounting.currentSnapshotRecordCount,
+      recoveryRecordCount: accounting.recoveryRecordCount,
+      pendingRecoveryRecordCount: accounting.missingRecoveryCount,
+      recoveryDurableVerified: accounting.durableVerified,
+      recoveryAccounting: accounting,
+      viewerLoadedRecords: Math.max(0, Number(result.viewerLoadedRecords ?? existingAll.length) || 0) + virtualRecords.length,
+      viewerLimited: accounting.logicalRecordCount > (Math.max(0, Number(result.viewerLoadedRecords ?? existingAll.length) || 0) + virtualRecords.length)
+    };
+  };
+
   const activeHayakuRuntime = capability => {
     const candidates = [];
     try {
@@ -4495,11 +4877,117 @@
     )
   );
 
+  const verifyHayakuSessionHandoffFromStorage = async (options = {}) => {
+    const targetChatId = text(options.targetChatId || '').trim();
+    const transferId = text(options.transferId || '').trim();
+    const sourceScopeKey = text(options.sourceScopeKey || '').trim();
+    const expectedRecords = Math.max(0, Number(options.expectedRecords || 0) || 0);
+    const base = {
+      schema: HAYAKU_HANDOFF_RECEIPT_SCHEMA,
+      ok: false,
+      available: false,
+      attempted: false,
+      adopted: false,
+      verified: false,
+      durable: false,
+      handoffContract: HAYAKU_REQUIRED_HANDOFF_CONTRACT,
+      sourceMutationAllowed: false,
+      sourceCompactionAllowed: false,
+      physicalCopies: 0,
+      sourcePreserved: false,
+      targetChatId,
+      transferId,
+      sourceScopeKey,
+      records: 0,
+      expectedRecords,
+      transport: 'plugin_storage_readback'
+    };
+    try {
+      const context = await getCurrentContext();
+      const currentIdentity = contextIdentity(context);
+      if (!targetChatId || currentIdentity.chatId !== targetChatId) {
+        return { ...base, reason: 'target_chat_not_active' };
+      }
+      const scope = hayakuScopeFor(context);
+      if (!scope.available) return { ...base, reason: scope.reason || 'hayaku_scope_unavailable' };
+      const ledger = parseJson(await storageGet(scope.storageKey), null);
+      if (!ledger || !HAYAKU_LEDGER_SCHEMAS.has(text(ledger.version || '')) || text(ledger.scopeKey || '') !== scope.scopeKey) {
+        return { ...base, available: false, reason: 'hayaku_target_ledger_missing' };
+      }
+      const archiveRef = normalizeHayakuArchiveRefForRetrace(ledger.archiveRef);
+      const archive = archiveRef
+        ? await readHayakuArchiveLayerMetas(archiveRef)
+        : { verified: expectedRecords === 0, records: 0, reason: 'archive_ref_absent' };
+      const session = ledger.sessionHandoff && typeof ledger.sessionHandoff === 'object' ? ledger.sessionHandoff : {};
+      const transferMatches = text(session.transferId || '') === transferId;
+      const sourceMatches = !sourceScopeKey || text(session.sourceScopeKey || '') === sourceScopeKey;
+      const archiveCount = Math.max(0, Number(archive.records ?? archiveRef?.recordCount ?? 0) || 0);
+      const recordsMatch = archiveCount === expectedRecords
+        && (!archiveRef || Math.max(0, Number(archiveRef.recordCount || 0) || 0) === expectedRecords);
+      const proofBefore = text(session.sourceFingerprintBefore || '').trim();
+      const proofAfter = text(session.sourceFingerprintAfter || '').trim();
+      let liveSourceFingerprint = '';
+      if (sourceScopeKey) {
+        const rawSource = await storageGet(`${HAYAKU_LEDGER_PREFIX}${sourceScopeKey}`);
+        if (rawSource != null && rawSource !== '') {
+          const serialized = typeof rawSource === 'string' ? rawSource : JSON.stringify(rawSource);
+          liveSourceFingerprint = stableHash64(serialized);
+        }
+      }
+      const sourcePreserved = expectedRecords === 0
+        ? (!sourceScopeKey || (!!proofBefore && proofBefore === proofAfter && (!liveSourceFingerprint || proofAfter === liveSourceFingerprint)))
+        : (!!sourceScopeKey && !!proofBefore && proofBefore === proofAfter && !!liveSourceFingerprint && proofAfter === liveSourceFingerprint);
+      const verified = session.verified === true
+        && session.sourcePreserved === true
+        && transferMatches
+        && sourceMatches
+        && archive.verified === true
+        && recordsMatch
+        && sourcePreserved;
+      return {
+        ...base,
+        ok: verified,
+        available: true,
+        verified,
+        durable: verified,
+        sourcePreserved,
+        records: archiveCount,
+        targetScopeKey: scope.scopeKey,
+        archiveId: text(archiveRef?.archiveId || ''),
+        archiveGeneration: Math.max(0, Number(archiveRef?.generation || 0) || 0),
+        archiveDigest: text(archiveRef?.digest || ''),
+        archiveRecordCount: Math.max(0, Number(archiveRef?.recordCount || 0) || 0),
+        sourceFingerprintBefore: proofBefore,
+        sourceFingerprintAfter: proofAfter,
+        sourceFingerprintLive: liveSourceFingerprint,
+        reason: verified ? 'hayaku_handoff_storage_readback_verified' : 'hayaku_handoff_storage_readback_not_verified',
+        diagnostics: {
+          transferMatches,
+          sourceMatches,
+          archiveVerified: archive.verified === true,
+          archiveReason: text(archive.reason || ''),
+          recordsMatch,
+          sessionVerified: session.verified === true,
+          sessionSourcePreserved: session.sourcePreserved === true,
+          sourcePreserved
+        }
+      };
+    } catch (error) {
+      return { ...base, reason: 'hayaku_handoff_storage_readback_failed', error: text(error?.message || error) };
+    }
+  };
+
   const adoptHayakuSessionHandoff = async (options = {}) => {
     const targetChatId = text(options.targetChatId || '').trim();
     const transferId = text(options.transferId || '').trim();
     const sourceScopeKey = text(options.sourceScopeKey || '').trim();
     const expectedRecords = Math.max(0, Number(options.expectedRecords || 0) || 0);
+    if (expectedRecords > 0) {
+      const existingReadback = await verifyHayakuSessionHandoffFromStorage({ targetChatId, transferId, sourceScopeKey, expectedRecords });
+      if (existingReadback?.verified === true && existingReadback?.durable === true && existingReadback?.sourcePreserved === true) {
+        return { ...existingReadback, ok: true, adopted: false, attempted: false, transport: 'plugin_storage_readback_existing' };
+      }
+    }
     if (expectedRecords <= 0) {
       return {
         ok: true,
@@ -4575,6 +5063,10 @@
             verified: true,
             durable: true
           };
+      }
+      const readback = await verifyHayakuSessionHandoffFromStorage({ targetChatId, transferId, sourceScopeKey, expectedRecords });
+      if (readback?.verified === true && readback?.durable === true && readback?.sourcePreserved === true) {
+        return { ...readback, ok: true, adopted: false, attempted: true, attempts: attempt, transport: 'plugin_storage_readback_after_owner' };
       }
       if (attempt < attempts) await delay(100);
     }
@@ -8054,6 +8546,16 @@
     return expected > 0 ? { ...options, expectedWorldAdditional: expected } : { ...options };
   };
 
+  const libraIpcAllowsRuntimeFallback = error => {
+    const code = text(error?.code || '').trim();
+    // Once the official owner replied, a rejection is semantic and must not be
+    // repeated through a second transport. Retrying SOURCE_MUTATION_DETECTED or any
+    // other fail-closed owner error can duplicate archive preparation and obscures
+    // the real reason. Only transport/unreachable failures may use the runtime API.
+    if (error?.remoteReachable === true || code === 'LIBRA_IPC_REJECTED') return false;
+    return true;
+  };
+
   const prepareLibraSessionHandoff = async options => {
     const runtime = activeLibraRuntime();
     try {
@@ -8063,7 +8565,7 @@
       }
       return { ...result, transport: 'libra_plugin_ipc' };
     } catch (error) {
-      if (runtime && typeof runtime.prepareSessionHandoff === 'function') {
+      if (libraIpcAllowsRuntimeFallback(error) && runtime && typeof runtime.prepareSessionHandoff === 'function') {
         const result = await runtime.prepareSessionHandoff(options || {});
         if (!libraPreparationReceiptMatches(result, options, 'libra_runtime_api')) {
           throw new Error('LIBRA runtime handoff preparation receipt is invalid.');
@@ -8081,7 +8583,7 @@
       const result = await requestLibraIpc('adopt_session_handoff', options || {}, { timeoutMs: LIBRA_ADOPT_TIMEOUT_MS });
       return { ...result, transport: 'libra_plugin_ipc' };
     } catch (error) {
-      if (runtime && typeof runtime.adoptSessionHandoff === 'function') {
+      if (libraIpcAllowsRuntimeFallback(error) && runtime && typeof runtime.adoptSessionHandoff === 'function') {
         try {
           const result = await runtime.adoptSessionHandoff(options || {});
           return { ...result, transport: 'libra_runtime_api' };
@@ -8141,7 +8643,7 @@
         ? { ...result, transport: 'libra_plugin_ipc' }
         : { ...result, verified: false, durable: false, transport: 'libra_plugin_ipc', reason: 'libra_handoff_receipt_mismatch' };
     } catch (error) {
-      if (runtime && typeof runtime.verifySessionHandoff === 'function') {
+      if (libraIpcAllowsRuntimeFallback(error) && runtime && typeof runtime.verifySessionHandoff === 'function') {
         try {
           const result = await runtime.verifySessionHandoff(payload);
           return libraVerificationReceiptMatches(result, payload, 'libra_runtime_api')
@@ -8164,13 +8666,26 @@
   const inspectTransition = async () => {
     const context = await getCurrentContext();
     const pendingHandoff = await inspectPendingNextSessionHandoff({ context });
-    const [flashback, hayaku, pendingColdStart, libra, gradia] = await Promise.all([
+    const [flashback, hayaku, pendingColdStart, pendingIncrementalRecovery, libra, gradia] = await Promise.all([
       readFlashbackSource(context, { includeRecords: false }),
-      readHayakuSource(context, { includeRecords: false }),
+      readHayakuSource(context, { includeRecords: false, skipOwnerInspect: true }),
       readPendingColdStartCapsule(context),
+      readPendingIncrementalRecoveryCapsule(context),
       readLibraSource(context, { includeRecords: false }),
       readGradiaSource(context, { includePayload: false })
     ]);
+    const baseHayakuRecordCount = hayaku.available
+      ? Math.max(0, Number(hayaku.recordCount ?? hayaku.records?.length ?? 0) || 0)
+      : Math.max(0, Number(pendingColdStart?.packets?.length || 0) || 0);
+    // Transition inspection is source-read-only. If a verified RE:TRACE recovery
+    // capsule has not yet been materialized into the HAYAKU ledger, account for
+    // its missing recovery entries logically; HAYAKU owner handoff imports the
+    // same capsule into an in-memory source ledger before building the immutable archive.
+    const hayakuRecoveryAccounting = await hayakuIncrementalRecoveryAccounting(
+      hayaku,
+      pendingIncrementalRecovery,
+      { baseRecordCount: baseHayakuRecordCount }
+    );
     const preview = {
       context,
       identity: contextIdentity(context),
@@ -8179,11 +8694,18 @@
       libra,
       gradia,
       pendingColdStart,
+      pendingIncrementalRecovery,
+      hayakuRecoveryAccounting,
       pendingHandoff,
-      includeHayaku: hayaku.available === true || pendingColdStart.available === true,
+      includeHayaku: hayaku.available === true || pendingColdStart.available === true || pendingIncrementalRecovery.available === true,
       includeLibra: libra.available === true,
       includeGradia: gradia.available === true,
-      hayakuRecordCount: hayaku.available ? Math.max(0, Number(hayaku.recordCount ?? hayaku.records?.length ?? 0) || 0) : pendingColdStart.packets.length,
+      hayakuRecordCount: hayakuRecoveryAccounting.logicalRecordCount,
+      hayakuCurrentRecordCount: hayakuRecoveryAccounting.currentSnapshotRecordCount,
+      hayakuRecoveryRecordCount: hayakuRecoveryAccounting.recoveryRecordCount,
+      hayakuPendingRecoveryRecordCount: hayakuRecoveryAccounting.missingRecoveryCount,
+      hayakuArchiveRecordCount: hayakuRecoveryAccounting.archiveRecordCount,
+      hayakuRecoveryDurableVerified: hayakuRecoveryAccounting.durableVerified,
       libraRecordCount: libra.recordCount,
       gradiaStoryArcCount: gradia.storyArcCount,
       gradiaWriterDesignCount: gradia.writerDesignCount,
@@ -8351,6 +8873,58 @@
     const loaded = nextSessionHandoffJournalFromChat(chat);
     const pending = loaded.available === true && text(loaded.journal?.state || '') !== 'completed';
     return { ...loaded, context, chat, pending };
+  };
+
+  const inspectPendingHandoffDurableStatus = async loaded => {
+    const bridge = loaded?.bridge && typeof loaded.bridge === 'object' ? loaded.bridge : {};
+    const journal = loaded?.journal && typeof loaded.journal === 'object' ? loaded.journal : {};
+    const targetChatId = text(bridge.targetChatId || journal.targetChatId || '').trim();
+    const transferId = text(bridge.transferId || journal.transferId || '').trim();
+    const hayakuExpectedRecords = Math.max(0, Number(bridge.hayakuRecordCount || 0) || 0);
+    const hayakuRequired = bridge.includeHayaku === true && hayakuExpectedRecords > 0;
+    const hayaku = hayakuRequired
+      ? await verifyHayakuSessionHandoffFromStorage({
+        targetChatId,
+        transferId,
+        sourceScopeKey: text(bridge.sourceHayakuScopeKey || ''),
+        expectedRecords: hayakuExpectedRecords
+      })
+      : { verified: true, durable: true, sourcePreserved: true, records: 0, expectedRecords: 0, reason: 'no_hayaku_data' };
+    return { hayakuRequired, hayakuExpectedRecords, hayaku };
+  };
+
+  const reconcilePendingHandoffJournalFromDurableReadback = async loaded => {
+    if (!loaded?.available || !loaded?.pending) return { ...loaded, reconciled: false };
+    const durable = await inspectPendingHandoffDurableStatus(loaded);
+    const ownerStatus = clone(loaded.journal?.ownerStatus, {}) || {};
+    let changed = false;
+    if (durable?.hayakuRequired === true
+      && durable?.hayaku?.verified === true
+      && durable?.hayaku?.durable === true
+      && durable?.hayaku?.sourcePreserved === true
+      && ownerStatus?.hayaku?.verified !== true) {
+      ownerStatus.hayaku = {
+        required: true,
+        verified: true,
+        durable: true,
+        sourcePreserved: true,
+        reason: text(durable.hayaku.reason || 'hayaku_handoff_storage_readback_verified'),
+        receipt: clone(durable.hayaku, {})
+      };
+      changed = true;
+    }
+    if (!changed) return { ...loaded, reconciled: false, durableStatus: durable };
+    const complete = Object.values(ownerStatus).every(status => status?.required !== true || status?.verified === true);
+    const journal = await persistNextSessionHandoffJournal(loaded.targetChatId, loaded.journal.transferId, {
+      state: complete ? 'completed' : 'pending_owner_handoffs',
+      ownerStatus,
+      completedAt: complete ? Date.now() : Number(loaded.journal?.completedAt || 0) || 0,
+      lastError: complete ? '' : text(loaded.journal?.lastError || 'one_or_more_required_owner_handoffs_not_verified'),
+      reconciledAt: Date.now(),
+      reconcileReason: 'durable_owner_readback'
+    });
+    const refreshed = await inspectPendingNextSessionHandoff({ targetChatId: loaded.targetChatId });
+    return { ...refreshed, reconciled: true, durableStatus: durable, journal };
   };
 
   const persistNextSessionHandoffJournal = async (targetChatIdValue, transferIdValue, patch = {}) => {
@@ -8621,7 +9195,7 @@
       });
     }
     const preview = await inspectTransition();
-    const { context, identity, flashback, hayaku, libra, gradia, pendingColdStart } = preview;
+    const { context, identity, flashback, hayaku, libra, gradia, pendingColdStart, pendingIncrementalRecovery } = preview;
     const compatibilitySuite = await inspectCompatibilitySuite(preview, { timeoutMs: 3800, forceProbe: true });
     if (!compatibilitySuite.compatible) {
       const blocking = (compatibilitySuite.blocking || []).map(item => `${item.label}: ${item.reason}`).join(' / ');
@@ -8777,7 +9351,7 @@
         sourceFlashbackScopeKey: text(flashback.sourceScope?.scopeKey || ''),
         sourceFlashbackFingerprint: text(flashbackSourceIntegrity?.fingerprint || ''),
         sourceFlashbackOwnerVersion: text(flashbackHandoffCapability?.pluginVersion || flashback.pluginVersion || ''),
-        sourceHayakuScopeKey: text(hayaku.scope?.scopeKey || ''),
+        sourceHayakuScopeKey: text(hayaku.scope?.scopeKey || pendingIncrementalRecovery?.scope?.scopeKey || pendingColdStart?.scope?.scopeKey || ''),
         sourceLibraScopeKey: text(libra.scope?.scopeKey || ''),
         sourceGradiaStoryArcScopeKey: text(gradia.scope?.storyArcScopeKey || ''),
         sourceGradiaWriterScopeKey: text(gradia.scope?.writerScopeKey || ''),
@@ -8791,13 +9365,21 @@
         sourceLiaLivePersonaId: liaRequired ? sourceLivePersonaId : '',
         flashbackRecordCount: Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0),
         hayakuRecordCount: preview.hayakuRecordCount,
+        hayakuCurrentRecordCount: Math.max(0, Number(preview.hayakuCurrentRecordCount || 0) || 0),
+        hayakuRecoveryRecordCount: Math.max(0, Number(preview.hayakuRecoveryRecordCount || 0) || 0),
+        hayakuPendingRecoveryRecordCount: Math.max(0, Number(preview.hayakuPendingRecoveryRecordCount || 0) || 0),
+        hayakuArchiveRecordCount: Math.max(0, Number(preview.hayakuArchiveRecordCount || 0) || 0),
         libraRecordCount: libra.recordCount,
         ...(Number(libra.worldAdditionalCount || 0) > 0 ? { libraWorldAdditionalCount: libra.worldAdditionalCount } : {}),
         gradiaStoryArcCount: gradia.storyArcCount,
         gradiaWriterDesignCount: gradia.writerDesignCount,
         gradiaNarrativeArchiveCount: gradia.narrativeArchiveCount,
         gradiaStoryArcBeatCount: gradia.storyArcBeatCount,
-        hayakuSource: hayaku.available ? 'canonical_ledger' : pendingColdStart.available ? 'pending_cold_start' : 'none',
+        hayakuSource: hayaku.available
+          ? (preview.hayakuPendingRecoveryRecordCount > 0 ? 'canonical_ledger+incremental_recovery_capsule' : 'canonical_ledger')
+          : pendingColdStart.available
+            ? (pendingIncrementalRecovery?.available ? 'pending_cold_start+incremental_recovery_capsule' : 'pending_cold_start')
+            : pendingIncrementalRecovery?.available ? 'incremental_recovery_capsule' : 'none',
         libraSource: preview.includeLibra ? text(libra.readSource || 'unknown') : 'none',
         gradiaSource: preview.includeGradia ? text(gradia.readSource || 'unknown') : 'none',
         libraArchiveId: text(libraPreparation?.archiveId || ''),
@@ -9160,16 +9742,28 @@
     const activeNodes = nodes.filter(node => !node?.status || text(node.status).toLowerCase() === 'active').length;
     const inheritedRecords = records.filter(record => record?.inheritedSessionHistory === true || isPermanentSessionHistory(record)).length;
     const liveRecords = records.length - inheritedRecords;
+    const currentSnapshotRecords = Math.max(0, Number(result.currentSnapshotRecordCount ?? records.filter(record => (
+      text(record?.packetType || 'current_snapshot').trim().toLowerCase() === 'current_snapshot'
+      && record?.inheritedSessionHistory !== true
+      && !isPermanentSessionHistory(record)
+    )).length) || 0);
+    const recoveryRecords = Math.max(0, Number(result.recoveryRecordCount ?? records.filter(record => (
+      text(record?.packetType || '').trim().toLowerCase() === 'recovery_snapshot'
+    )).length) || 0);
+    const archiveRecords = Math.max(0, Number(result.archiveRecordCount ?? inheritedRecords) || 0);
     const updatedAt = result.ledger?.updatedAt ? new Date(result.ledger.updatedAt).toLocaleString() : '-';
     return `<div class="metrics">
       <div><span>저장 패킷</span><strong>${formatNumber(result.recordCount || records.length)}</strong></div>
-      <div><span>현재 / Archive</span><strong>${formatNumber(result.localRecordCount ?? liveRecords)} / ${formatNumber(result.archiveRecordCount ?? inheritedRecords)}</strong></div>
+      <div><span>Current</span><strong>${formatNumber(currentSnapshotRecords)}</strong></div>
+      <div><span>Recovery</span><strong>${formatNumber(recoveryRecords)}</strong></div>
+      <div><span>Archive</span><strong>${formatNumber(archiveRecords)}</strong></div>
       <div><span>표시 로드</span><strong>${formatNumber(result.viewerLoadedRecords ?? records.length)}</strong></div>
       <div><span>표시 삭제됨</span><strong>${formatNumber(deletedRecords.length)}</strong></div>
       <div><span>활성 / 전체 월드라인</span><strong>${formatNumber(activeNodes)} / ${formatNumber(nodes.length)}</strong></div>
       <div><span>표시 본문</span><strong>${formatNumber(chars)} chars</strong></div>
     </div>
     <div class="ledger-key"><span>READ ONLY</span><code>${escapeHtml(result.scope.storageKey)}</code><small>갱신 ${escapeHtml(updatedAt)}</small></div>
+    ${Number(result.pendingRecoveryRecordCount || 0) > 0 ? `<div class="settings-callout viewer-warning">RE:TRACE Recovery ${formatNumber(result.pendingRecoveryRecordCount)}개는 검증된 recovery capsule에서 읽기 전용으로 표시 중입니다. HAYAKU durable 원장 반영이 확인되면 자동으로 실제 recovery_snapshot 레코드로 전환됩니다.</div>` : ''}
     ${deletedRecords.length ? `<div class="settings-callout">사용자가 삭제한 패킷 ${formatNumber(deletedRecords.length)}개는 tombstone으로 보존되지만 활성 목록과 자동 누락 복구에서 제외됩니다.</div>` : ''}
     ${result.viewerLimited ? `<div class="settings-callout">OOM 방지를 위해 현재 원장과 최신 Archive layer에서 ${formatNumber(result.viewerLoadedRecords ?? visible.length)}개만 해제했습니다. 전체 ${formatNumber(result.recordCount || ordered.length)}개는 Archive에 그대로 보존됩니다.</div>` : (ordered.length > visible.length ? `<div class="settings-callout">최신 ${formatNumber(visible.length)}개만 화면에 표시합니다.</div>` : '')}
     <div class="record-list">${visible.map((record, actionIndex) => {
@@ -9177,13 +9771,16 @@
       const inherited = record.inheritedSessionHistory === true || isPermanentSessionHistory(record);
       const permanent = isPermanentSessionHistory(record);
       const coldStart = text(record.captureSource).includes('cold_start');
+      const virtualRecovery = record?.retraceVirtualRecovery === true;
       const state = text(record.recordState || '').trim().toUpperCase();
-      const deleteDisabled = permanent || state === 'TOMBSTONED';
-      const regenerateDisabled = permanent || recordRegenerationTurns(record).length === 0;
-      const protectedTitle = permanent ? 'Permanent session history is protected.' : '';
-      const label = ['TOMBSTONED', 'SUPERSEDED', 'QUARANTINED', 'ORPHANED', 'DETACHED'].includes(state)
-        ? state
-        : permanent ? 'PERMANENT HISTORY' : inherited ? 'INHERITED' : coldStart ? 'COLD START' : state || 'LIVE';
+      const deleteDisabled = permanent || virtualRecovery || state === 'TOMBSTONED';
+      const regenerateDisabled = permanent || virtualRecovery || recordRegenerationTurns(record).length === 0;
+      const protectedTitle = permanent ? 'Permanent session history is protected.' : virtualRecovery ? 'Read-only RE:TRACE recovery capsule projection.' : '';
+      const label = virtualRecovery
+        ? 'RECOVERY CAPSULE'
+        : ['TOMBSTONED', 'SUPERSEDED', 'QUARANTINED', 'ORPHANED', 'DETACHED'].includes(state)
+          ? state
+          : permanent ? 'PERMANENT HISTORY' : inherited ? 'INHERITED' : coldStart ? 'COLD START' : state || 'LIVE';
       const entityRows = [...info.characters, ...info.relations].slice(0, 8);
       const knowledgeRows = [...info.memories, ...info.secrets].slice(0, 6);
       const plannerRows = [...info.plannerRows, ...info.importanceReasons.map(value => `중요도 · ${value}`)].slice(0, 9);
@@ -9204,6 +9801,111 @@
       </article>`;
     }).join('')}</div>`;
   };
+
+  const closeRetraceDialog = result => {
+    const root = Runtime.root;
+    const layer = root?.querySelector?.('#retraceDialogLayer');
+    const resolver = Runtime.dialogResolver;
+    Runtime.dialogResolver = null;
+    if (Runtime.dialogKeyHandler) {
+      try { document.removeEventListener('keydown', Runtime.dialogKeyHandler, true); } catch (_) {}
+      Runtime.dialogKeyHandler = null;
+    }
+    if (layer) {
+      layer.hidden = true;
+      layer.setAttribute('aria-hidden', 'true');
+    }
+    if (typeof resolver === 'function') resolver(Boolean(result));
+  };
+
+  const showRetraceDialog = (message, options = {}) => new Promise(resolve => {
+    const root = Runtime.root;
+    const layer = root?.querySelector?.('#retraceDialogLayer');
+    const titleNode = root?.querySelector?.('#retraceDialogTitle');
+    const messageNode = root?.querySelector?.('#retraceDialogMessage');
+    const cancelButton = root?.querySelector?.('#retraceDialogCancel');
+    const confirmButton = root?.querySelector?.('#retraceDialogConfirm');
+    if (!layer || !titleNode || !messageNode || !confirmButton) {
+      Runtime.lastUiDialog = { at: Date.now(), type: options.confirm === true ? 'confirm' : 'alert', result: false, reason: 'dialog_dom_unavailable' };
+      warn('RE:TRACE internal dialog unavailable; action cancelled fail-closed');
+      resolve(false);
+      return;
+    }
+    if (typeof Runtime.dialogResolver === 'function') {
+      if (Runtime.dialogKeyHandler) {
+        try { document.removeEventListener('keydown', Runtime.dialogKeyHandler, true); } catch (_) {}
+        Runtime.dialogKeyHandler = null;
+      }
+      const previous = Runtime.dialogResolver;
+      Runtime.dialogResolver = null;
+      try { previous(false); } catch (_) {}
+    }
+    const sequence = ++Runtime.dialogSequence;
+    Runtime.dialogResolver = value => {
+      Runtime.lastUiDialog = {
+        at: Date.now(),
+        sequence,
+        type: options.confirm === true ? 'confirm' : 'alert',
+        result: Boolean(value),
+        title: text(options.title || (options.confirm === true ? '확인' : '알림'))
+      };
+      resolve(Boolean(value));
+    };
+    titleNode.textContent = text(options.title || (options.confirm === true ? '확인' : '알림'));
+    messageNode.textContent = text(message || '');
+    confirmButton.textContent = text(options.confirmLabel || (options.confirm === true ? '계속' : '확인'));
+    confirmButton.classList.toggle('danger', options.danger === true);
+    // The surrounding action may already be in Runtime.busy state. Dialog controls are
+    // the only controls that must stay interactive while background actions remain locked.
+    confirmButton.disabled = false;
+    delete confirmButton.dataset.bridgeBusyDisabled;
+    if (cancelButton) {
+      cancelButton.hidden = options.confirm !== true;
+      cancelButton.textContent = text(options.cancelLabel || '취소');
+      cancelButton.disabled = false;
+      delete cancelButton.dataset.bridgeBusyDisabled;
+    }
+    layer.hidden = false;
+    layer.setAttribute('aria-hidden', 'false');
+    const finish = value => {
+      if (Runtime.dialogSequence !== sequence) return;
+      closeRetraceDialog(value);
+    };
+    confirmButton.onclick = () => finish(true);
+    if (cancelButton) cancelButton.onclick = () => finish(false);
+    layer.onclick = event => {
+      if (event.target === layer && options.confirm === true) finish(false);
+    };
+    const onKey = event => {
+      if (Runtime.dialogSequence !== sequence) {
+        document.removeEventListener('keydown', onKey, true);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        document.removeEventListener('keydown', onKey, true);
+        finish(options.confirm === true ? false : true);
+      } else if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        document.removeEventListener('keydown', onKey, true);
+        finish(true);
+      }
+    };
+    Runtime.dialogKeyHandler = onKey;
+    document.addEventListener('keydown', onKey, true);
+    queueMicrotask(() => { try { confirmButton.focus(); } catch (_) {} });
+  });
+
+  const retraceConfirm = (message, options = {}) => showRetraceDialog(message, {
+    ...options,
+    confirm: true
+  });
+
+  const retraceAlert = (message, options = {}) => showRetraceDialog(message, {
+    ...options,
+    confirm: false,
+    confirmLabel: options.confirmLabel || '확인'
+  });
 
   const renderShell = () => {
     const root = Runtime.root;
@@ -9309,11 +10011,12 @@
       .compatibility-panel.acknowledged{opacity:.82}
       .compatibility-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.compatibility-head>div{display:flex;flex-direction:column;gap:4px}.compatibility-head strong{font-size:15px}.compatibility-head span{font-size:12px;color:var(--lra-text-2);line-height:1.55}.compatibility-head em{font-style:normal;font-size:11px;font-weight:800;white-space:nowrap;padding:5px 8px;border-radius:999px;background:var(--lra-surface-3)}
       .compat-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.compat-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 10px;padding:9px 10px;border:1px solid var(--lra-line);border-radius:11px;background:var(--lra-surface-2)}.compat-row small{grid-column:1/-1;color:var(--lra-text-2);line-height:1.4}.compat-row.bad{border-color:color-mix(in srgb,#d75050 46%,var(--lra-line))}.compat-row.muted{opacity:.68}.compat-name{display:flex;align-items:center;gap:6px;min-width:0}.compat-name>span{font-size:11px;color:var(--lra-text-2)}.compat-state{font-size:11px;font-weight:800}.compat-row.ok .compat-state{color:var(--lra-green)}.compat-row.bad .compat-state{color:#b83d3d}.compat-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+      .retrace-dialog-layer[hidden]{display:none!important}.retrace-dialog-layer{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(5,8,14,.72);backdrop-filter:blur(5px)}.retrace-dialog{width:min(560px,calc(100vw - 32px));max-height:min(78vh,680px);overflow:auto;border:1px solid var(--lra-line);border-radius:18px;background:var(--lra-surface);box-shadow:0 24px 80px rgba(0,0,0,.45);padding:20px}.retrace-dialog h3{margin:0 0 12px;font-size:17px;color:var(--lra-text)}.retrace-dialog-message{white-space:pre-wrap;word-break:break-word;color:var(--lra-text-2);font-size:13px;line-height:1.65}.retrace-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.retrace-dialog .btn.danger{border-color:rgba(239,68,68,.6);background:rgba(127,29,29,.45);color:#fecaca}.retrace-dialog .btn.danger:hover{background:rgba(153,27,27,.58)}
       @media(max-width:820px){.session-handoff-flow{grid-template-columns:1fr 1fr}.bridge{grid-template-columns:78px minmax(0,1fr)}.side{padding:10px 7px}.nav-group-label,.nav>span:not(.ic),.scope-card,.version{display:none}.nav{justify-content:center;padding:6px}.panel{padding:18px 14px 70px}.flow,.metrics{grid-template-columns:1fr 1fr}}
       @media(max-width:560px){.session-handoff-flow{grid-template-columns:1fr}.bridge{height:100dvh;max-height:100dvh;border-radius:0;grid-template-columns:64px minmax(0,1fr);grid-template-rows:62px minmax(0,1fr)}.top{padding:0 10px}.brand span,.global-status{display:none}.flow,.metrics,.settings-feature-grid,.packet-sections,.analysis-console-metrics{grid-template-columns:1fr}.ledger-key small{display:none}.field-wide,.profile-actions{grid-column:1}}
     </style>
     <div class="bridge${Runtime.busy ? ' busy' : ''}">
-      <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>FLASHBACK · HAYAKU · LIBRA · GRADIA · LIA Compatibility Hub</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="closeBridge" class="btn">닫기</button></div></header>
+      <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>FLASHBACK · HAYAKU · LIBRA · GRADIA · LIA Compatibility Hub</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="exportRetraceDebug" class="btn">디버그 로그 내보내기</button><button id="closeBridge" class="btn">닫기</button></div></header>
       <aside class="side">
         <div class="nav-group-label">Operations</div>
         <button class="nav ${Runtime.activeTab === 'session' ? 'active' : ''}" data-tab="session"><span class="ic">↪</span><span>다음 세션</span></button>
@@ -9379,7 +10082,8 @@
           <div class="actions"><button id="saveProvider" class="btn primary">프로바이더 설정 저장</button></div>
         </section>
       </main>
-    </div>`;
+    </div>
+    <div id="retraceDialogLayer" class="retrace-dialog-layer" hidden aria-hidden="true"><div class="retrace-dialog" role="dialog" aria-modal="true" aria-labelledby="retraceDialogTitle"><h3 id="retraceDialogTitle">확인</h3><div id="retraceDialogMessage" class="retrace-dialog-message"></div><div class="retrace-dialog-actions"><button id="retraceDialogCancel" type="button" class="btn">취소</button><button id="retraceDialogConfirm" type="button" class="btn primary">계속</button></div></div></div>`;
     bindUi();
     renderAnalysisConsole();
   };
@@ -9456,7 +10160,7 @@
   const setBusy = value => {
     Runtime.busy = Boolean(value);
     Runtime.root?.querySelector?.('.bridge')?.classList?.toggle('busy', Runtime.busy);
-    Runtime.root?.querySelectorAll?.('button:not(#closeBridge):not(.nav):not(#analysisReturnToRisu)').forEach(button => {
+    Runtime.root?.querySelectorAll?.('button:not(#closeBridge):not(.nav):not(#analysisReturnToRisu):not(#retraceDialogConfirm):not(#retraceDialogCancel)').forEach(button => {
       if (Runtime.busy) {
         if (!button.disabled) button.dataset.bridgeBusyDisabled = 'true';
         button.disabled = true;
@@ -9472,14 +10176,33 @@
     if (!node) return null;
     node.textContent = '전환 대상을 확인하는 중입니다.';
     try {
-      const preview = await inspectTransition();
+      let preview = await inspectTransition();
       const scopeNode = Runtime.root?.querySelector?.('#sidebarScope');
+      if (preview.pendingHandoff?.pending) {
+        try {
+          const reconciled = await reconcilePendingHandoffJournalFromDurableReadback(preview.pendingHandoff);
+          if (reconciled?.reconciled === true && reconciled?.pending !== true) {
+            preview = await inspectTransition();
+          } else if (reconciled?.reconciled === true) {
+            preview = { ...preview, pendingHandoff: reconciled };
+          }
+        } catch (error) {
+          warn('pending handoff durable journal reconciliation failed', error);
+        }
+      }
       if (preview.pendingHandoff?.pending) {
         const failedOwners = Object.entries(preview.pendingHandoff.journal?.ownerStatus || {})
           .filter(([, status]) => status?.required === true && status?.verified !== true)
           .map(([owner]) => owner)
           .join(', ');
-        node.textContent = `미완료 다음 세션 handoff가 있습니다. 같은 target/transfer로 재시도합니다.\n실패 또는 미검증 owner: ${failedOwners || '확인 중'}`;
+        let durableHint = '';
+        try {
+          const durable = await inspectPendingHandoffDurableStatus(preview.pendingHandoff);
+          if (durable?.hayakuRequired && durable?.hayaku?.verified === true) {
+            durableHint = `\nHAYAKU 실제 target 원장은 ${formatNumber(durable.hayaku.records)}개 승계가 이미 검증되었습니다. 다음 세션 만들기를 다시 누르면 journal을 완료 처리합니다.`;
+          }
+        } catch (_) {}
+        node.textContent = `미완료 다음 세션 handoff가 있습니다. 같은 target/transfer로 재시도합니다.\n실패 또는 미검증 owner: ${failedOwners || '확인 중'}${durableHint}`;
         await refreshCompatibility(preview).catch(error => warn('compatibility refresh failed', error));
         return preview;
       }
@@ -9488,7 +10211,7 @@
         ? `Flashback 기억 ${formatNumber(preview.flashback.records)}개 · ${formatNumber(preview.flashback.shards)}개 샤드`
         : `Flashback 저장 기억 0개 (${preview.flashback.reason})`;
       const hayakuLine = preview.includeHayaku
-        ? `HAYAKU 패킷 ${formatNumber(preview.hayakuRecordCount)}개 자동 포함${preview.hayaku.available ? '' : ' (콜드스타트 대기 캡슐)'}`
+        ? `HAYAKU 패킷 ${formatNumber(preview.hayakuRecordCount)}개 자동 포함 · Current ${formatNumber(preview.hayakuCurrentRecordCount || 0)} · Recovery ${formatNumber(preview.hayakuRecoveryRecordCount || 0)} · Archive ${formatNumber(preview.hayakuArchiveRecordCount || 0)}${preview.hayakuPendingRecoveryRecordCount ? ` · Recovery 원장 반영 대기 ${formatNumber(preview.hayakuPendingRecoveryRecordCount)}` : ''}${preview.hayaku.available ? '' : ' (캡슐 기반)'}`
         : `HAYAKU 제외 (${preview.hayaku.reason})`;
       const libraLine = preview.includeLibra
         ? `LIBRA 정본 메모리 ${formatNumber(preview.libraRecordCount)}개 IPC 승계 준비`
@@ -9694,9 +10417,14 @@
       ]);
       const coldStartNeedsAdoption = pending.available
         && text(result?.ledger?.coldStart?.transferId || '') !== text(pending?.capsule?.transferId || '');
+      // lastRecoveryId alone is not proof: metadata may survive while one or more
+      // recovery records/slot heads are absent. Verify durable packet bodies and
+      // recovered-turn coverage before deciding adoption is complete.
+      let incrementalVerification = pendingIncremental.available
+        ? await verifyDurableHayakuIncrementalRecovery(pendingIncremental.capsule)
+        : null;
       const incrementalNeedsAdoption = pendingIncremental.available
-        && text(result?.ledger?.incrementalRecovery?.lastRecoveryId || '')
-          !== text(pendingIncremental?.capsule?.recoveryId || '');
+        && incrementalVerification?.verified !== true;
       let adoptionChanged = false;
       if (coldStartNeedsAdoption) {
         const adoption = await requestImmediateHayakuColdStartAdoption(pending.capsule);
@@ -9705,8 +10433,13 @@
       if (incrementalNeedsAdoption) {
         const adoption = await requestImmediateHayakuIncrementalRecoveryAdoption(pendingIncremental.capsule);
         adoptionChanged = adoption.verified === true || adoptionChanged;
+        incrementalVerification = adoption.verified === true
+          ? await verifyDurableHayakuIncrementalRecovery(pendingIncremental.capsule)
+          : incrementalVerification;
       }
       if (adoptionChanged) result = await readHayakuViewerSource(context);
+      result = await mergeHayakuRecoveryAccountingForViewer(result, pendingIncremental);
+      if (incrementalVerification) result = { ...result, recoveryDurableVerification: incrementalVerification };
       if (!result.available && pending.available) {
         body.innerHTML = `<div class="empty"><strong>콜드스타트 반영 대기</strong><span>패킷 ${formatNumber(pending.packets.length)}개가 검증 저장됐습니다.</span><span>다음 모델 요청의 시작 단계에서 HAYAKU가 원장에 반영하고 같은 요청부터 리콜합니다.</span></div>`;
       } else {
@@ -9740,6 +10473,199 @@
     if (!node) return;
     node.textContent = text(message);
     node.style.color = kind === 'error' ? 'var(--lra-red)' : kind === 'ok' ? 'var(--lra-green)' : 'var(--lra-primary)';
+  };
+
+  const retraceDebugSafeValue = (value, key = '', depth = 0) => {
+    if (depth > 10) return '[DEPTH_LIMIT]';
+    const name = text(key || '').toLowerCase();
+    if (/(?:api.?key|authorization|bearer|password|secret|credential|private.?key|client.?secret|access.?token|refresh.?token|(^|_)token$)/i.test(name)) {
+      return value ? '[REDACTED]' : '';
+    }
+    if (/(?:extraheadersjson|extrabodyjson)/i.test(name)) return value ? '[REDACTED_CONFIGURED]' : '';
+    if (value == null || typeof value === 'number' || typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      if (/(?:characterid|chatid|personaid|scopekey|storagekey|manifestkey|metakey|archivescopekey)$/i.test(name)) {
+        return value ? `hash:${stableHash64(value)}` : '';
+      }
+      if (/(?:^raw$|packetbody|memorytext|chatmessages|messagebody)$/i.test(name) || value.length > 4000) {
+        return value ? `[OMITTED ${value.length} chars · ${stableHash64(value)}]` : '';
+      }
+      return value;
+    }
+    if (Array.isArray(value)) return value.slice(0, 120).map((item, index) => retraceDebugSafeValue(item, `${key}[${index}]`, depth + 1));
+    if (typeof value === 'object') {
+      const out = {};
+      for (const [childKey, childValue] of Object.entries(value)) {
+        if (['character', 'chat', 'runtimeItems', 'items', 'records', 'allRecords', 'shards', 'archiveLayers'].includes(childKey)) {
+          if (Array.isArray(childValue)) out[childKey] = `[OMITTED ARRAY ${childValue.length}]`;
+          else if (childValue && typeof childValue === 'object') out[childKey] = '[OMITTED OBJECT]';
+          else out[childKey] = childValue;
+          continue;
+        }
+        out[childKey] = retraceDebugSafeValue(childValue, childKey, depth + 1);
+      }
+      return out;
+    }
+    return text(value);
+  };
+
+  const retraceDebugProviderSummary = settings => {
+    const profile = settings?.primary || {};
+    return {
+      provider: text(profile.provider || ''),
+      url: text(profile.url || ''),
+      model: text(profile.model || ''),
+      timeoutMs: Math.max(0, Number(profile.timeoutMs || 0) || 0),
+      maxTokens: Math.max(0, Number(profile.maxTokens || 0) || 0),
+      requestFormat: text(profile.requestFormat || ''),
+      reasoningPreset: text(profile.reasoningPreset || ''),
+      reasoningEffort: text(profile.reasoningEffort || ''),
+      reasoningBudgetTokens: Number(profile.reasoningBudgetTokens || 0) || 0,
+      thinkingType: text(profile.thinkingType || ''),
+      stream: profile.stream === true,
+      serviceTier: text(profile.serviceTier || ''),
+      credentialConfigured: Boolean(text(profile.key || '').trim()),
+      extraHeadersConfigured: Boolean(text(profile.extraHeadersJson || '').trim()),
+      extraBodyConfigured: Boolean(text(profile.extraBodyJson || '').trim())
+    };
+  };
+
+  const buildRetraceDebugExport = async () => {
+    const exportedAt = new Date().toISOString();
+    let context = null;
+    let contextError = '';
+    try { context = await getCurrentContext(); } catch (error) { contextError = text(error?.message || error); }
+    const identity = context ? contextIdentity(context) : {};
+    let pending = null;
+    let durableStatus = null;
+    let transition = null;
+    let pendingColdStart = null;
+    let pendingIncremental = null;
+    let hayakuSummary = null;
+    let flashbackSummary = null;
+    let libraSummary = null;
+    let gradiaSummary = null;
+    if (context) {
+      try { pending = await inspectPendingNextSessionHandoff({ context }); } catch (error) { pending = { available: false, error: text(error?.message || error) }; }
+      if (pending?.available) {
+        try { durableStatus = await inspectPendingHandoffDurableStatus(pending); } catch (error) { durableStatus = { error: text(error?.message || error) }; }
+      }
+      try { transition = await inspectTransition(); } catch (error) { transition = { error: text(error?.message || error) }; }
+      try { pendingColdStart = await readPendingColdStartCapsule(context); } catch (error) { pendingColdStart = { available: false, error: text(error?.message || error) }; }
+      try { pendingIncremental = await readPendingIncrementalRecoveryCapsule(context); } catch (error) { pendingIncremental = { available: false, error: text(error?.message || error) }; }
+      try { hayakuSummary = await readHayakuSource(context, { includeRecords: false, skipOwnerInspect: true }); } catch (error) { hayakuSummary = { available: false, error: text(error?.message || error) }; }
+      try { flashbackSummary = await readFlashbackSource(context, { includeRecords: false, skipRuntime: true, skipIpc: true }); } catch (error) { flashbackSummary = { available: false, error: text(error?.message || error) }; }
+      try { libraSummary = await readLibraSource(context, { includeRecords: false }); } catch (error) { libraSummary = { available: false, error: text(error?.message || error) }; }
+      try { gradiaSummary = await readGradiaSource(context, { includePayload: false }); } catch (error) { gradiaSummary = { available: false, error: text(error?.message || error) }; }
+    }
+    let settings = null;
+    try { settings = await loadSettings(); } catch (_) {}
+    const payload = {
+      schema: 'retrace_debug_export_v1',
+      schemaVersion: 1,
+      exportedAt,
+      plugin: PLUGIN_NAME,
+      pluginVersion: PLUGIN_VERSION,
+      privacy: {
+        credentialValues: 'redacted',
+        rawChatMessages: 'omitted',
+        rawMemoryBodies: 'omitted',
+        characterChatPersonaIds: 'hashed'
+      },
+      environment: {
+        timezone: (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (_) { return ''; } })(),
+        language: text(globalThis.navigator?.language || ''),
+        userAgent: text(globalThis.navigator?.userAgent || '')
+      },
+      context: {
+        available: Boolean(context),
+        error: contextError,
+        characterIdHash: identity.characterId ? stableHash64(identity.characterId) : '',
+        chatIdHash: identity.chatId ? stableHash64(identity.chatId) : '',
+        personaIdHash: identity.personaId ? stableHash64(identity.personaId) : '',
+        chatTitle: compact(context?.chat?.name || context?.chat?.title || '', 120),
+        chatMessageCount: Array.isArray(context?.chat?.message) ? context.chat.message.length : 0,
+        source: text(context?.source || '')
+      },
+      provider: retraceDebugProviderSummary(settings),
+      runtime: {
+        visible: Runtime.visible === true,
+        mounted: Runtime.mounted === true,
+        activeTab: text(Runtime.activeTab || ''),
+        busy: Runtime.busy === true,
+        analysis: analysisProgressSnapshot(),
+        ipc: {
+          flashback: {
+            registered: Runtime.flashbackIpcRegistered === true,
+            lastSeenAt: Runtime.flashbackIpcLastSeenAt || 0,
+            lastError: Runtime.flashbackIpcLastError || '',
+            lastTimeoutAt: Runtime.flashbackIpcLastTimeoutAt || 0,
+            pending: Runtime.flashbackIpcPending?.size || 0,
+            summaryTimeoutMs: FLASHBACK_INSPECT_SUMMARY_TIMEOUT_MS,
+            inspectCircuitUntil: Runtime.flashbackInspectCircuitUntil || 0,
+            inspectCircuitOpen: Runtime.flashbackInspectCircuitUntil > Date.now(),
+            inspectCircuitTrips: Runtime.flashbackInspectCircuitTrips || 0,
+            inspectFallbackCount: Runtime.flashbackInspectFallbackCount || 0,
+            inspectLastFallbackAt: Runtime.flashbackInspectLastFallbackAt || 0,
+            inspectLastFallbackReason: Runtime.flashbackInspectLastFallbackReason || '',
+            inspectIpcSuccesses: Runtime.flashbackInspectIpcSuccesses || 0,
+            summaryInFlight: Boolean(Runtime.flashbackInspectSummaryPromise)
+          },
+          hayaku: { registered: Runtime.hayakuIpcRegistered === true, unavailableUntil: Runtime.hayakuIpcUnavailableUntil || 0, pending: Runtime.hayakuIpcPending?.size || 0 },
+          libra: { registered: Runtime.libraIpcRegistered === true, lastSeenAt: Runtime.libraIpcLastSeenAt || 0, lastError: Runtime.libraIpcLastError || '', pending: Runtime.libraIpcPending?.size || 0 },
+          gradia: { registered: Runtime.gradiaIpcRegistered === true, lastSeenAt: Runtime.gradiaIpcLastSeenAt || 0, lastError: Runtime.gradiaIpcLastError || '', pending: Runtime.gradiaIpcPending?.size || 0 },
+          lia: { registered: Runtime.liaIpcRegistered === true, lastError: Runtime.liaIpcLastError || '', pending: Runtime.liaIpcPending?.size || 0 }
+        },
+        handoffResumeInFlight: Runtime.handoffResumePromises?.size || 0,
+        lastUiDialog: clone(Runtime.lastUiDialog, null),
+        warnings: clone(Runtime.warnings, [])
+      },
+      handoff: {
+        pending: pending ? {
+          available: pending.available === true,
+          pending: pending.pending === true,
+          reason: text(pending.reason || ''),
+          targetChatId: text(pending.targetChatId || ''),
+          bridge: pending.bridge,
+          journal: pending.journal
+        } : null,
+        durableStatus,
+        lastTransition: Runtime.lastTransition,
+        transitionPreview: transition ? {
+          includeHayaku: transition.includeHayaku === true,
+          hayakuRecordCount: Math.max(0, Number(transition.hayakuRecordCount || 0) || 0),
+          hayakuCurrentRecordCount: Math.max(0, Number(transition.hayakuCurrentRecordCount || 0) || 0),
+          hayakuRecoveryRecordCount: Math.max(0, Number(transition.hayakuRecoveryRecordCount || 0) || 0),
+          hayakuPendingRecoveryRecordCount: Math.max(0, Number(transition.hayakuPendingRecoveryRecordCount || 0) || 0),
+          hayakuArchiveRecordCount: Math.max(0, Number(transition.hayakuArchiveRecordCount || 0) || 0),
+          includeLibra: transition.includeLibra === true,
+          includeGradia: transition.includeGradia === true,
+          pendingHandoff: transition.pendingHandoff
+        } : null
+      },
+      owners: {
+        hayaku: hayakuSummary,
+        flashback: flashbackSummary,
+        libra: libraSummary,
+        gradia: gradiaSummary,
+        pendingColdStart: pendingColdStart ? { available: pendingColdStart.available === true, reason: text(pendingColdStart.reason || ''), packetCount: Array.isArray(pendingColdStart.packets) ? pendingColdStart.packets.length : 0, scope: pendingColdStart.scope } : null,
+        pendingIncrementalRecovery: pendingIncremental ? { available: pendingIncremental.available === true, reason: text(pendingIncremental.reason || ''), packetCount: Array.isArray(pendingIncremental.packets) ? pendingIncremental.packets.length : 0, recoveryId: text(pendingIncremental.capsule?.recoveryId || ''), sourceHash: text(pendingIncremental.capsule?.sourceHash || ''), scope: pendingIncremental.scope } : null
+      },
+      compatibility: Runtime.compatibilitySuite,
+      recent: {
+        lastColdStart: Runtime.lastColdStart,
+        lastIncrementalRecovery: Runtime.lastIncrementalRecovery,
+        lastHayakuBackup: Runtime.lastHayakuBackup
+      }
+    };
+    return retraceDebugSafeValue(payload);
+  };
+
+  const exportRetraceDebugLogFile = async () => {
+    const payload = await buildRetraceDebugExport();
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    if (!downloadJson(`retrace-debug-${stamp}.json`, payload)) throw new Error('브라우저 다운로드를 시작하지 못했습니다.');
+    return payload;
   };
 
   const downloadJson = (filename, value) => {
@@ -9855,6 +10781,14 @@
       }
       return { profile, meta };
     };
+    root.querySelector('#exportRetraceDebug')?.addEventListener('click', async () => {
+      const button = root.querySelector('#exportRetraceDebug');
+      const previous = button?.textContent || '디버그 로그 내보내기';
+      if (button) { button.disabled = true; button.textContent = '내보내는 중…'; }
+      try { await exportRetraceDebugLogFile(); }
+      catch (error) { await retraceAlert(`RE:TRACE 디버그 로그 내보내기 실패\n${error?.message || error}`); }
+      finally { if (button) { button.disabled = false; button.textContent = previous; } }
+    });
     root.querySelector('#closeBridge')?.addEventListener('click', () => closeUi());
     root.querySelector('#analysisReturnToRisu')?.addEventListener('click', () => closeUi());
     for (const button of root.querySelectorAll('.nav[data-tab]')) {
@@ -9897,7 +10831,7 @@
         if (maxNode) maxNode.textContent = `\uCD5C\uB300 ${formatNumber(target.maxTurn)}\uD134`;
         await scrollToChatMessageIndex(target.messageIndex);
       } catch (error) {
-        globalThis.alert?.(`HAYAKU \uD134 \uC774\uB3D9 \uC2E4\uD328\n${error?.message || error}`);
+        await retraceAlert(`HAYAKU \uD134 \uC774\uB3D9 \uC2E4\uD328\n${error?.message || error}`);
       } finally {
         setBusy(false);
       }
@@ -9921,15 +10855,15 @@
       if (deleting) {
         const message = '\uC774 \uD328\uD0B7\uC744 \uC0AD\uC81C\uD560\uAE4C\uC694?\n\n'
           + '\uBCF5\uAD6C \uAC00\uB2A5\uD55C tombstone\uC73C\uB85C \uCC98\uB9AC\uD558\uBA70, \uC601\uAD6C \uBCF4\uC874 \uAE30\uB85D\uC740 \uC0AD\uC81C\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.';
-        if (typeof globalThis.confirm === 'function' && !globalThis.confirm(message)) return;
+        if (!(await retraceConfirm(message, { title: 'HAYAKU 패킷 삭제', confirmLabel: '삭제', danger: true }))) return;
         setBusy(true);
         try {
           const deletion = await deleteHayakuRecord(record);
-          globalThis.alert?.(`패킷 삭제를 확인했습니다. 활성 원장에서 제외되었으며 tombstone으로 보존됩니다.${deletion?.suppressedRecords ? `\n동일 variant alias ${formatNumber(deletion.suppressedRecords)}개 억제` : ''}`);
+          await retraceAlert(`패킷 삭제를 확인했습니다. 활성 원장에서 제외되었으며 tombstone으로 보존됩니다.${deletion?.suppressedRecords ? `\n동일 variant alias ${formatNumber(deletion.suppressedRecords)}개 억제` : ''}`);
           await refreshHayaku();
           await refreshIncrementalRecovery();
         } catch (error) {
-          globalThis.alert?.(`HAYAKU \uD328\uD0B7 \uC0AD\uC81C \uC2E4\uD328\n${error?.message || error}`);
+          await retraceAlert(`HAYAKU \uD328\uD0B7 \uC0AD\uC81C \uC2E4\uD328\n${error?.message || error}`);
         } finally {
           setBusy(false);
         }
@@ -9938,18 +10872,18 @@
       const turns = recordRegenerationTurns(record);
       const message = `\uC774 \uD328\uD0B7\uC744 \uC7AC\uC0DD\uC131\uD560\uAE4C\uC694?\n\n\uB300\uC0C1 \uD134: ${turns.join(', ')}\n`
         + '\uC0C8 \uD328\uD0B7\uC774 \uAC80\uC99D\uB41C \uB4A4\uC5D0\uB9CC \uAE30\uC874 \uD328\uD0B7\uC744 tombstone \uCC98\uB9AC\uD558\uACE0 \uAD50\uCCB4\uD569\uB2C8\uB2E4.';
-      if (typeof globalThis.confirm === 'function' && !globalThis.confirm(message)) return;
+      if (!(await retraceConfirm(message, { title: 'HAYAKU 패킷 재생성', confirmLabel: '재생성' }))) return;
       setBusy(true);
       try {
         const result = await regenerateHayakuRecord(record);
-        globalThis.alert?.(
+        await retraceAlert(
           `HAYAKU \uD328\uD0B7 \uC7AC\uC0DD\uC131\uC744 \uC644\uB8CC\uD588\uC2B5\uB2C8\uB2E4.\n`
           + `\uD134 ${(result.recoveredTurns || []).join(', ')} \u00B7 \uAD50\uCCB4 ${formatNumber(result.adoption?.replacedRecords || 0)}\uAC1C`
         );
         await refreshHayaku();
         await refreshIncrementalRecovery();
       } catch (error) {
-        globalThis.alert?.(`HAYAKU \uD328\uD0B7 \uC7AC\uC0DD\uC131 \uC2E4\uD328\n${error?.message || error}`);
+        await retraceAlert(`HAYAKU \uD328\uD0B7 \uC7AC\uC0DD\uC131 \uC2E4\uD328\n${error?.message || error}`);
       } finally {
         setBusy(false);
       }
@@ -10057,7 +10991,7 @@
     }
     root.querySelector('#runColdStart')?.addEventListener('click', async () => {
       if (analysisIsRunning()) {
-        globalThis.alert?.('이미 분석 작업이 실행 중입니다. 실시간 분석 콘솔에서 진행 상태를 확인하세요.');
+        await retraceAlert('이미 분석 작업이 실행 중입니다. 실시간 분석 콘솔에서 진행 상태를 확인하세요.');
         return;
       }
       setBusy(true);
@@ -10071,7 +11005,7 @@
           ? '저장된 검증 캡슐을 HAYAKU 원장에 다시 채택합니다. 모델은 호출하지 않습니다.\n\n계속할까요?'
           : `현재 채팅 ${formatNumber(inspection.evidence.rows.length)}개 메시지의 ${formatNumber(pendingChunks)}개 청크를 분석합니다.\n`
             + `라이브 원장은 보존되며, Primary 프로필로 생성형 LLM을 최대 ${formatNumber(pendingChunks)}회 호출할 수 있습니다.\n\n계속할까요?`;
-        if (typeof globalThis.confirm === 'function' && !globalThis.confirm(confirmed)) return;
+        if (!(await retraceConfirm(confirmed, { title: 'HAYAKU 콜드스타트', confirmLabel: '분석 시작' }))) return;
         const status = root.querySelector('#coldStartStatus');
         if (status) status.textContent = mode === 'readopt'
           ? '검증된 콜드스타트 캡슐을 다시 채택하는 중입니다.'
@@ -10080,7 +11014,7 @@
         startBackgroundAnalysisTask('cold_start', mode, onProgress => executeColdStart({ mode, onProgress }));
         renderAnalysisConsole();
       } catch (error) {
-        globalThis.alert?.(`HAYAKU 콜드스타트 실패\n${error?.message || error}`);
+        await retraceAlert(`HAYAKU 콜드스타트 실패\n${error?.message || error}`);
         await refreshColdStart();
       } finally {
         if (Runtime.busy) setBusy(false);
@@ -10088,7 +11022,7 @@
     });
     root.querySelector('#runIncrementalRecovery')?.addEventListener('click', async () => {
       if (analysisIsRunning()) {
-        globalThis.alert?.('이미 분석 작업이 실행 중입니다. 실시간 분석 콘솔에서 진행 상태를 확인하세요.');
+        await retraceAlert('이미 분석 작업이 실행 중입니다. 실시간 분석 콘솔에서 진행 상태를 확인하세요.');
         return;
       }
       setBusy(true);
@@ -10109,7 +11043,7 @@
               + `전체 누락 범위는 ${formatNumber(inspection.evidence.chunks.length)}개 청크이며, 실제 Primary 프로필 호출은 최대 ${formatNumber(pendingChunks)}회입니다.\n\n계속할까요?`
             : `누락 완료 턴 ${inspection.evidence.coverage.missingTurns.join(', ')}를 ${formatNumber(pendingChunks)}개 청크로 증분 분석합니다.\n`
               + `이미 커버된 턴과 콜드스타트 epoch는 변경하지 않습니다. Primary 프로필을 최대 ${formatNumber(pendingChunks)}회 호출할 수 있습니다.\n\n계속할까요?`;
-        if (typeof globalThis.confirm === 'function' && !globalThis.confirm(confirmed)) return;
+        if (!(await retraceConfirm(confirmed, { title: 'HAYAKU 누락 복구', confirmLabel: '재분석 시작' }))) return;
         const status = root.querySelector('#incrementalRecoveryStatus');
         if (status) status.textContent = mode === 'readopt'
           ? '검증된 증분 재분석 캡슐을 다시 채택하는 중입니다.'
@@ -10118,7 +11052,7 @@
         startBackgroundAnalysisTask('incremental_recovery', mode, onProgress => executeIncrementalRecovery({ mode, onProgress }));
         renderAnalysisConsole();
       } catch (error) {
-        globalThis.alert?.(`HAYAKU 증분 재분석 실패\n${error?.message || error}`);
+        await retraceAlert(`HAYAKU 증분 재분석 실패\n${error?.message || error}`);
         await refreshIncrementalRecovery();
       } finally {
         if (Runtime.busy) setBusy(false);
@@ -10140,7 +11074,7 @@
           worldAdditional: result.worldAdditional
         })) throw new Error('브라우저 다운로드를 시작하지 못했습니다.');
       } catch (error) {
-        globalThis.alert?.(`LIBRA 내보내기 실패\n${error?.message || error}`);
+        await retraceAlert(`LIBRA 내보내기 실패\n${error?.message || error}`);
       } finally {
         setBusy(false);
       }
@@ -10170,7 +11104,7 @@
         };
         if (!downloadJson(`flashback-memory-${stamp}.json`, payload)) throw new Error('브라우저 다운로드를 시작하지 못했습니다.');
       } catch (error) {
-        globalThis.alert?.(`Flashback 내보내기 실패\n${error?.message || error}`);
+        await retraceAlert(`Flashback 내보내기 실패\n${error?.message || error}`);
       } finally {
         setBusy(false);
       }
@@ -10179,13 +11113,13 @@
       setBusy(true);
       try {
         const result = await backupHayakuLedger();
-        globalThis.alert?.(
+        await retraceAlert(
           `HAYAKU 미러 원장 백업을 완료했습니다.\n`
           + `레코드 ${formatNumber(result.recordCount)}개 · 슬롯 ${formatNumber(result.slotHeadCount)}개\n`
           + `백업 ID ${result.backupId}\n검증 ${result.verified ? '완료' : '실패'}`
         );
       } catch (error) {
-        globalThis.alert?.(`HAYAKU 미러 원장 백업 실패\n${error?.message || error}`);
+        await retraceAlert(`HAYAKU 미러 원장 백업 실패\n${error?.message || error}`);
       } finally {
         setBusy(false);
       }
@@ -10204,7 +11138,7 @@
           ledger: result.ledger
         });
       } catch (error) {
-        globalThis.alert?.(`HAYAKU 내보내기 실패\n${error?.message || error}`);
+        await retraceAlert(`HAYAKU 내보내기 실패\n${error?.message || error}`);
       } finally {
         setBusy(false);
       }
@@ -10217,17 +11151,17 @@
         renderCompatibilitySuite(compatibilitySuite);
         if (!compatibilitySuite.compatible) {
           const blocking = (compatibilitySuite.blocking || []).map(item => `${item.label}: ${item.reason}`).join('\n');
-          globalThis.alert?.(`다음 세션 승계를 시작할 수 없습니다.\n\n${blocking}\n\nRE:TRACE 홈 상단의 호환성 패널에서 각 플러그인의 계약 상태를 확인하세요.`);
+          await retraceAlert(`다음 세션 승계를 시작할 수 없습니다.\n\n${blocking}\n\nRE:TRACE 홈 상단의 호환성 패널에서 각 플러그인의 계약 상태를 확인하세요.`);
           return;
         }
         if (preview.pendingHandoff?.pending) {
           const retryMessage = '미완료 다음 세션 handoff를 같은 target/transfer로 다시 검증합니다. 새 채팅은 추가로 만들지 않습니다.\n\n계속할까요?';
-          if (typeof globalThis.confirm === 'function' && !globalThis.confirm(retryMessage)) return;
+          if (!(await retraceConfirm(retryMessage, { title: '미완료 승계 재검증', confirmLabel: '재검증' }))) return;
           const retried = await resumeNextSessionHandoff({
             targetChatId: preview.pendingHandoff.targetChatId,
             transferId: preview.pendingHandoff.journal.transferId
           });
-          globalThis.alert?.(retried.ok
+          await retraceAlert(retried.ok
             ? `다음 세션 handoff 재개가 완료되었습니다.\ntransferId: ${retried.transferId}`
             : `다음 세션 handoff가 아직 미완료입니다. 같은 버튼으로 다시 재시도할 수 있습니다.\ntransferId: ${retried.transferId}`);
           await refreshTransition();
@@ -10243,10 +11177,10 @@
           + (isLiaLivePersonaId(preview.identity?.personaId) ? 'LIA Live Persona · 새 채팅 전용 Fork\n' : 'LIA Live Persona 없음\n')
           + `Flashback 기억 ${formatNumber(preview.flashback.records)}개\n`
           + (preview.includeHayaku
-            ? `HAYAKU 패킷 ${formatNumber(preview.hayakuRecordCount)}개`
+            ? `HAYAKU 패킷 ${formatNumber(preview.hayakuRecordCount)}개 (Current ${formatNumber(preview.hayakuCurrentRecordCount || 0)} · Recovery ${formatNumber(preview.hayakuRecoveryRecordCount || 0)} · Archive ${formatNumber(preview.hayakuArchiveRecordCount || 0)})`
             : 'HAYAKU 원장 없음')
           + '\n\n원본 채팅과 원장은 그대로 보존됩니다.';
-        if (typeof globalThis.confirm === 'function' && !globalThis.confirm(message)) return;
+        if (!(await retraceConfirm(message, { title: '다음 세션 만들기', confirmLabel: '승계 시작' }))) return;
         const result = await continueToNextSession();
         if (!result.ok) {
           const failedOwners = [
@@ -10256,7 +11190,7 @@
             result.gradiaVerified ? '' : result.gradiaScheduled ? `GRADIA: ${result.gradiaAdoption?.reason || 'not_verified'}` : '',
             result.liaVerified ? '' : result.liaRequired ? `LIA: ${result.liaAdoption?.reason || 'not_verified'}` : ''
           ].filter(Boolean);
-          globalThis.alert?.(`새 채팅은 보존되었지만 일부 승계 대상의 owner handoff가 아직 미완료입니다. 같은 버튼으로 동일 target/transfer를 재시도할 수 있습니다.\ntransferId: ${result.transferId}${failedOwners.length ? `\n\n${failedOwners.join('\n')}` : ''}`);
+          await retraceAlert(`새 채팅은 보존되었지만 일부 승계 대상의 owner handoff가 아직 미완료입니다. 같은 버튼으로 동일 target/transfer를 재시도할 수 있습니다.\ntransferId: ${result.transferId}${failedOwners.length ? `\n\n${failedOwners.join('\n')}` : ''}`);
           await refreshTransition();
           return;
         }
@@ -10285,7 +11219,7 @@
             ? `LIA Live Persona Fork 확인: ${result.targetLivePersonaId || result.liaAdoption?.livePersonaName || 'new Live Persona'}`
             : `LIA Live Persona Fork 검증 실패: ${result.liaAdoption?.reason || 'unknown'}`
           : 'LIA Live Persona 없음';
-        globalThis.alert?.(
+        await retraceAlert(
           `다음 세션을 만들었습니다.\n`
           + `${libraStatus}\n`
           + `${gradiaStatus}\n`
@@ -10296,7 +11230,7 @@
         );
         await refreshTransition();
       } catch (error) {
-        globalThis.alert?.(`다음 세션 만들기 실패\n${error?.message || error}`);
+        await retraceAlert(`다음 세션 만들기 실패\n${error?.message || error}`);
       } finally {
         setBusy(false);
       }
@@ -10391,7 +11325,11 @@
     inspectCompatibility: inspectCompatibilitySuite,
     continueToNextSession,
     inspectPendingNextSessionHandoff,
+    inspectPendingHandoffDurableStatus,
+    reconcilePendingHandoffJournalFromDurableReadback,
     resumeNextSessionHandoff,
+    exportDebugLogFile: exportRetraceDebugLogFile,
+    debugSnapshot: buildRetraceDebugExport,
     adoptFlashbackSessionHandoff,
     adoptHayakuSessionHandoff,
     inspectColdStart,
@@ -10450,7 +11388,8 @@
       prepareGradiaSessionHandoff, adoptGradiaSessionHandoff, adoptGradiaSessionHandoffDurable, verifyDurableGradiaSessionHandoff,
       requiredHandoffsVerified,
       sealNextSessionHandoffJournal, nextSessionHandoffJournalFromChat,
-      inspectPendingNextSessionHandoff, persistNextSessionHandoffJournal, performPendingNextSessionHandoff,
+      inspectPendingNextSessionHandoff, inspectPendingHandoffDurableStatus, reconcilePendingHandoffJournalFromDurableReadback, persistNextSessionHandoffJournal, performPendingNextSessionHandoff,
+      verifyHayakuSessionHandoffFromStorage, buildRetraceDebugExport, retraceDebugSafeValue,
       libraMemoryViewerInfo,
       coldStartChunkHash, coldStartConfigHash, incrementalRecoveryConfigHash,
       incrementalRecoveryCheckpointBodyReusable, incrementalRecoveryCheckpointPlan,

@@ -1,16 +1,27 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.35
+//@version 1.9.43
+/* v1.9.43 adds an owner-gated optional automatic HAYAKU repair worker. It reacts to durable Recovery Vault debt events, leases exact worldline variants, disables source-fallback packets in automatic mode, suspends and reuses a verified candidate across first-observation rollback quarantine, and requires HAYAKU owner-side target/adoption readback before completion. HAYAKU-related analysis, viewing, handoff, backup, compatibility fallback, and server-scope scans remain completely inactive when a live authenticated HAYAKU owner is absent. */
+/* v1.9.42 adds a non-destructive canonical identity layer to Memory Suite scope discovery: RisuAI chaId/chat.id aliases are retained alongside legacy physical scope IDs so owner scope matching and diagnostics can converge without rewriting peer storage keys. */
+/* v1.9.41 adds suite-wide Memory Suite server diagnostics to the RE:TRACE debug export. RE:TRACE retrieves the privacy-scrubbed event journal and integrity state for all six namespaces through the manager-only endpoint, while falling back to its own namespace/offline snapshot if the manager endpoint is unavailable. */
+/* v1.9.40 makes RE:TRACE's own recovery/cold-start storage mode independent per chat scope and updates owner deletion/handoff proof to change only the target scope. Peer server inspection remains read-only and can never overwrite another plugin's routing policy. */
+/* v1.9.39 adds shared Memory Suite background synchronization telemetry to RE:TRACE server connection. Initial seeding, mirror sync, and restore expose live phase/count/bytes/timing/retry diagnostics and continue after the panel closes without changing server-scope management, next-session handoff, or source-immutability rules. */
+/* v1.9.38 adds a dedicated 서버 연결 side-panel page separate from Server Data Management. It exposes RE:TRACE storage mode, loopback URL editing, connection testing, server/protocol status, synchronization, recovery, and guarded pluginStorage deletion while preserving next-session handoff and scope-management behavior. */
+/* v1.9.37 adds Server Data Management with explicit active, referenced-ancestor, orphan-candidate and unverified scope states. RE:TRACE derives a conservative scope index from all six Memory Suite namespaces, never auto-deletes missing-chat data, requires stable host inventory and owner proof, creates a server backup, and uses a two-step conditional deletion plan. */
 //@allowed-ipc libra
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
 //@allowed-ipc lia_persona_linker
 //@allowed-ipc serial_gradation_agents_for_rp
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/RETRACE/refs/heads/main/RETRACE.js
+//@arg memory_suite_server_mode string Legacy 0.2.6 migration only; current scope modes are stored in the routing registry
+//@arg memory_suite_server_url string Memory Suite server URL; blank uses http://127.0.0.1:47630
+//@arg retrace_hayaku_auto_repair string true|false; optional automatic LLM repair for HAYAKU Recovery Vault debt; blank uses false
 //@description LIBRA, GRADIA, HAYAKU, Flashback, and LIA Live Persona continuity analysis and next-session handoff bridge
 //@author Hayaku
 
+/* v1.9.37 adds Memory Suite serverization to RE:TRACE itself and makes next-session handoff server-aware. RE:TRACE durable recovery/cold-start/backup records can use plugin-only, mirror, or server-only storage; server-side Flashback/HAYAKU data is available to read-only fallback inspection when pluginStorage was intentionally cleared; LIBRA/GRADIA/LIA server presence is surfaced even when owner IPC is unavailable; and patched owner handoff receipts prove Memory Suite mirror/server synchronization before and after prepare/adopt/verify without weakening immutable-source safeguards. */
 /* v1.9.35 fixes RE:TRACE runtime version reporting and hardens current-chat resolution against RisuAI's transient chat selection race. getCurrentChatIndex() may briefly throw while the host's character/chat page is switching; RE:TRACE now treats that as a soft host-context miss, falls back to the already-read character.chatPage when valid, retries the indexed resolver with short bounded delays, and only fails after both indexed and direct context paths are unavailable. This prevents the compatibility/transition panel from showing Cannot read properties of undefined (reading 'chatPage') while preserving exact character/chat identity checks before handoff writes. */
 /* v1.9.34 gives GRADIA next-session owner handoff storage-safe IPC budgets instead of the old 6s prepare/verify ceiling: prepare/adopt now allow up to 90s and verify up to 60s, the GRADIA IPC transport cap is raised to 120s, and owner-side rejected receipts are no longer redundantly retried through the shared-runtime fallback. This prevents a healthy but storage-busy GRADIA prepare_session_handoff from aborting before target chat creation while preserving fail-closed receipt validation. */
 /* v1.9.33 hardens LIBRA handoff error handling: remote owner rejections such as SOURCE_MUTATION_DETECTED are no longer retried through the same runtime API, while genuine IPC transport failures may still fall back. LIBRA IPC remote error codes are preserved when available so diagnostics distinguish transport failure from owner-side fail-closed safety checks. */
@@ -36,8 +47,3815 @@
 (async () => {
   'use strict';
 
+/* MEMORY SUITE STORAGE SDK v1.8.1
+ * Scope-routed durable storage client shared by Flashback, HAYAKU, LIBRA, GRADIA, LIA and RE:TRACE.
+ * The server stores opaque values. Each plugin keeps ownership of its own data schema.
+ */
+const createMemorySuiteStorageBridge = (rawOptions = {}) => {
+  const options = rawOptions && typeof rawOptions === 'object' ? rawOptions : {};
+  const namespace = String(options.namespace || '').trim().toLowerCase();
+  const pluginId = String(options.pluginId || namespace || 'plugin').trim();
+  const pluginVersion = String(options.pluginVersion || '').trim();
+  const defaultUrl = String(options.defaultUrl || 'http://127.0.0.1:47630').replace(/\/+$/, '');
+  const pluginPrefixes = Array.isArray(options.pluginPrefixes) ? options.pluginPrefixes.map(String) : [];
+  const pluginKeys = new Set(Array.isArray(options.pluginKeys) ? options.pluginKeys.map(String) : []);
+  const localPrefixes = Array.isArray(options.localPrefixes) ? options.localPrefixes.map(String) : [];
+  const localKeys = new Set(Array.isArray(options.localKeys) ? options.localKeys.map(String) : []);
+  const excludedKeys = new Set(Array.isArray(options.excludedKeys) ? options.excludedKeys.map(value => String(value).toLowerCase()) : []);
+  const excludedPrefixes = Array.isArray(options.excludedPrefixes) ? options.excludedPrefixes.map(value => String(value).toLowerCase()) : [];
+  const excludedContains = Array.isArray(options.excludedContains) ? options.excludedContains.map(value => String(value).toLowerCase()).filter(Boolean) : [];
+  const modeArguments = [...new Set(['memory_suite_server_mode', ...(Array.isArray(options.modeArguments) ? options.modeArguments : [])].map(String))];
+  const urlArguments = [...new Set(['memory_suite_server_url', ...(Array.isArray(options.urlArguments) ? options.urlArguments : [])].map(String))];
+  const requiredCapabilities = ['kv.v1', 'keys.v1', 'revision.v1', 'digest.v1', 'idempotency.v1', 'tombstone.v1', 'readback.v1', 'namespace-integrity.v1'];
+  const MODE_PLUGIN_ONLY = 'plugin_only';
+  const MODE_MIRROR = 'mirror';
+  const MODE_SERVER_ONLY = 'server_only';
+  const VALID_MODES = new Set([MODE_PLUGIN_ONLY, MODE_MIRROR, MODE_SERVER_ONLY]);
+  const displayName = String(options.displayName || pluginId || namespace || 'Plugin').trim();
+  const managementButtonEnabled = options.managementButton !== false;
+  const requestTimeoutMs = Math.max(5000, Math.min(120000, Number(options.requestTimeoutMs || 30000) || 30000));
+  const configCacheMs = 30000;
+  const bootstrapCacheMs = 30000;
+  const proxyCache = new WeakMap();
+  const localProxyCache = new WeakMap();
+  const migrationStateByLegacy = new WeakMap();
+  const mutationTails = new Map();
+  const autoMigratePlugin = options.autoMigratePlugin !== false;
+  const autoMigrateLocal = options.autoMigrateLocal !== false;
+  const migrationConcurrency = Math.max(1, Math.min(4, Number(options.migrationConcurrency || 2) || 2));
+  const migrationRetryMs = Math.max(5000, Math.min(10 * 60 * 1000, Number(options.migrationRetryMs || 30000) || 30000));
+  const currentScopeProvider = typeof options.currentScopeProvider === 'function' ? options.currentScopeProvider : null;
+  const resolveKeyScopeProvider = typeof options.resolveKeyScope === 'function' ? options.resolveKeyScope : null;
+  const scopeRoutingEnabled = options.scopeRouting !== false;
+  const scopeCacheMs = Math.max(0, Math.min(10000, Number(options.scopeCacheMs || 0) || 0));
+  const sharedRouteModeRaw = String(options.sharedRouteMode || MODE_MIRROR);
+  const namespaceDelaySeed = Array.from(namespace).reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  const migrationDelayMs = Math.max(250, Math.min(10000, Number(options.migrationDelayMs || (700 + (namespaceDelaySeed % 7) * 240)) || 700));
+  const state = {
+    config: { at: 0, mode: MODE_PLUGIN_ONLY, url: defaultUrl },
+    bootstrap: { at: 0, baseUrl: '', value: null, pending: null },
+    status: { state: 'idle', at: 0, reason: '', serverVersion: '', url: defaultUrl, namespace },
+    migration: {
+      plugin: { state: 'idle', scanned: 0, migrated: 0, skipped: 0, failed: 0, at: 0, reason: '' },
+      local: { state: 'idle', scanned: 0, migrated: 0, skipped: 0, failed: 0, at: 0, reason: '' }
+    },
+    warned: new Set(),
+    legacy: { plugin: null, local: null },
+    management: { registered: false, registering: false, handle: null, timer: null, root: null, lastResult: null },
+    syncJob: { current: null, promise: null, retryTimer: null, persistTimer: null, loaded: false, listeners: new Set() },
+    transientMode: '',
+    diagnostics: { value: null, at: 0, pending: null, timer: null },
+    scopeRouting: {
+      current: null,
+      currentAt: 0,
+      registry: null,
+      registryLoaded: false,
+      registryLoading: null,
+      transientModes: new Map(),
+      routeCache: new Map(),
+      lastLegacyImport: null
+    }
+  };
+  const SYNC_JOB_SCHEMA = 'memory-suite.sync-job.v1';
+  const SYNC_JOB_STORAGE_KEY = `__memory_suite_internal_sync_job_v1__:${namespace}`;
+  const SYNC_JOB_RETRY_DELAYS_MS = Object.freeze([3000, 5000, 10000, 20000, 30000]);
+  const SCOPE_ROUTING_SCHEMA = 'memory-suite.scope-routing.v1';
+  const SCOPE_ROUTING_LOCAL_KEY = `__memory_suite_internal_scope_routes_v1__:${namespace}`;
+  const SCOPE_ROUTING_SERVER_KEY = `__memory_suite_scope_routes_v1__:${namespace}`;
+  const SCOPED_REMOTE_KEY_MARKER = '::memory-suite-scope:v1:';
+
+  const safeText = value => String(value == null ? '' : value);
+  const compact = (value, max = 500) => safeText(value).replace(/\s+/g, ' ').trim().slice(0, max);
+  const jsonComparable = value => {
+    try { return JSON.stringify(value); }
+    catch (_) { return '__MEMORY_SUITE_UNSERIALIZABLE__'; }
+  };
+  const setStatus = (next, reason = '', extra = {}) => {
+    state.status = { ...state.status, state: String(next || 'unknown'), reason: compact(reason), at: Date.now(), ...extra };
+  };
+  const warnOnce = (code, error) => {
+    const key = String(code || 'warning');
+    if (state.warned.has(key)) return;
+    state.warned.add(key);
+    try { console.warn(`[Memory Suite/${pluginId}] ${key}:`, error?.message || error || 'unknown'); } catch (_) {}
+  };
+
+  const storageValueBytes = value => {
+    let serialized = '';
+    try { serialized = JSON.stringify(value); } catch (_) { serialized = safeText(value); }
+    if (serialized == null) serialized = '';
+    try { if (typeof TextEncoder === 'function') return new TextEncoder().encode(String(serialized)).byteLength; } catch (_) {}
+    return String(serialized).length * 2;
+  };
+
+  const syncJobTerminal = status => ['completed', 'failed', 'cancelled'].includes(String(status || ''));
+  const cloneSyncJob = value => {
+    if (!value || typeof value !== 'object') return null;
+    try { return JSON.parse(JSON.stringify(value)); } catch (_) { return { ...value }; }
+  };
+  const notifySyncJob = () => {
+    const snapshot = cloneSyncJob(state.syncJob.current);
+    for (const listener of Array.from(state.syncJob.listeners)) {
+      try { listener(snapshot); } catch (_) {}
+    }
+  };
+  const persistSyncJobNow = async () => {
+    if (state.syncJob.persistTimer) { clearTimeout(state.syncJob.persistTimer); state.syncJob.persistTimer = null; }
+    const legacy = state.legacy.plugin;
+    const job = state.syncJob.current;
+    if (!legacy || typeof legacy.setItem !== 'function' || !job) return false;
+    try {
+      const payload = JSON.stringify({ ...cloneSyncJob(job), persistedAt: Date.now() });
+      const result = await legacy.setItem(SYNC_JOB_STORAGE_KEY, payload);
+      return result !== false;
+    } catch (_) { return false; }
+  };
+  const scheduleSyncJobPersist = (immediate = false) => {
+    if (immediate) { void persistSyncJobNow(); return; }
+    if (state.syncJob.persistTimer) return;
+    state.syncJob.persistTimer = setTimeout(() => {
+      state.syncJob.persistTimer = null;
+      void persistSyncJobNow();
+    }, 650);
+    try { state.syncJob.persistTimer?.unref?.(); } catch (_) {}
+  };
+  const updateSyncJob = (patch = {}, options = {}) => {
+    if (!state.syncJob.current) return null;
+    const now = Date.now();
+    state.syncJob.current = {
+      ...state.syncJob.current,
+      ...(patch && typeof patch === 'object' ? patch : {}),
+      updatedAt: now,
+      lastActivityAt: options.activity === false ? Number(state.syncJob.current.lastActivityAt || now) : now
+    };
+    scheduleSyncJobPersist(options.persist === 'immediate');
+    notifySyncJob();
+    return cloneSyncJob(state.syncJob.current);
+  };
+  const aggregateSyncJobSpaces = (spaces, completedPasses = {}) => {
+    const values = [
+      ...Object.values(spaces && typeof spaces === 'object' ? spaces : {}),
+      ...Object.values(completedPasses && typeof completedPasses === 'object' ? completedPasses : {})
+    ];
+    const sum = key => values.reduce((total, row) => total + Math.max(0, Number(row?.[key] || 0) || 0), 0);
+    return {
+      totalItems: sum('totalItems'), processedItems: sum('processedItems'), processedBytes: sum('processedBytes'),
+      transferredBytes: sum('transferredBytes'), uploaded: sum('uploaded'), restored: sum('restored'), matched: sum('matched'),
+      removedByTombstone: sum('removedByTombstone'), failures: sum('failureCount'), conflicts: sum('conflictCount')
+    };
+  };
+  const applySyncProgressToJob = progress => {
+    const job = state.syncJob.current;
+    if (!job || !progress || typeof progress !== 'object') return;
+    const space = String(progress.space || job.currentSpace || 'plugin');
+    const spaces = { ...(job.spaces || {}) };
+    const completedPasses = { ...(job.completedPasses || {}) };
+    const previous = spaces[space] || null;
+    if (previous && Number(previous.startedAt || 0) > 0 && Number(progress.startedAt || 0) > 0
+      && Number(previous.startedAt) !== Number(progress.startedAt)) {
+      const prior = completedPasses[space] || {};
+      completedPasses[space] = {
+        totalItems: Number(prior.totalItems || 0) + Number(previous.totalItems || 0),
+        processedItems: Number(prior.processedItems || 0) + Number(previous.processedItems || 0),
+        processedBytes: Number(prior.processedBytes || 0) + Number(previous.processedBytes || 0),
+        transferredBytes: Number(prior.transferredBytes || 0) + Number(previous.transferredBytes || 0),
+        uploaded: Number(prior.uploaded || 0) + Number(previous.uploaded || 0),
+        restored: Number(prior.restored || 0) + Number(previous.restored || 0),
+        matched: Number(prior.matched || 0) + Number(previous.matched || 0),
+        removedByTombstone: Number(prior.removedByTombstone || 0) + Number(previous.removedByTombstone || 0),
+        failureCount: Number(prior.failureCount || 0) + Number(previous.failureCount || 0),
+        conflictCount: Number(prior.conflictCount || 0) + Number(previous.conflictCount || 0),
+        passCount: Number(prior.passCount || 0) + 1
+      };
+      spaces[space] = {};
+    }
+    spaces[space] = { ...(spaces[space] || {}), ...progress, space };
+    const totals = aggregateSyncJobSpaces(spaces, completedPasses);
+    updateSyncJob({
+      spaces,
+      completedPasses,
+      ...totals,
+      phase: String(progress.phase || job.phase || 'running'),
+      currentSpace: space,
+      currentKey: compact(progress.currentKey || '', 220),
+      currentAction: String(progress.currentAction || progress.action || ''),
+      status: job.status === 'paused' ? 'running' : job.status,
+      message: String(progress.message || job.message || '')
+    });
+  };
+  const subscribeSyncJob = listener => {
+    if (typeof listener !== 'function') return () => {};
+    state.syncJob.listeners.add(listener);
+    try { listener(cloneSyncJob(state.syncJob.current)); } catch (_) {}
+    return () => state.syncJob.listeners.delete(listener);
+  };
+  const getSyncJob = () => cloneSyncJob(state.syncJob.current);
+  const loadPersistedSyncJob = async () => {
+    if (state.syncJob.loaded) return getSyncJob();
+    const legacy = state.legacy.plugin;
+    if (!legacy || typeof legacy.getItem !== 'function') return null;
+    state.syncJob.loaded = true;
+    try {
+      const raw = await legacy.getItem(SYNC_JOB_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!parsed || parsed.schema !== SYNC_JOB_SCHEMA || parsed.namespace !== namespace) return null;
+      const age = Date.now() - Math.max(0, Number(parsed.updatedAt || parsed.startedAt || 0) || 0);
+      if (age > 24 * 60 * 60 * 1000) return null;
+      if (!syncJobTerminal(parsed.status)) {
+        parsed.status = 'paused';
+        parsed.phase = 'resume_pending';
+        parsed.message = '이전 동기화 작업을 다시 연결하고 있습니다.';
+        parsed.nextRetryAt = 0;
+      }
+      state.syncJob.current = parsed;
+      notifySyncJob();
+      return getSyncJob();
+    } catch (_) { return null; }
+  };
+  const clearPersistedSyncJob = async () => {
+    const legacy = state.legacy.plugin;
+    if (!legacy) return false;
+    try {
+      if (typeof legacy.removeItem === 'function') return (await legacy.removeItem(SYNC_JOB_STORAGE_KEY)) !== false;
+      if (typeof legacy.setItem === 'function') return (await legacy.setItem(SYNC_JOB_STORAGE_KEY, null)) !== false;
+    } catch (_) {}
+    return false;
+  };
+  const retryableSyncError = error => {
+    const message = String(error?.message || error || '').toLowerCase();
+    const code = String(error?.code || '').toUpperCase();
+    return ['TIMEOUT', 'NETWORK_ERROR', 'ECONNRESET', 'ECONNREFUSED', 'MEMORY_SUITE_SERVER_UNAVAILABLE'].includes(code)
+      || /fetch|network|timeout|timed out|econn|connection|server_unavailable|bootstrap|http_50[0234]|503|socket|temporar/.test(message);
+  };
+
+  const apiCandidates = () => {
+    const out = [];
+    const add = value => {
+      if (value && (typeof value === 'object' || typeof value === 'function') && !out.includes(value)) out.push(value);
+    };
+    try { if (typeof risuai !== 'undefined') add(risuai); } catch (_) {}
+    try { if (typeof risuApi !== 'undefined') add(risuApi); } catch (_) {}
+    try { if (typeof risuAPI !== 'undefined') add(risuAPI); } catch (_) {}
+    try { if (typeof Risuai !== 'undefined') add(Risuai); } catch (_) {}
+    try { if (typeof RisuAI !== 'undefined') add(RisuAI); } catch (_) {}
+    try {
+      if (typeof globalThis !== 'undefined') {
+        add(globalThis.risuai);
+        add(globalThis.risuApi);
+        add(globalThis.risuAPI);
+        add(globalThis.Risuai);
+        add(globalThis.RisuAI);
+        add(globalThis.__pluginApis__);
+      }
+    } catch (_) {}
+    return out;
+  };
+
+  const getArgumentValue = async (names, fallback = '') => {
+    for (const name of names) {
+      for (const api of apiCandidates()) {
+        try {
+          let value;
+          if (typeof api?.getArgument === 'function') value = await api.getArgument(name);
+          else if (typeof api?.getArg === 'function') value = await api.getArg(name);
+          if (value !== undefined && value !== null && String(value).trim() !== '') return String(value).trim();
+        } catch (_) {}
+      }
+    }
+    return fallback;
+  };
+
+  const setArgumentValue = async (name, value) => {
+    let lastError = null;
+    for (const api of apiCandidates()) {
+      try {
+        const fn = typeof api?.setArgument === 'function' ? api.setArgument : (typeof api?.setArg === 'function' ? api.setArg : null);
+        if (!fn) continue;
+        const result = await fn.call(api, name, value);
+        if (result === false) throw new Error('argument_write_rejected');
+        return true;
+      } catch (error) { lastError = error; }
+    }
+    const error = new Error(`memory_suite_argument_persistence_unavailable:${compact(lastError?.message || lastError || 'setArgument unavailable', 180)}`);
+    error.code = 'MEMORY_SUITE_ARGUMENT_PERSISTENCE_UNAVAILABLE';
+    throw error;
+  };
+
+  const normalizeMode = raw => {
+    const value = String(raw || '').trim().toLowerCase().replace(/[ -]+/g, '_');
+    if (['off', 'plugin', 'plugin_only', 'standalone', 'local', 'local_only'].includes(value)) return MODE_PLUGIN_ONLY;
+    if (['mirror', 'dual', 'coexist', 'coexistence', 'plugin_server', 'plugin+server', 'plugin_and_server'].includes(value)) return MODE_MIRROR;
+    if (['required', 'server', 'server_only', 'remote', 'remote_only'].includes(value)) return MODE_SERVER_ONLY;
+    return MODE_PLUGIN_ONLY;
+  };
+
+  const modeLabel = mode => mode === MODE_MIRROR
+    ? '플러그인 + 서버 병존'
+    : (mode === MODE_SERVER_ONLY ? '서버 단독' : '플러그인 단독');
+
+  const normalizeServerUrl = rawValue => {
+    const raw = String(rawValue || defaultUrl).trim().replace(/\/+$/, '') || defaultUrl;
+    try {
+      const parsed = new URL(raw);
+      const host = String(parsed.hostname || '').toLowerCase();
+      if (parsed.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1'].includes(host)) {
+        throw new Error('server_url_must_be_loopback_http');
+      }
+      return parsed.origin;
+    } catch (error) {
+      const wrapped = new Error(`invalid_memory_suite_server_url:${compact(error?.message || error, 180)}`);
+      wrapped.code = 'MEMORY_SUITE_INVALID_SERVER_URL';
+      throw wrapped;
+    }
+  };
+
+  const resetBootstrapCache = () => {
+    state.bootstrap = { at: 0, baseUrl: '', value: null, pending: null };
+  };
+
+  const readConfig = async (force = false) => {
+    if (!force && state.transientMode && VALID_MODES.has(state.transientMode)) return { ...state.config, mode: state.transientMode };
+    if (!force && Date.now() - Number(state.config.at || 0) < configCacheMs) return state.config;
+    const rawMode = (await getArgumentValue(modeArguments, MODE_PLUGIN_ONLY)).trim().toLowerCase();
+    const mode = state.transientMode && VALID_MODES.has(state.transientMode) ? state.transientMode : normalizeMode(rawMode);
+    const rawUrl = await getArgumentValue(urlArguments, defaultUrl);
+    const url = normalizeServerUrl(rawUrl);
+    state.config = { at: Date.now(), mode, url };
+    return state.config;
+  };
+
+  const persistMode = async modeValue => {
+    const mode = normalizeMode(modeValue);
+    state.transientMode = mode;
+    try {
+      await setArgumentValue(modeArguments[0] || 'memory_suite_server_mode', mode);
+      state.config.at = 0;
+      state.transientMode = '';
+      const verified = await readConfig(true);
+      if (verified.mode !== mode) throw new Error(`memory_suite_mode_readback_mismatch:${verified.mode}->${mode}`);
+      setStatus('mode_changed', '', { mode, modeLabel: modeLabel(mode) });
+      return verified;
+    } catch (error) {
+      state.transientMode = '';
+      state.config.at = 0;
+      throw error;
+    }
+  };
+
+  const persistServerUrl = async urlValue => {
+    const url = normalizeServerUrl(urlValue);
+    await setArgumentValue(urlArguments[0] || 'memory_suite_server_url', url);
+    state.config.at = 0;
+    resetBootstrapCache();
+    const verified = await readConfig(true);
+    if (verified.url !== url) throw new Error(`memory_suite_url_readback_mismatch:${verified.url}->${url}`);
+    setStatus('url_changed', '', { url });
+    return verified;
+  };
+
+  const excluded = key => {
+    const lower = String(key || '').toLowerCase();
+    // Legacy chunk artifacts belong to the old storage adapter. The server stores
+    // the hydrated logical record and must never promote individual chunk pieces.
+    if (lower.includes('::chunk:v1:')) return true;
+    if (excludedKeys.has(lower)) return true;
+    if (excludedPrefixes.some(prefix => lower.startsWith(prefix))) return true;
+    if (excludedContains.some(part => lower.includes(part))) return true;
+    return false;
+  };
+
+  const matchesRoute = (space, key) => {
+    const normalized = String(key || '');
+    if (!normalized || excluded(normalized)) return false;
+    const prefixes = space === 'local' ? localPrefixes : pluginPrefixes;
+    const exact = space === 'local' ? localKeys : pluginKeys;
+    return exact.has(normalized) || prefixes.some(prefix => normalized.startsWith(prefix));
+  };
+
+  const fetchApi = (url, init = {}) => {
+    const requestInit = {
+      ...init,
+      networkRoute: 'local_network',
+      requestTimeoutMs,
+      logFetch: false
+    };
+    for (const api of apiCandidates()) {
+      if (typeof api?.nativeFetch === 'function') return api.nativeFetch(url, requestInit);
+      if (typeof api?.risuFetch === 'function') return api.risuFetch(url, requestInit);
+    }
+    if (typeof fetch === 'function') return fetch(url, requestInit);
+    throw new Error('memory_suite_server_fetch_unavailable');
+  };
+
+  const withTimeout = async (promise, label) => {
+    let timer = null;
+    try {
+      return await Promise.race([
+        Promise.resolve(promise),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error(`${label || 'Memory Suite request'} timed out after ${requestTimeoutMs}ms`);
+            error.code = 'MEMORY_SUITE_TIMEOUT';
+            reject(error);
+          }, requestTimeoutMs);
+        })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  const responseText = async (response, label) => {
+    if (typeof response?.text === 'function') return await withTimeout(response.text(), `${label} response`);
+    if (typeof response?.json === 'function') return JSON.stringify(await withTimeout(response.json(), `${label} response`));
+    if (typeof response === 'string') return response;
+    if (response && typeof response === 'object' && Object.prototype.hasOwnProperty.call(response, 'data')) {
+      return typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+    }
+    return JSON.stringify(response || {});
+  };
+
+  const fetchJson = async (url, init = {}, label = 'Memory Suite request') => {
+    const response = await withTimeout(fetchApi(url, init), label);
+    const raw = await responseText(response, label);
+    let payload = null;
+    try { payload = raw ? JSON.parse(raw) : {}; }
+    catch (_) { throw new Error('memory_suite_server_invalid_json'); }
+    const status = Number(response?.status || payload?.status || 0);
+    const ok = typeof response?.ok === 'boolean' ? response.ok : (status ? status >= 200 && status < 300 : payload?.ok === true);
+    if (!ok || payload?.ok !== true) {
+      const error = new Error(payload?.error || `memory_suite_server_http_${status || 'unknown'}`);
+      error.status = status;
+      error.payload = payload;
+      throw error;
+    }
+    return payload;
+  };
+
+  const validateBootstrapPayload = (payload, requestedUrl = '') => {
+    if (payload?.schema !== 'memory-suite.storage.bootstrap.v1' || !payload?.token || !payload?.url) {
+      throw new Error('memory_suite_bootstrap_contract_mismatch');
+    }
+    if (Number(payload.protocol?.major || 0) !== 1) throw new Error('memory_suite_protocol_major_incompatible');
+    if (!Array.isArray(payload.namespaces) || !payload.namespaces.includes(namespace)) {
+      throw new Error(`memory_suite_namespace_not_supported:${namespace}`);
+    }
+    for (const capability of requiredCapabilities) {
+      if (payload.capabilities?.[capability] !== true) throw new Error(`memory_suite_capability_missing:${capability}`);
+    }
+    return {
+      requestedUrl: requestedUrl || '',
+      url: String(payload.url).replace(/\/+$/, ''),
+      token: String(payload.token),
+      version: String(payload.version || ''),
+      protocol: payload.protocol || {},
+      capabilities: payload.capabilities || {},
+      namespaces: Array.isArray(payload.namespaces) ? payload.namespaces.slice() : []
+    };
+  };
+
+  const bootstrapAtUrl = async urlValue => {
+    const url = normalizeServerUrl(urlValue);
+    const payload = await fetchJson(`${url}/bootstrap`, {
+      method: 'GET',
+      headers: {
+        'X-Memory-Suite-Plugin': pluginId,
+        'X-Memory-Suite-Plugin-Version': pluginVersion
+      }
+    }, 'Memory Suite connection test');
+    return validateBootstrapPayload(payload, url);
+  };
+
+  const testConnection = async urlValue => {
+    const config = await readConfig(true).catch(() => ({ mode: MODE_PLUGIN_ONLY, url: defaultUrl }));
+    const url = normalizeServerUrl(urlValue || config.url || defaultUrl);
+    const startedAt = Date.now();
+    try {
+      const connection = await bootstrapAtUrl(url);
+      const integrityPayload = await fetchJson(`${connection.url}/v1/integrity?namespace=${encodeURIComponent(namespace)}`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${connection.token}`,
+          'X-Memory-Suite-Plugin': pluginId,
+          'X-Memory-Suite-Plugin-Version': pluginVersion
+        }
+      }, 'Memory Suite namespace integrity');
+      const integrity = integrityPayload?.result || null;
+      if (integrity?.ok !== true) throw new Error(`memory_suite_namespace_integrity_failed:${integrity?.result || 'unknown'}`);
+      const result = {
+        ok: true,
+        url,
+        serverUrl: connection.url,
+        serverVersion: connection.version,
+        protocol: connection.protocol,
+        namespaces: connection.namespaces,
+        integrity,
+        records: Math.max(0, Number(integrity?.records || 0) || 0),
+        liveRecords: Math.max(0, Number(integrity?.liveRecords || 0) || 0),
+        tombstones: Math.max(0, Number(integrity?.tombstones || 0) || 0),
+        fileBytes: Math.max(0, Number(integrity?.fileBytes || 0) || 0),
+        durationMs: Date.now() - startedAt
+      };
+      if (url === config.url) {
+        state.bootstrap = { at: Date.now(), baseUrl: config.url, value: connection, pending: null };
+        setStatus('connected', '', { serverVersion: connection.version, url: connection.url, protocol: connection.protocol });
+      }
+      return result;
+    } catch (error) {
+      const result = { ok: false, url, error: compact(error?.message || error, 700), durationMs: Date.now() - startedAt };
+      if (url === config.url) setStatus('unavailable', result.error, { url });
+      return result;
+    }
+  };
+
+  const bootstrap = async (force = false, allowPluginOnly = false) => {
+    const config = await readConfig();
+    if (config.mode === MODE_PLUGIN_ONLY && allowPluginOnly !== true) return null;
+    const cached = state.bootstrap;
+    if (!force && cached.value && cached.baseUrl === config.url && Date.now() - Number(cached.at || 0) < bootstrapCacheMs) return cached.value;
+    if (!force && cached.pending && cached.baseUrl === config.url) return await cached.pending;
+    const pending = (async () => {
+      const payload = await fetchJson(`${config.url}/bootstrap`, {
+        method: 'GET',
+        headers: {
+          'X-Memory-Suite-Plugin': pluginId,
+          'X-Memory-Suite-Plugin-Version': pluginVersion
+        }
+      }, 'Memory Suite bootstrap');
+      const value = validateBootstrapPayload(payload, config.url);
+      state.bootstrap = { at: Date.now(), baseUrl: config.url, value, pending: null };
+      setStatus('connected', '', { serverVersion: value.version, url: value.url });
+      return value;
+    })();
+    state.bootstrap = { at: 0, baseUrl: config.url, value: null, pending };
+    try {
+      return await pending;
+    } catch (error) {
+      state.bootstrap = { at: 0, baseUrl: config.url, value: null, pending: null };
+      setStatus('unavailable', error?.message || error, { url: config.url });
+      warnOnce(`server_unavailable_${compact(error?.message || error, 120)}`, error);
+      throw error;
+    }
+  };
+
+  const request = async (method, route, body = null, requestOptions = {}) => {
+    const connection = await bootstrap(requestOptions.forceBootstrap === true, requestOptions.allowPluginOnly === true);
+    if (!connection) throw new Error('memory_suite_server_not_enabled');
+    const requestScope = requestOptions.scope && typeof requestOptions.scope === 'object'
+      ? requestOptions.scope
+      : state.scopeRouting.current;
+    const requestScopeId = String(requestOptions.scopeId || requestScope?.scopeId || '').trim();
+    const registeredMode = requestScopeId ? state.scopeRouting.registry?.entries?.[requestScopeId]?.mode : '';
+    const transientMode = requestScopeId ? state.scopeRouting.transientModes.get(requestScopeId) : '';
+    const requestMode = normalizeMode(requestOptions.storageMode || transientMode || registeredMode || state.config.mode || MODE_PLUGIN_ONLY);
+    const init = {
+      method,
+      headers: {
+        Authorization: `Bearer ${connection.token}`,
+        'X-Memory-Suite-Plugin': pluginId,
+        'X-Memory-Suite-Plugin-Version': pluginVersion,
+        ...(requestScopeId ? { 'X-Memory-Suite-Scope-Id': encodeURIComponent(requestScopeId) } : {}),
+        'X-Memory-Suite-Storage-Mode': requestMode,
+        ...(requestOptions.extraHeaders && typeof requestOptions.extraHeaders === 'object' ? requestOptions.extraHeaders : {}),
+        ...(body == null ? {} : { 'Content-Type': 'application/json' })
+      },
+      ...(body == null ? {} : { body: JSON.stringify(body) })
+    };
+    try {
+      return await fetchJson(`${connection.url}${route}`, init, `Memory Suite ${method} ${route}`);
+    } catch (error) {
+      if (error?.status === 403 && requestOptions.authRetry !== false) {
+        await bootstrap(true, requestOptions.allowPluginOnly === true);
+        return await request(method, route, body, { ...requestOptions, authRetry: false });
+      }
+      setStatus('request_failed', error?.message || error, { route, method });
+      throw error;
+    }
+  };
+
+  const operationId = kind => {
+    let unique = '';
+    try { unique = globalThis?.crypto?.randomUUID?.() || ''; } catch (_) {}
+    if (!unique) unique = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}_${Math.random().toString(36).slice(2)}`;
+    const prefix = `${namespace}_${kind}_${pluginId}`.replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 80);
+    return `${prefix}_${unique.replace(/[^A-Za-z0-9._:-]/g, '')}`.slice(0, 238);
+  };
+
+  const verifyReceipt = (payload, expectedId, expectedSpace, expectedKey) => {
+    const receipt = payload?.result || {};
+    if (receipt.schema !== 'memory-suite.storage.receipt.v1'
+      || receipt.namespace !== namespace
+      || receipt.operationId !== expectedId
+      || receipt.space !== expectedSpace
+      || receipt.key !== expectedKey
+      || receipt.durable !== true
+      || receipt.verified !== true
+      || !receipt.digest
+      || Number(receipt.revision || 0) < 1) {
+      throw new Error('memory_suite_durable_receipt_invalid');
+    }
+    return receipt;
+  };
+
+  const statusReadback = async (id, requestOptions = {}) => {
+    try {
+      return await request('GET', `/v1/operations/${encodeURIComponent(namespace)}/${encodeURIComponent(id)}`, null, { authRetry: true, allowPluginOnly: requestOptions.allowPluginOnly === true });
+    } catch (error) {
+      if (error?.status === 404) return null;
+      throw error;
+    }
+  };
+
+  const remoteGet = async (space, key, requestOptions = {}) => {
+    const payload = await request(
+      'GET',
+      `/v1/kv/get?namespace=${encodeURIComponent(namespace)}&space=${encodeURIComponent(space)}&key=${encodeURIComponent(key)}`,
+      null,
+      { allowPluginOnly: requestOptions.allowPluginOnly === true }
+    );
+    return payload?.result || {};
+  };
+
+  const remoteGetMany = async (space, keys = [], requestOptions = {}) => {
+    const list = Array.isArray(keys) ? keys.map(value => String(value || '')).filter(Boolean).slice(0, 512) : [];
+    if (!list.length) return { values: {} };
+    const payload = await request(
+      'POST',
+      '/v1/kv/get-many',
+      { namespace, space, keys: list },
+      { allowPluginOnly: requestOptions.allowPluginOnly === true }
+    );
+    return payload?.result || { values: {} };
+  };
+
+  const remoteKeys = async (space, prefix = '', requestOptions = {}) => {
+    const payload = await request(
+      'GET',
+      `/v1/kv/keys?namespace=${encodeURIComponent(namespace)}&space=${encodeURIComponent(space)}&prefix=${encodeURIComponent(prefix)}`,
+      null,
+      { allowPluginOnly: requestOptions.allowPluginOnly === true }
+    );
+    return payload?.result || { keys: [], tombstones: [] };
+  };
+
+  const remoteIntegrity = async (requestOptions = {}) => {
+    const payload = await request(
+      'GET',
+      `/v1/integrity?namespace=${encodeURIComponent(namespace)}`,
+      null,
+      { allowPluginOnly: requestOptions.allowPluginOnly === true }
+    );
+    const result = payload?.result || {};
+    if (result.ok !== true || String(result.result || '') !== 'ok') {
+      const error = new Error(`memory_suite_namespace_integrity_failed:${result.result || 'unknown'}`);
+      error.code = 'MEMORY_SUITE_INTEGRITY_FAILED';
+      throw error;
+    }
+    return result;
+  };
+
+  const remoteMutate = async (kind, space, key, value, mutateOptions = {}) => {
+    const id = operationId(kind);
+    const expectedRevision = Number.isInteger(Number(mutateOptions.expectedRevision))
+      ? Math.max(0, Number(mutateOptions.expectedRevision))
+      : null;
+    const body = {
+      namespace,
+      operationId: id,
+      space,
+      key,
+      ...(kind === 'set' ? { value } : {}),
+      ...(expectedRevision == null ? {} : { expectedRevision })
+    };
+    const verifyStored = async receipt => {
+      const stored = await remoteGet(space, key, { allowPluginOnly: mutateOptions.allowPluginOnly === true });
+      const valueMatches = kind === 'remove'
+        ? stored.exists === false && stored.tombstone === true
+        : stored.exists === true && jsonComparable(stored.value) === jsonComparable(value);
+      if (!valueMatches
+        || Number(stored.revision || 0) !== Number(receipt.revision || 0)
+        || String(stored.digest || '') !== String(receipt.digest || '')) {
+        throw new Error('memory_suite_end_to_end_readback_mismatch');
+      }
+      setStatus('durable', '', { operationId: id, revision: receipt.revision, key: compact(key, 180), space });
+      return { ...receipt, endToEndVerified: true };
+    };
+    try {
+      const payload = await request('POST', `/v1/kv/${kind}`, body, { allowPluginOnly: mutateOptions.allowPluginOnly === true });
+      return await verifyStored(verifyReceipt(payload, id, space, key));
+    } catch (error) {
+      try {
+        const status = await statusReadback(id, { allowPluginOnly: mutateOptions.allowPluginOnly === true });
+        if (status) return await verifyStored(verifyReceipt(status, id, space, key));
+      } catch (_) {}
+      error.storageMutationIndeterminate = true;
+      error.storageMutationKey = key;
+      error.storageOperationId = id;
+      throw error;
+    }
+  };
+
+  const serializeMutation = async (space, key, factory) => {
+    const lockKey = `${space}\n${key}`;
+    const previous = mutationTails.get(lockKey) || Promise.resolve();
+    const operation = Promise.resolve(previous).catch(() => undefined).then(factory);
+    const tail = operation.then(() => undefined, () => undefined);
+    mutationTails.set(lockKey, tail);
+    tail.then(() => {
+      if (mutationTails.get(lockKey) === tail) mutationTails.delete(lockKey);
+    });
+    return await operation;
+  };
+
+  const isNullishStorageValue = value => value === null || value === undefined || value === '';
+
+  const legacyRead = async (legacy, key) => {
+    if (!legacy || typeof legacy.getItem !== 'function') return null;
+    return await legacy.getItem(key);
+  };
+
+  const legacyWriteVerified = async (legacy, key, value) => {
+    if (!legacy || typeof legacy.setItem !== 'function') return false;
+    const result = await legacy.setItem(key, value);
+    if (result === false) return false;
+    if (typeof legacy.getItem === 'function') {
+      const readback = await legacy.getItem(key);
+      if (jsonComparable(readback) !== jsonComparable(value)) {
+        const error = new Error(`memory_suite_pluginstorage_readback_mismatch:${compact(key, 160)}`);
+        error.code = 'MEMORY_SUITE_LOCAL_READBACK_MISMATCH';
+        throw error;
+      }
+    }
+    return true;
+  };
+
+  const legacyRemoveVerified = async (legacy, key) => {
+    if (!legacy) return false;
+    let result = false;
+    if (typeof legacy.removeItem === 'function') result = (await legacy.removeItem(key)) !== false;
+    else if (typeof legacy.setItem === 'function') result = (await legacy.setItem(key, null)) !== false;
+    if (!result) return false;
+    if (typeof legacy.getItem === 'function') {
+      const readback = await legacy.getItem(key);
+      if (!isNullishStorageValue(readback)) {
+        const error = new Error(`memory_suite_pluginstorage_remove_readback_mismatch:${compact(key, 160)}`);
+        error.code = 'MEMORY_SUITE_LOCAL_REMOVE_READBACK_MISMATCH';
+        throw error;
+      }
+    }
+    return true;
+  };
+
+  const legacyKeys = async legacy => {
+    if (!legacy || typeof legacy.keys !== 'function') return null;
+    const listed = await legacy.keys();
+    return Array.isArray(listed) ? [...new Set(listed.map(String).filter(Boolean))] : [];
+  };
+
+  const chunkOwnerKey = key => {
+    const raw = String(key || '');
+    const marker = '::chunk:v1:';
+    const index = raw.indexOf(marker);
+    return index > 0 ? raw.slice(0, index) : '';
+  };
+
+  const isOwnedChunkArtifact = (space, key) => {
+    const owner = chunkOwnerKey(key);
+    return !!owner && matchesRoute(space, owner);
+  };
+
+  const listRoutedLegacyKeys = async (legacy, space, includeArtifacts = false) => {
+    const listed = await legacyKeys(legacy);
+    if (listed == null) {
+      const error = new Error('memory_suite_pluginstorage_key_enumeration_required');
+      error.code = 'MEMORY_SUITE_KEYS_UNAVAILABLE';
+      throw error;
+    }
+    return listed.filter(key => matchesRoute(space, key) || (includeArtifacts && isOwnedChunkArtifact(space, key)));
+  };
+
+  const migrateFromLegacy = async (space, key, legacyGet = null) => {
+    if (typeof legacyGet !== 'function') return { state: 'missing', value: null };
+    return await serializeMutation(space, key, async () => {
+      const current = await remoteGet(space, key);
+      if (current.exists === true) return { state: 'server', value: current.value };
+      if (current.tombstone === true) return { state: 'tombstone', value: null };
+      const legacy = await legacyGet();
+      if (legacy === null || legacy === undefined) return { state: 'missing', value: null };
+      try {
+        await remoteMutate('set', space, key, legacy, { expectedRevision: 0 });
+        return { state: 'migrated', value: legacy };
+      } catch (error) {
+        if (error?.status === 409) {
+          const afterConflict = await remoteGet(space, key);
+          if (afterConflict.exists === true) return { state: 'server', value: afterConflict.value };
+          if (afterConflict.tombstone === true) return { state: 'tombstone', value: null };
+        }
+        throw error;
+      }
+    });
+  };
+
+  const synchronizeLegacyWithServer = async (legacy, space = 'plugin', options = {}) => {
+    if (!legacy) throw new Error('memory_suite_pluginstorage_unavailable');
+    const config = await readConfig(true);
+    if (config.mode === MODE_PLUGIN_ONLY && options.allowPluginOnly !== true) {
+      throw new Error('memory_suite_server_mode_required_for_sync');
+    }
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const allowPluginOnly = options.allowPluginOnly === true;
+    const progress = {
+      schema: 'memory-suite.sync-progress.v1', namespace, space,
+      phase: 'integrity_before', currentAction: '서버 무결성 확인', currentKey: '',
+      totalItems: 0, processedItems: 0, processedBytes: 0, transferredBytes: 0,
+      uploaded: 0, restored: 0, matched: 0, removedByTombstone: 0,
+      failureCount: 0, conflictCount: 0, startedAt: Date.now(), lastActivityAt: Date.now()
+    };
+    const report = (phase, patch = {}) => {
+      Object.assign(progress, patch || {}, { phase: String(phase || progress.phase), lastActivityAt: Date.now() });
+      try { onProgress?.({ ...progress }); } catch (_) {}
+    };
+    report('integrity_before', { message: '서버 DATA 무결성을 확인하고 있습니다.' });
+    const integrityBefore = await remoteIntegrity({ allowPluginOnly });
+    report('inventory', { currentAction: '데이터 목록 조사', message: 'pluginStorage와 서버의 데이터 목록을 비교하고 있습니다.' });
+    const localLogicalKeys = (await listRoutedLegacyKeys(legacy, space, false)).slice().sort();
+    const serverListing = await remoteKeys(space, '', { allowPluginOnly });
+    const serverKeys = new Set((serverListing.keys || []).map(String));
+    const serverTombstones = new Set((serverListing.tombstones || []).map(String));
+    const serverRecordBytes = new Map((Array.isArray(serverListing.records) ? serverListing.records : []).map(row => [String(row?.key || ''), Math.max(0, Number(row?.valueBytes || 0) || 0)]));
+    const localSet = new Set(localLogicalKeys);
+    const missingServerKeys = options.restoreMissingLocal === true
+      ? Array.from(serverKeys).filter(key => matchesRoute(space, key) && !localSet.has(key)).sort()
+      : [];
+    progress.totalItems = localLogicalKeys.length + missingServerKeys.length;
+    report('inventory_complete', {
+      currentAction: '목록 조사 완료',
+      localKeys: localLogicalKeys.length,
+      serverKeys: serverKeys.size,
+      serverTombstones: serverTombstones.size,
+      message: `처리 대상 ${progress.totalItems.toLocaleString()}개를 확인했습니다.`
+    });
+    const result = {
+      schema: 'memory-suite.sync.v1', namespace, space, startedAt: progress.startedAt,
+      localKeys: localLogicalKeys.length, uploaded: 0, restored: 0, removedByTombstone: 0,
+      matched: 0, conflicts: [], failures: [], integrityBefore, integrityAfter: null,
+      totalItems: progress.totalItems, processedItems: 0, processedBytes: 0, transferredBytes: 0
+    };
+    // A failed plugin_only -> mirror transition must never consume the only local
+    // copy merely because the server carries a deliberate scope-deletion tombstone.
+    const protectedConflictKeys = new Set();
+
+    for (const key of localLogicalKeys) {
+      let localBytes = 0;
+      let action = '비교';
+      try {
+        report('sync_local', { currentAction: 'pluginStorage → 서버 비교', currentKey: key });
+        const localValue = await legacyRead(legacy, key);
+        localBytes = isNullishStorageValue(localValue) ? 0 : storageValueBytes(localValue);
+        if (isNullishStorageValue(localValue)) {
+          action = '빈 값 건너뜀';
+        } else {
+          const remote = await remoteGet(space, key, { allowPluginOnly });
+          if (remote.exists === true && jsonComparable(remote.value) === jsonComparable(localValue)) {
+            result.matched += 1;
+            action = '일치 확인';
+          } else if (remote.tombstone === true && options.resurrectTombstones !== true) {
+            if (options.allowOverwrite === false) {
+              result.conflicts.push({ key, serverState: 'tombstone', localPreserved: true });
+              protectedConflictKeys.add(key);
+              action = '삭제 충돌 보존';
+            } else if (options.restoreMissingLocal === true) {
+              const removed = await legacyRemoveVerified(legacy, key);
+              if (!removed) throw new Error('pluginstorage_tombstone_apply_failed');
+              result.removedByTombstone += 1;
+              action = '서버 삭제 상태 반영';
+            } else {
+              result.conflicts.push({ key, serverState: 'tombstone' });
+              action = '삭제 충돌';
+            }
+          } else if (options.allowOverwrite === false && remote.exists === true) {
+            result.conflicts.push({ key, serverState: 'value' });
+            action = '기존 서버 값 충돌';
+          } else {
+            await remoteMutate('set', space, key, localValue, { allowPluginOnly });
+            const verified = await remoteGet(space, key, { allowPluginOnly });
+            if (verified.exists !== true || jsonComparable(verified.value) !== jsonComparable(localValue)) {
+              throw new Error('post_sync_server_readback_mismatch');
+            }
+            result.uploaded += 1;
+            progress.transferredBytes += localBytes;
+            action = '업로드·검증';
+          }
+        }
+      } catch (error) {
+        result.failures.push({ key, error: compact(error?.message || error, 220) });
+        action = '실패';
+      } finally {
+        result.processedItems += 1;
+        result.processedBytes += localBytes;
+        progress.processedItems = result.processedItems;
+        progress.processedBytes = result.processedBytes;
+        progress.uploaded = result.uploaded;
+        progress.restored = result.restored;
+        progress.matched = result.matched;
+        progress.removedByTombstone = result.removedByTombstone;
+        progress.failureCount = result.failures.length;
+        progress.conflictCount = result.conflicts.length;
+        report('sync_local', { currentAction: action, currentKey: key });
+      }
+    }
+
+    if (options.restoreMissingLocal === true) {
+      for (const key of missingServerKeys) {
+        const remoteBytes = Math.max(0, Number(serverRecordBytes.get(key) || 0) || 0);
+        let action = '서버 → pluginStorage 복구';
+        try {
+          report('restore_missing_local', { currentAction: action, currentKey: key });
+          const remote = await remoteGet(space, key, { allowPluginOnly });
+          if (remote.exists !== true) {
+            action = '서버 값 없음';
+          } else {
+            const ok = await legacyWriteVerified(legacy, key, remote.value);
+            if (!ok) throw new Error('pluginstorage_restore_write_failed');
+            result.restored += 1;
+            progress.transferredBytes += remoteBytes || storageValueBytes(remote.value);
+            action = '복구·검증';
+          }
+        } catch (error) {
+          result.failures.push({ key, error: compact(error?.message || error, 220) });
+          action = '복구 실패';
+        } finally {
+          result.processedItems += 1;
+          result.processedBytes += remoteBytes;
+          progress.processedItems = result.processedItems;
+          progress.processedBytes = result.processedBytes;
+          progress.uploaded = result.uploaded;
+          progress.restored = result.restored;
+          progress.matched = result.matched;
+          progress.removedByTombstone = result.removedByTombstone;
+          progress.failureCount = result.failures.length;
+          progress.conflictCount = result.conflicts.length;
+          report('restore_missing_local', { currentAction: action, currentKey: key });
+        }
+      }
+      // Tombstones for keys that were already present locally are handled in the
+      // local-key pass above. Re-check only for values that survived unexpectedly.
+      for (const key of serverTombstones) {
+        if (!matchesRoute(space, key) || !localSet.has(key) || protectedConflictKeys.has(key)) continue;
+        try {
+          const current = await legacyRead(legacy, key);
+          if (!isNullishStorageValue(current)) {
+            const ok = await legacyRemoveVerified(legacy, key);
+            if (!ok) throw new Error('pluginstorage_tombstone_apply_failed');
+            result.removedByTombstone += 1;
+          }
+        } catch (error) {
+          result.failures.push({ key, error: compact(error?.message || error, 220) });
+        }
+      }
+    }
+
+    report('integrity_after', { currentAction: '최종 무결성 확인', currentKey: '', message: '동기화 후 서버 DATA 무결성을 확인하고 있습니다.' });
+    result.integrityAfter = await remoteIntegrity({ allowPluginOnly });
+    result.finishedAt = Date.now();
+    result.ok = result.failures.length === 0 && result.conflicts.length === 0;
+    progress.failureCount = result.failures.length;
+    progress.conflictCount = result.conflicts.length;
+    progress.uploaded = result.uploaded;
+    progress.restored = result.restored;
+    progress.matched = result.matched;
+    progress.removedByTombstone = result.removedByTombstone;
+    report(result.ok ? 'space_complete' : 'space_incomplete', {
+      currentAction: result.ok ? '공간 동기화 완료' : '동기화 확인 필요', currentKey: '',
+      message: result.ok ? `${space} 저장소 동기화를 완료했습니다.` : `충돌 ${result.conflicts.length}건 · 실패 ${result.failures.length}건`
+    });
+    state.management.lastResult = result;
+    if (!result.ok) {
+      const error = new Error(`memory_suite_sync_incomplete:conflicts=${result.conflicts.length},failures=${result.failures.length}`);
+      error.code = 'MEMORY_SUITE_SYNC_INCOMPLETE';
+      error.result = result;
+      throw error;
+    }
+    return result;
+  };
+
+  const verifyServerPreservation = async (legacy = state.legacy.plugin) => {
+    if (!legacy) throw new Error('memory_suite_pluginstorage_unavailable');
+    const config = await readConfig(true);
+    if (config.mode === MODE_PLUGIN_ONLY) {
+      const error = new Error('plugin_only_mode_has_no_verified_server_copy');
+      error.code = 'MEMORY_SUITE_SERVER_COPY_NOT_ACTIVE';
+      throw error;
+    }
+    if (config.mode === MODE_MIRROR) {
+      await synchronizeLegacyWithServer(legacy, 'plugin', { allowOverwrite: true, restoreMissingLocal: true });
+    }
+    const integrity = await remoteIntegrity();
+    const keys = await listRoutedLegacyKeys(legacy, 'plugin', false);
+    const result = { schema: 'memory-suite.server-preservation.v1', namespace, mode: config.mode, integrity, checked: 0, exact: 0, covered: 0, unsafe: [] };
+    for (const key of keys) {
+      const localValue = await legacyRead(legacy, key);
+      if (isNullishStorageValue(localValue)) continue;
+      const remote = await remoteGet('plugin', key);
+      result.checked += 1;
+      if (config.mode === MODE_MIRROR) {
+        if (remote.exists === true && jsonComparable(remote.value) === jsonComparable(localValue)) result.exact += 1;
+        else result.unsafe.push({ key, reason: remote.tombstone === true ? 'server_tombstone' : (remote.exists === true ? 'value_mismatch' : 'server_missing') });
+      } else {
+        if (remote.exists === true || remote.tombstone === true) result.covered += 1;
+        else result.unsafe.push({ key, reason: 'server_has_no_record_or_tombstone' });
+      }
+    }
+    result.ok = integrity.ok === true && result.unsafe.length === 0;
+    if (!result.ok) {
+      const error = new Error(`memory_suite_server_preservation_verification_failed:${result.unsafe.length}`);
+      error.code = 'MEMORY_SUITE_SERVER_PRESERVATION_FAILED';
+      error.result = result;
+      throw error;
+    }
+    state.management.lastResult = result;
+    return result;
+  };
+
+  const restoreServerSpaceToLegacy = async (legacy, space = 'plugin', options = {}) => {
+    if (!legacy) throw new Error(`memory_suite_${space}_storage_unavailable`);
+    const normalizedSpace = String(space || 'plugin') === 'local' ? 'local' : 'plugin';
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const progress = {
+      schema: 'memory-suite.restore-progress.v1', namespace, space: normalizedSpace,
+      phase: 'integrity_before', currentAction: '서버 무결성 확인', currentKey: '', totalItems: 0, processedItems: 0,
+      processedBytes: 0, transferredBytes: 0, restored: 0, removed: 0, verified: 0, failureCount: 0,
+      startedAt: Date.now(), lastActivityAt: Date.now()
+    };
+    const report = (phase, patch = {}) => {
+      Object.assign(progress, patch || {}, { phase, lastActivityAt: Date.now() });
+      try { onProgress?.({ ...progress }); } catch (_) {}
+    };
+    report('integrity_before', { message: '서버 DATA 무결성을 확인하고 있습니다.' });
+    const integrity = await remoteIntegrity({ allowPluginOnly: options.allowPluginOnly === true });
+    report('inventory', { currentAction: '복구 대상 조사', message: '서버 DATA와 pluginStorage를 비교하고 있습니다.' });
+    const listing = await remoteKeys(normalizedSpace, '', { allowPluginOnly: options.allowPluginOnly === true });
+    const serverKeys = (listing.keys || []).map(String).filter(key => matchesRoute(normalizedSpace, key)).sort();
+    const tombstones = (listing.tombstones || []).map(String).filter(key => matchesRoute(normalizedSpace, key)).sort();
+    const recordBytes = new Map((Array.isArray(listing.records) ? listing.records : []).map(row => [String(row?.key || ''), Math.max(0, Number(row?.valueBytes || 0) || 0)]));
+    const localKeys = await listRoutedLegacyKeys(legacy, normalizedSpace, false);
+    const represented = new Set([...serverKeys, ...tombstones]);
+    const untracked = localKeys.filter(key => !represented.has(key));
+    const pruneKeys = options.pruneUntracked === true ? untracked.slice().sort() : [];
+    progress.totalItems = pruneKeys.length + serverKeys.length + tombstones.length;
+    report('inventory_complete', { currentAction: '복구 대상 조사 완료', message: `복구·검증 대상 ${progress.totalItems.toLocaleString()}개를 확인했습니다.` });
+    const result = {
+      schema: 'memory-suite.restore-to-legacy-storage.v1', namespace, space: normalizedSpace,
+      restored: 0, removed: 0, verified: 0, pruned: 0, failures: [],
+      untrackedLocalKeys: untracked.slice(), integrity,
+      totalItems: progress.totalItems, processedItems: 0, processedBytes: 0, transferredBytes: 0
+    };
+
+    if (options.pruneUntracked === true) {
+      for (const key of pruneKeys) {
+        let action = '추적되지 않은 로컬 값 정리';
+        try {
+          report('prune_local', { currentAction: action, currentKey: key });
+          const ok = await legacyRemoveVerified(legacy, key);
+          if (!ok) throw new Error('untracked_local_prune_failed');
+          result.pruned += 1;
+          action = '정리 완료';
+        } catch (error) {
+          result.failures.push({ key, error: compact(error?.message || error, 220) }); action = '정리 실패';
+        } finally {
+          result.processedItems += 1; progress.processedItems = result.processedItems; progress.failureCount = result.failures.length;
+          report('prune_local', { currentAction: action, currentKey: key });
+        }
+      }
+      result.untrackedLocalKeys = [];
+    }
+
+    for (let offset = 0; offset < serverKeys.length; offset += 256) {
+      const batchKeys = serverKeys.slice(offset, offset + 256);
+      let values = {};
+      try { values = (await remoteGetMany(normalizedSpace, batchKeys, { allowPluginOnly: options.allowPluginOnly === true }))?.values || {}; }
+      catch (_) {}
+      for (const key of batchKeys) {
+        const bytes = Math.max(0, Number(recordBytes.get(key) || 0) || 0);
+        let action = '서버 → pluginStorage 복구';
+        try {
+          report('restore_values', { currentAction: action, currentKey: key });
+          const remote = values[key] || await remoteGet(normalizedSpace, key, { allowPluginOnly: options.allowPluginOnly === true });
+          if (remote.exists !== true) throw new Error('server_key_disappeared_during_restore');
+          const ok = await legacyWriteVerified(legacy, key, remote.value);
+          if (!ok) throw new Error('legacy_restore_write_failed');
+          result.restored += 1; result.verified += 1; result.transferredBytes += bytes || storageValueBytes(remote.value);
+          action = '복구·readback 검증';
+        } catch (error) {
+          result.failures.push({ key, error: compact(error?.message || error, 220) }); action = '복구 실패';
+        } finally {
+          result.processedItems += 1; result.processedBytes += bytes;
+          progress.processedItems = result.processedItems; progress.processedBytes = result.processedBytes; progress.transferredBytes = result.transferredBytes;
+          progress.restored = result.restored; progress.verified = result.verified; progress.failureCount = result.failures.length;
+          report('restore_values', { currentAction: action, currentKey: key });
+        }
+      }
+    }
+    for (const key of tombstones) {
+      let action = '서버 tombstone 반영';
+      try {
+        report('restore_tombstones', { currentAction: action, currentKey: key });
+        const current = await legacyRead(legacy, key);
+        if (!isNullishStorageValue(current)) {
+          const ok = await legacyRemoveVerified(legacy, key);
+          if (!ok) throw new Error('legacy_restore_tombstone_failed');
+          result.removed += 1;
+        }
+        action = '삭제 상태 검증';
+      } catch (error) {
+        result.failures.push({ key, error: compact(error?.message || error, 220) }); action = 'tombstone 반영 실패';
+      } finally {
+        result.processedItems += 1; progress.processedItems = result.processedItems; progress.removed = result.removed; progress.failureCount = result.failures.length;
+        report('restore_tombstones', { currentAction: action, currentKey: key });
+      }
+    }
+    result.ok = result.failures.length === 0 && (options.requireFullCoverage !== true || result.untrackedLocalKeys.length === 0);
+    report(result.ok ? 'space_complete' : 'space_incomplete', {
+      currentAction: result.ok ? '복구 완료' : '복구 확인 필요', currentKey: '',
+      message: result.ok ? `${normalizedSpace} 저장소 복구를 완료했습니다.` : `실패 ${result.failures.length}건 · 추적되지 않은 값 ${result.untrackedLocalKeys.length}건`
+    });
+    if (!result.ok) {
+      const error = new Error(`memory_suite_legacy_restore_incomplete:space=${normalizedSpace},failures=${result.failures.length},untracked=${result.untrackedLocalKeys.length}`);
+      error.code = 'MEMORY_SUITE_RESTORE_INCOMPLETE';
+      error.result = result;
+      throw error;
+    }
+    state.management.lastResult = result;
+    return result;
+  };
+
+  const restoreServerToPluginStorage = async (options = {}) => await restoreServerSpaceToLegacy(
+    options.legacy || state.legacy.plugin,
+    'plugin',
+    options
+  );
+
+  const verifyScopedLegacyPreservation = async (legacy, space, keys = []) => {
+    const normalizedSpace = String(space || 'plugin') === 'local' ? 'local' : 'plugin';
+    const requested = [...new Set((Array.isArray(keys) ? keys : []).map(String).filter(key => matchesRoute(normalizedSpace, key)))];
+    const result = { schema: 'memory-suite.scoped-legacy-preservation.v1', namespace, space: normalizedSpace, requested: requested.length, exact: 0, tombstones: 0, failures: [] };
+    if (!requested.length) return { ...result, ok: true };
+    const values = (await remoteGetMany(normalizedSpace, requested, { allowPluginOnly: true }))?.values || {};
+    for (const key of requested) {
+      try {
+        const remote = values[key] || await remoteGet(normalizedSpace, key, { allowPluginOnly: true });
+        const local = await legacyRead(legacy, key);
+        if (remote.tombstone === true || remote.exists === false) {
+          if (!isNullishStorageValue(local)) throw new Error('local_value_survives_server_tombstone');
+          result.tombstones += 1;
+        } else if (remote.exists === true && jsonComparable(local) === jsonComparable(remote.value)) {
+          result.exact += 1;
+        } else {
+          throw new Error(remote.exists === true ? 'local_value_mismatch' : 'server_record_missing');
+        }
+      } catch (error) { result.failures.push({ key, error: compact(error?.message || error, 220) }); }
+    }
+    result.ok = result.failures.length === 0;
+    if (!result.ok) {
+      const error = new Error(`memory_suite_scoped_legacy_preservation_failed:${normalizedSpace}:${result.failures.length}`);
+      error.code = 'MEMORY_SUITE_SCOPE_PRESERVATION_FAILED';
+      error.result = result;
+      throw error;
+    }
+    return result;
+  };
+
+  const setModeSafely = async (requestedMode, operationOptions = {}) => {
+    const target = normalizeMode(requestedMode);
+    const current = await readConfig(true);
+    if (target === current.mode) return { changed: false, from: current.mode, to: target, modeLabel: modeLabel(target) };
+    const legacy = state.legacy.plugin;
+    if (!legacy) throw new Error('memory_suite_pluginstorage_unavailable');
+    const onProgress = typeof operationOptions.onProgress === 'function' ? operationOptions.onProgress : null;
+    try {
+      if (current.mode === MODE_PLUGIN_ONLY && (target === MODE_MIRROR || target === MODE_SERVER_ONLY)) {
+        const synchronized = await synchronizeAllLegacy({
+          allowPluginOnly: true,
+          allowOverwrite: false,
+          restoreMissingLocal: target === MODE_MIRROR,
+          onProgress
+        });
+        if (!synchronized.ok) throw new Error(`memory_suite_mode_seed_sync_failed:${synchronized.failures.length}`);
+        // The first pass proves the existing server contains no conflicting data.
+        // Only after that proof do new writes temporarily mirror to both stores while
+        // a final settle pass closes the race between initial inventory and mode commit.
+        state.transientMode = MODE_MIRROR;
+        const settled = await synchronizeAllLegacy({
+          allowPluginOnly: true,
+          allowOverwrite: true,
+          restoreMissingLocal: target === MODE_MIRROR,
+          onProgress
+        });
+        if (!settled.ok) throw new Error(`memory_suite_mode_settle_sync_failed:${settled.failures.length}`);
+        const integrity = await remoteIntegrity({ allowPluginOnly: true });
+        if (integrity?.ok !== true) throw new Error(`memory_suite_mode_integrity_failed:${integrity?.result || 'unknown'}`);
+      } else if (current.mode === MODE_MIRROR && target === MODE_SERVER_ONLY) {
+        const synchronized = await synchronizeAllLegacy({ allowOverwrite: true, restoreMissingLocal: true, onProgress });
+        if (!synchronized.ok) throw new Error(`memory_suite_mode_final_sync_failed:${synchronized.failures.length}`);
+        const integrity = await remoteIntegrity();
+        if (integrity?.ok !== true) throw new Error(`memory_suite_mode_integrity_failed:${integrity?.result || 'unknown'}`);
+      } else if (current.mode === MODE_SERVER_ONLY && (target === MODE_MIRROR || target === MODE_PLUGIN_ONLY)) {
+        const restored = await restoreAllLegacyFromServer({ pruneUntracked: true, requireFullCoverage: true, onProgress });
+        if (!restored.ok) throw new Error(`memory_suite_mode_restore_failed:${restored.failures.length}`);
+      }
+      const config = await persistMode(target);
+      return { changed: true, from: current.mode, to: target, modeLabel: modeLabel(target), config };
+    } catch (error) {
+      state.transientMode = '';
+      state.config.at = 0;
+      throw error;
+    }
+  };
+
+  const synchronizeAllLegacy = async (options = {}) => {
+    const result = { schema: 'memory-suite.sync-all.v1', namespace, plugin: null, local: null, uploaded: 0, restored: 0, matched: 0, failures: [], totalItems: 0, processedItems: 0, processedBytes: 0, transferredBytes: 0 };
+    const forward = progress => { try { options.onProgress?.(progress); } catch (_) {} };
+    if (state.legacy.plugin) {
+      result.plugin = await synchronizeLegacyWithServer(state.legacy.plugin, 'plugin', {
+        allowPluginOnly: options.allowPluginOnly === true,
+        allowOverwrite: options.allowOverwrite !== false,
+        restoreMissingLocal: options.restoreMissingLocal !== false,
+        onProgress: forward
+      });
+      result.uploaded += Number(result.plugin?.uploaded || 0);
+      result.restored += Number(result.plugin?.restored || 0);
+      result.matched += Number(result.plugin?.matched || 0);
+      result.totalItems += Number(result.plugin?.totalItems || 0);
+      result.processedItems += Number(result.plugin?.processedItems || 0);
+      result.processedBytes += Number(result.plugin?.processedBytes || 0);
+      result.transferredBytes += Number(result.plugin?.transferredBytes || 0);
+      result.failures.push(...(Array.isArray(result.plugin?.failures) ? result.plugin.failures.map(row => ({ space: 'plugin', ...row })) : []));
+    }
+    if (state.legacy.local && typeof state.legacy.local?.keys === 'function') {
+      result.local = await synchronizeLegacyWithServer(state.legacy.local, 'local', {
+        allowPluginOnly: options.allowPluginOnly === true,
+        allowOverwrite: options.allowOverwrite !== false,
+        restoreMissingLocal: options.restoreMissingLocal !== false,
+        onProgress: forward
+      });
+      result.uploaded += Number(result.local?.uploaded || 0);
+      result.restored += Number(result.local?.restored || 0);
+      result.matched += Number(result.local?.matched || 0);
+      result.totalItems += Number(result.local?.totalItems || 0);
+      result.processedItems += Number(result.local?.processedItems || 0);
+      result.processedBytes += Number(result.local?.processedBytes || 0);
+      result.transferredBytes += Number(result.local?.transferredBytes || 0);
+      result.failures.push(...(Array.isArray(result.local?.failures) ? result.local.failures.map(row => ({ space: 'local', ...row })) : []));
+    }
+    result.ok = result.failures.length === 0;
+    return result;
+  };
+
+  const restoreAllLegacyFromServer = async (options = {}) => {
+    const result = { schema: 'memory-suite.restore-all.v1', namespace, plugin: null, local: null, restored: 0, removed: 0, verified: 0, failures: [], totalItems: 0, processedItems: 0, processedBytes: 0, transferredBytes: 0 };
+    const forward = progress => { try { options.onProgress?.(progress); } catch (_) {} };
+    if (state.legacy.plugin) {
+      result.plugin = await restoreServerSpaceToLegacy(state.legacy.plugin, 'plugin', {
+        pruneUntracked: options.pruneUntracked === true,
+        requireFullCoverage: options.requireFullCoverage === true,
+        allowPluginOnly: options.allowPluginOnly === true,
+        onProgress: forward
+      });
+      result.restored += Number(result.plugin?.restored || 0);
+      result.removed += Number(result.plugin?.removed || 0);
+      result.verified += Number(result.plugin?.verified || 0);
+      result.totalItems += Number(result.plugin?.totalItems || 0);
+      result.processedItems += Number(result.plugin?.processedItems || 0);
+      result.processedBytes += Number(result.plugin?.processedBytes || 0);
+      result.transferredBytes += Number(result.plugin?.transferredBytes || 0);
+      result.failures.push(...(Array.isArray(result.plugin?.failures) ? result.plugin.failures.map(row => ({ space: 'plugin', ...row })) : []));
+    }
+    if (state.legacy.local && typeof state.legacy.local?.getItem === 'function') {
+      result.local = await restoreServerSpaceToLegacy(state.legacy.local, 'local', {
+        pruneUntracked: options.pruneUntracked === true,
+        requireFullCoverage: options.requireFullCoverage === true,
+        allowPluginOnly: options.allowPluginOnly === true,
+        onProgress: forward
+      });
+      result.restored += Number(result.local?.restored || 0);
+      result.removed += Number(result.local?.removed || 0);
+      result.verified += Number(result.local?.verified || 0);
+      result.totalItems += Number(result.local?.totalItems || 0);
+      result.processedItems += Number(result.local?.processedItems || 0);
+      result.processedBytes += Number(result.local?.processedBytes || 0);
+      result.transferredBytes += Number(result.local?.transferredBytes || 0);
+      result.failures.push(...(Array.isArray(result.local?.failures) ? result.local.failures.map(row => ({ space: 'local', ...row })) : []));
+    }
+    result.ok = result.failures.length === 0;
+    return result;
+  };
+
+  const configureConnection = async (settings, operationOptions = {}) => {
+    const requested = settings && typeof settings === 'object' ? settings : {};
+    const current = await readConfig(true);
+    const targetMode = normalizeMode(requested.mode ?? current.mode);
+    const targetUrl = normalizeServerUrl(requested.url ?? current.url);
+    const original = { ...current };
+    const onProgress = typeof operationOptions.onProgress === 'function' ? operationOptions.onProgress : null;
+    const report = (phase, patch = {}) => { try { onProgress?.({ schema: 'memory-suite.connection-progress.v1', namespace, space: String(patch.space || 'plugin'), phase, ...patch, lastActivityAt: Date.now() }); } catch (_) {} };
+    let connectionTest = null;
+    let restoredBeforeUrlChange = null;
+    let seedSync = null;
+    try {
+      report('configuration_start', { currentAction: '설정 변경 준비', message: `${modeLabel(original.mode)} → ${modeLabel(targetMode)}` });
+      if (targetMode === MODE_PLUGIN_ONLY) {
+        const transition = current.mode === MODE_PLUGIN_ONLY
+          ? { changed: false, from: current.mode, to: targetMode }
+          : await setModeSafely(MODE_PLUGIN_ONLY, { onProgress });
+        if (targetUrl !== original.url) await persistServerUrl(targetUrl);
+        const config = await readConfig(true);
+        report('configuration_complete', { currentAction: '설정 적용 완료', message: `${modeLabel(config.mode)}로 적용되었습니다.` });
+        return { ok: true, from: original, to: config, transition, connectionTest: null, restoredBeforeUrlChange: null, seedSync: null };
+      }
+
+      report('connection_test', { currentAction: '서버 연결 확인', message: `${targetUrl} 연결을 확인하고 있습니다.` });
+      connectionTest = await testConnection(targetUrl);
+      if (!connectionTest.ok) {
+        const error = new Error(`memory_suite_connection_test_failed:${connectionTest.error || 'unknown'}`);
+        error.code = 'MEMORY_SUITE_CONNECTION_TEST_FAILED';
+        error.connectionTest = connectionTest;
+        throw error;
+      }
+      report('connection_ready', { currentAction: '서버 연결 확인 완료', message: `Memory Suite ${connectionTest.serverVersion || '-'} 연결됨` });
+
+      if (targetUrl !== original.url && original.mode === MODE_SERVER_ONLY) {
+        report('restore_before_url_change', { currentAction: '기존 서버 데이터 로컬 복구', message: '서버 주소 변경 전에 현재 서버 DATA를 pluginStorage로 안전하게 복구합니다.' });
+        restoredBeforeUrlChange = await restoreAllLegacyFromServer({ pruneUntracked: true, requireFullCoverage: true, onProgress });
+        if (!restoredBeforeUrlChange.ok) throw new Error(`memory_suite_restore_before_url_change_failed:${restoredBeforeUrlChange.failures.length}`);
+      }
+
+      if (targetUrl !== original.url) await persistServerUrl(targetUrl);
+      resetBootstrapCache();
+
+      if (targetUrl !== original.url) {
+        report('seed_new_server', { currentAction: '새 서버 기준선 생성', message: '새 서버에 기존 데이터를 안전하게 복사하고 있습니다.' });
+        seedSync = await synchronizeAllLegacy({
+          allowPluginOnly: true,
+          allowOverwrite: false,
+          restoreMissingLocal: targetMode === MODE_MIRROR,
+          onProgress
+        });
+        if (!seedSync.ok) throw new Error(`memory_suite_new_server_seed_failed:${seedSync.failures.length}`);
+      }
+
+      const refreshed = await readConfig(true);
+      report('mode_transition', { currentAction: '저장 모드 전환 준비', message: '서버 기준선 검증이 끝나면 저장 모드를 확정합니다.' });
+      const transition = refreshed.mode === targetMode
+        ? { changed: false, from: refreshed.mode, to: targetMode }
+        : await setModeSafely(targetMode, { onProgress });
+      const config = await readConfig(true);
+      await bootstrap(true, true);
+      report('configuration_complete', { currentAction: '설정 적용 완료', message: `${modeLabel(config.mode)} · ${config.url}` });
+      return { ok: true, from: original, to: config, transition, connectionTest, restoredBeforeUrlChange, seedSync };
+    } catch (error) {
+      state.transientMode = '';
+      state.config.at = 0;
+      report('configuration_rollback', { currentAction: '이전 설정 복구', message: compact(error?.message || error, 260) });
+      try {
+        const now = await readConfig(true).catch(() => null);
+        if (now?.url !== original.url) await persistServerUrl(original.url);
+        const afterUrl = await readConfig(true).catch(() => null);
+        if (afterUrl && afterUrl.mode !== original.mode) await setModeSafely(original.mode, { onProgress });
+      } catch (_) {}
+      throw error;
+    }
+  };
+
+  const createBackgroundJob = async (kind, target = {}) => {
+    const currentConfig = await readConfig(true);
+    const existing = state.syncJob.current;
+    if (existing && !syncJobTerminal(existing.status)) {
+      const sameTarget = existing.kind === kind
+        && String(existing.targetMode || '') === String(target.mode || '')
+        && String(existing.targetUrl || '') === String(target.url || '');
+      if (sameTarget) return cloneSyncJob(existing);
+      const error = new Error(`memory_suite_background_job_busy:${existing.kind}:${existing.status}`);
+      error.code = 'MEMORY_SUITE_SYNC_JOB_BUSY';
+      error.job = cloneSyncJob(existing);
+      throw error;
+    }
+    let random = '';
+    try { random = globalThis?.crypto?.randomUUID?.() || ''; } catch (_) {}
+    if (!random) random = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    const job = {
+      schema: SYNC_JOB_SCHEMA,
+      namespace,
+      pluginId,
+      pluginVersion,
+      jobId: `${namespace}_${kind}_${random}`.replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 220),
+      kind,
+      status: 'queued',
+      phase: 'queued',
+      sourceMode: currentConfig.mode,
+      sourceUrl: currentConfig.url,
+      targetMode: target.mode ? normalizeMode(target.mode) : currentConfig.mode,
+      targetUrl: target.url ? normalizeServerUrl(target.url) : currentConfig.url,
+      totalItems: 0,
+      processedItems: 0,
+      processedBytes: 0,
+      transferredBytes: 0,
+      uploaded: 0,
+      restored: 0,
+      matched: 0,
+      removedByTombstone: 0,
+      failures: 0,
+      conflicts: 0,
+      retryCount: 0,
+      nextRetryAt: 0,
+      currentSpace: '',
+      currentKey: '',
+      currentAction: '',
+      message: '',
+      spaces: {},
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      finishedAt: 0,
+      result: null,
+      error: ''
+    };
+    state.syncJob.current = job;
+    state.syncJob.loaded = true;
+    notifySyncJob();
+    await persistSyncJobNow();
+    return cloneSyncJob(job);
+  };
+
+  const completeBackgroundJob = async (result = null) => {
+    updateSyncJob({
+      status: 'completed', phase: 'completed', currentAction: '완료', currentKey: '',
+      message: '작업이 안전하게 완료되었습니다.', result: result ? cloneSyncJob(result) : null,
+      error: '', nextRetryAt: 0, finishedAt: Date.now()
+    }, { persist: 'immediate' });
+    return getSyncJob();
+  };
+
+  const failBackgroundJob = async error => {
+    updateSyncJob({
+      status: 'failed', phase: 'failed', currentAction: '작업 중단', currentKey: '',
+      message: '작업을 완료하지 못했습니다.', error: compact(error?.message || error, 700),
+      nextRetryAt: 0, finishedAt: Date.now()
+    }, { persist: 'immediate' });
+    return getSyncJob();
+  };
+
+  const executeBackgroundJob = async () => {
+    const job = state.syncJob.current;
+    if (!job || syncJobTerminal(job.status)) return getSyncJob();
+    if (state.syncJob.promise) return state.syncJob.promise;
+    if (state.syncJob.retryTimer) { clearTimeout(state.syncJob.retryTimer); state.syncJob.retryTimer = null; }
+    updateSyncJob({ status: 'running', phase: job.phase === 'resume_pending' ? 'resuming' : (job.phase || 'starting'), nextRetryAt: 0, error: '' });
+    const runner = (async () => {
+      try {
+        let result;
+        if (job.kind === 'connection_config') {
+          result = await configureConnection({ mode: job.targetMode, url: job.targetUrl }, { onProgress: applySyncProgressToJob });
+        } else if (job.kind === 'manual_sync') {
+          result = await synchronizeAllLegacy({ allowOverwrite: true, restoreMissingLocal: true, onProgress: applySyncProgressToJob });
+          if (!result.ok) throw new Error(`sync_failures:${result.failures.length}`);
+        } else if (job.kind === 'server_restore') {
+          result = await restoreAllLegacyFromServer({ pruneUntracked: false, requireFullCoverage: false, onProgress: applySyncProgressToJob });
+          if (!result.ok) throw new Error(`restore_failures:${result.failures.length}`);
+        } else {
+          throw new Error(`memory_suite_unknown_background_job:${job.kind}`);
+        }
+        await completeBackgroundJob(result);
+        return result;
+      } catch (error) {
+        if (retryableSyncError(error) && Number(state.syncJob.current?.retryCount || 0) < 120) {
+          const retryCount = Number(state.syncJob.current?.retryCount || 0) + 1;
+          const delay = SYNC_JOB_RETRY_DELAYS_MS[Math.min(SYNC_JOB_RETRY_DELAYS_MS.length - 1, retryCount - 1)];
+          updateSyncJob({
+            status: 'paused', phase: 'waiting_for_server', currentAction: '서버 재연결 대기',
+            message: `서버 연결이 일시적으로 끊겼습니다. ${Math.ceil(delay / 1000)}초 후 이어서 확인합니다.`,
+            error: compact(error?.message || error, 420), retryCount, nextRetryAt: Date.now() + delay
+          }, { persist: 'immediate' });
+          state.syncJob.retryTimer = setTimeout(() => {
+            state.syncJob.retryTimer = null;
+            void executeBackgroundJob();
+          }, delay);
+          try { state.syncJob.retryTimer?.unref?.(); } catch (_) {}
+          return null;
+        }
+        await failBackgroundJob(error);
+        throw error;
+      }
+    })();
+    state.syncJob.promise = runner.finally(() => { state.syncJob.promise = null; });
+    return state.syncJob.promise;
+  };
+
+  const startConnectionConfigurationJob = async settings => {
+    const requested = settings && typeof settings === 'object' ? settings : {};
+    const current = await readConfig(true);
+    const target = {
+      mode: normalizeMode(requested.mode ?? current.mode),
+      url: normalizeServerUrl(requested.url ?? current.url)
+    };
+    const job = await createBackgroundJob('connection_config', target);
+    void executeBackgroundJob().catch(() => {});
+    return job;
+  };
+
+  const startSynchronizationJob = async () => {
+    const current = await readConfig(true);
+    if (current.mode !== MODE_MIRROR) throw new Error('memory_suite_manual_sync_requires_mirror_mode');
+    const job = await createBackgroundJob('manual_sync', { mode: current.mode, url: current.url });
+    void executeBackgroundJob().catch(() => {});
+    return job;
+  };
+
+  const startRestoreJob = async () => {
+    const current = await readConfig(true);
+    if (current.mode !== MODE_SERVER_ONLY) throw new Error('memory_suite_restore_requires_server_only_mode');
+    const job = await createBackgroundJob('server_restore', { mode: current.mode, url: current.url });
+    void executeBackgroundJob().catch(() => {});
+    return job;
+  };
+
+  const resumePendingSyncJob = async () => {
+    await loadPersistedSyncJob();
+    const job = state.syncJob.current;
+    if (!job || syncJobTerminal(job.status)) return cloneSyncJob(job);
+    if (!state.legacy.plugin) return cloneSyncJob(job);
+    void executeBackgroundJob().catch(() => {});
+    return cloneSyncJob(job);
+  };
+
+  const waitForSyncJob = async (jobId = '', timeoutMs = 15 * 60 * 1000) => {
+    const wanted = String(jobId || state.syncJob.current?.jobId || '');
+    if (!wanted) return null;
+    const current = state.syncJob.current;
+    if (current?.jobId === wanted && syncJobTerminal(current.status)) return cloneSyncJob(current);
+    return await new Promise((resolve, reject) => {
+      let timer = null;
+      const unsubscribe = subscribeSyncJob(job => {
+        if (!job || job.jobId !== wanted || !syncJobTerminal(job.status)) return;
+        if (timer) clearTimeout(timer);
+        unsubscribe();
+        resolve(job);
+      });
+      timer = setTimeout(() => {
+        unsubscribe();
+        reject(new Error(`memory_suite_sync_job_wait_timeout:${wanted}`));
+      }, Math.max(1000, Number(timeoutMs || 0) || 15 * 60 * 1000));
+    });
+  };
+
+  const getConnectionSettings = async (options = {}) => {
+    const config = await readConfig(options.force === true);
+    const result = {
+      schema: 'memory-suite.connection-settings.v1',
+      namespace,
+      pluginId,
+      pluginVersion,
+      mode: config.mode,
+      modeLabel: modeLabel(config.mode),
+      url: config.url,
+      status: { ...state.status },
+      migration: { plugin: { ...state.migration.plugin }, local: { ...state.migration.local } },
+      syncJob: getSyncJob(),
+      diagnostics: {
+        ready: !!state.diagnostics.value,
+        reachable: state.diagnostics.value?.reachable ?? null,
+        updatedAt: Number(state.diagnostics.at || 0),
+        eventCount: Array.isArray(state.diagnostics.value?.events) ? state.diagnostics.value.events.length : 0,
+        error: String(state.diagnostics.value?.error || '')
+      }
+    };
+    if (options.test === true) result.connection = await testConnection(config.url);
+    return result;
+  };
+
+  const prepareServerScopeDeletion = async (options = {}) => {
+    const pluginLegacy = state.legacy.plugin;
+    if (!pluginLegacy) throw new Error('memory_suite_pluginstorage_unavailable');
+    const localLegacy = state.legacy.local;
+    const pluginKeys = [...new Set((Array.isArray(options.pluginKeys) ? options.pluginKeys : []).map(String).filter(key => matchesRoute('plugin', key)))];
+    const localKeys = [...new Set((Array.isArray(options.localKeys) ? options.localKeys : []).map(String).filter(key => matchesRoute('local', key)))];
+    const current = await readConfig(true);
+    const proofNeedsTransientServer = current.mode === MODE_PLUGIN_ONLY;
+    if (proofNeedsTransientServer) state.transientMode = MODE_MIRROR;
+    let beforeIntegrity;
+    try { beforeIntegrity = await remoteIntegrity(); }
+    catch (error) { if (proofNeedsTransientServer) state.transientMode = ''; throw error; }
+    let pluginRestore = null;
+    let localRestore = null;
+    let pluginSync = null;
+    let localSync = null;
+
+    if (current.mode === MODE_MIRROR) {
+      pluginSync = await synchronizeLegacyWithServer(pluginLegacy, 'plugin', { allowOverwrite: true, restoreMissingLocal: true });
+      if (localLegacy && typeof localLegacy?.getItem === 'function') {
+        localSync = await synchronizeLegacyWithServer(localLegacy, 'local', { allowOverwrite: true, restoreMissingLocal: true });
+      }
+    } else if (current.mode === MODE_SERVER_ONLY) {
+      pluginRestore = await restoreServerSpaceToLegacy(pluginLegacy, 'plugin', { pruneUntracked: false, requireFullCoverage: false });
+      if (localLegacy && typeof localLegacy?.getItem === 'function') {
+        localRestore = await restoreServerSpaceToLegacy(localLegacy, 'local', { pruneUntracked: false, requireFullCoverage: false });
+      } else if (localKeys.length) {
+        const error = new Error('memory_suite_local_storage_required_for_scope_preservation');
+        error.code = 'MEMORY_SUITE_LOCAL_STORAGE_UNAVAILABLE';
+        throw error;
+      }
+    }
+
+    const pluginProof = await verifyScopedLegacyPreservation(pluginLegacy, 'plugin', pluginKeys);
+    const localProof = localKeys.length
+      ? await verifyScopedLegacyPreservation(localLegacy, 'local', localKeys)
+      : { schema: 'memory-suite.scoped-legacy-preservation.v1', namespace, space: 'local', requested: 0, exact: 0, tombstones: 0, failures: [], ok: true };
+
+    let modeChanged = false;
+    if (proofNeedsTransientServer) state.transientMode = '';
+    if (current.mode !== MODE_PLUGIN_ONLY) {
+      await persistMode(MODE_PLUGIN_ONLY);
+      modeChanged = true;
+    }
+    const verifiedMode = await readConfig(true);
+    if (verifiedMode.mode !== MODE_PLUGIN_ONLY) throw new Error(`memory_suite_scope_delete_mode_transition_failed:${verifiedMode.mode}`);
+    const afterIntegrity = await remoteIntegrity({ allowPluginOnly: true });
+    const receipt = {
+      schema: 'memory-suite.server-scope-delete-owner-receipt.v1',
+      namespace, pluginId, pluginVersion,
+      scopeId: String(options.scopeId || '').slice(0, 320),
+      scopeKey: String(options.scopeKey || '').slice(0, 700),
+      modeBefore: current.mode,
+      modeAfter: MODE_PLUGIN_ONLY,
+      modeChanged,
+      verified: pluginProof.ok === true && localProof.ok === true && afterIntegrity.ok === true,
+      pluginKeys: pluginKeys.length,
+      localKeys: localKeys.length,
+      pluginProof,
+      localProof,
+      pluginRestore,
+      localRestore,
+      pluginSync,
+      localSync,
+      integrityBefore: beforeIntegrity,
+      integrityAfter: afterIntegrity,
+      checkedAt: Date.now()
+    };
+    if (receipt.verified !== true) {
+      const error = new Error('memory_suite_scope_delete_owner_proof_incomplete');
+      error.code = 'MEMORY_SUITE_SCOPE_DELETE_OWNER_PROOF_INCOMPLETE';
+      error.receipt = receipt;
+      throw error;
+    }
+    state.management.lastResult = receipt;
+    setStatus('scope_delete_owner_ready', '', { mode: MODE_PLUGIN_ONLY, scopeId: receipt.scopeId });
+    return receipt;
+  };
+
+  const deletePluginStorageAfterServerVerification = async () => {
+    const legacy = state.legacy.plugin;
+    if (!legacy) throw new Error('memory_suite_pluginstorage_unavailable');
+    const current = await readConfig(true);
+    if (current.mode === MODE_PLUGIN_ONLY) {
+      const error = new Error('pluginStorage 삭제는 플러그인 + 서버 병존 또는 서버 단독 모드에서만 사용할 수 있습니다.');
+      error.code = 'MEMORY_SUITE_DELETE_REQUIRES_SERVER_MODE';
+      throw error;
+    }
+    const preservation = await verifyServerPreservation(legacy);
+    let modeChanged = false;
+    if (current.mode === MODE_MIRROR) {
+      await persistMode(MODE_SERVER_ONLY);
+      modeChanged = true;
+    }
+    const allKeys = await listRoutedLegacyKeys(legacy, 'plugin', true);
+    const logicalKeys = allKeys.filter(key => matchesRoute('plugin', key));
+    const artifactKeys = allKeys.filter(key => !matchesRoute('plugin', key) && isOwnedChunkArtifact('plugin', key));
+    const failures = [];
+    let deleted = 0;
+    for (const key of logicalKeys) {
+      try {
+        const ok = await legacyRemoveVerified(legacy, key);
+        if (!ok) throw new Error('pluginstorage_delete_failed');
+        deleted += 1;
+      } catch (error) { failures.push({ key, error: compact(error?.message || error, 220) }); }
+    }
+    for (const key of artifactKeys) {
+      try {
+        const ok = await legacyRemoveVerified(legacy, key);
+        if (ok) deleted += 1;
+      } catch (error) { failures.push({ key, error: compact(error?.message || error, 220) }); }
+    }
+    const remaining = await listRoutedLegacyKeys(legacy, 'plugin', true).catch(() => []);
+    if (remaining.length) failures.push({ key: '*', error: `pluginstorage_keys_remaining:${remaining.length}` });
+    const result = { schema: 'memory-suite.pluginstorage-delete.v1', namespace, preservation, modeChanged, mode: MODE_SERVER_ONLY, deleted, logicalDeleted: logicalKeys.length, artifactDeleted: artifactKeys.length, remaining, failures, ok: failures.length === 0 };
+    state.management.lastResult = result;
+    if (!result.ok) {
+      const error = new Error(`memory_suite_pluginstorage_delete_incomplete:${failures.length}`);
+      error.code = 'MEMORY_SUITE_PLUGINSTORAGE_DELETE_INCOMPLETE';
+      error.result = result;
+      throw error;
+    }
+    setStatus('pluginstorage_deleted', '', { mode: MODE_SERVER_ONLY, deleted });
+    return result;
+  };
+
+  const migrateAllLegacy = async (legacy, space) => {
+    const target = state.migration[space] || state.migration.plugin;
+    const startedAt = Date.now();
+    target.state = 'running'; target.at = startedAt; target.reason = '';
+    target.scanned = 0; target.migrated = 0; target.skipped = 0; target.failed = 0;
+    const config = await readConfig();
+    if (config.mode === MODE_PLUGIN_ONLY) {
+      target.state = 'plugin_only';
+      return { ...target };
+    }
+    if (typeof legacy?.keys !== 'function' || typeof legacy?.getItem !== 'function') {
+      target.state = 'lazy_only'; target.reason = 'legacy_key_enumeration_unavailable'; return { ...target };
+    }
+    if (config.mode === MODE_MIRROR && space === 'plugin') {
+      try {
+        const synced = await synchronizeLegacyWithServer(legacy, space, { allowOverwrite: true, restoreMissingLocal: true });
+        target.scanned = synced.localKeys; target.migrated = synced.uploaded; target.skipped = synced.matched + synced.restored; target.failed = synced.failures.length;
+        target.state = synced.ok ? 'complete' : 'partial'; target.at = Date.now();
+        return { ...target, durationMs: Date.now() - startedAt };
+      } catch (error) {
+        target.state = 'partial'; target.failed += 1; target.reason = compact(error?.message || error, 240); target.at = Date.now();
+        return { ...target, durationMs: Date.now() - startedAt };
+      }
+    }
+    const listed = await legacy.keys();
+    const keysToInspect = [...new Set((Array.isArray(listed) ? listed : []).map(String).filter(key => matchesRoute(space, key)))];
+    target.scanned = keysToInspect.length;
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < keysToInspect.length) {
+        const index = cursor; cursor += 1; const key = keysToInspect[index];
+        try {
+          const result = await migrateFromLegacy(space, key, async () => await legacy.getItem(key));
+          if (result.state === 'migrated') target.migrated += 1; else target.skipped += 1;
+        } catch (error) { target.failed += 1; target.reason = compact(error?.message || error, 240); }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(migrationConcurrency, Math.max(1, keysToInspect.length)) }, () => worker()));
+    target.state = target.failed > 0 ? 'partial' : 'complete'; target.at = Date.now();
+    return { ...target, durationMs: Date.now() - startedAt };
+  };
+
+  const scheduleLegacyMigration = (legacy, space, force = false) => {
+    const enabled = space === 'local' ? autoMigrateLocal : autoMigratePlugin;
+    if (!enabled || !legacy || (typeof legacy !== 'object' && typeof legacy !== 'function')) return null;
+    let record = migrationStateByLegacy.get(legacy);
+    const timestamp = Date.now();
+    if (!record) { record = { running: null, timer: null, completed: false, retryAt: 0, space }; migrationStateByLegacy.set(legacy, record); }
+    if (record.running) return record.running;
+    if (!force && record.completed) return null;
+    if (!force && record.retryAt > timestamp) return null;
+    if (record.timer) return null;
+    record.timer = setTimeout(() => {
+      record.timer = null;
+      record.running = migrateAllLegacy(legacy, space)
+        .then(result => {
+          record.completed = result.state === 'complete' || result.state === 'plugin_only' || result.state === 'lazy_only';
+          record.retryAt = result.state === 'partial' ? Date.now() + migrationRetryMs : 0;
+          return result;
+        })
+        .catch(error => {
+          record.completed = false; record.retryAt = Date.now() + migrationRetryMs;
+          const target = state.migration[space] || state.migration.plugin;
+          target.state = 'failed'; target.reason = compact(error?.message || error, 240); target.at = Date.now();
+          warnOnce(`migration_${space}_${target.reason}`, error);
+          return { ...target };
+        })
+        .finally(() => { record.running = null; });
+    }, migrationDelayMs + (space === 'local' ? 900 : 0));
+    try { record.timer?.unref?.(); } catch (_) {}
+    return null;
+  };
+
+  const get = async (space, key, legacyGet = null, legacySet = null, legacyRemove = null) => {
+    if (!matchesRoute(space, key)) return typeof legacyGet === 'function' ? await legacyGet() : null;
+    const config = await readConfig();
+    if (config.mode === MODE_PLUGIN_ONLY) return typeof legacyGet === 'function' ? await legacyGet() : null;
+    if (config.mode === MODE_MIRROR) {
+      const localValue = typeof legacyGet === 'function' ? await legacyGet() : null;
+      if (!isNullishStorageValue(localValue)) {
+        try {
+          const remote = await remoteGet(space, key);
+          if (remote.tombstone === true) {
+            if (typeof legacyRemove === 'function') await legacyRemove();
+            setStatus('server_tombstone_applied', '', { mode: MODE_MIRROR, key: compact(key, 160), space });
+            return null;
+          }
+          void serializeMutation(space, key, async () => {
+            try {
+              if (remote.exists !== true || jsonComparable(remote.value) !== jsonComparable(localValue)) {
+                await remoteMutate('set', space, key, localValue);
+              }
+              setStatus('synced', '', { mode: MODE_MIRROR, key: compact(key, 160), space });
+            } catch (error) {
+              setStatus('local_ahead', error?.message || error, { mode: MODE_MIRROR, key: compact(key, 160), space });
+            }
+          });
+          return localValue;
+        } catch (error) {
+          setStatus('server_unavailable_local_only', error?.message || error, { mode: MODE_MIRROR, key: compact(key, 160), space });
+          return localValue;
+        }
+      }
+      try {
+        const remote = await remoteGet(space, key);
+        if (remote.exists === true) {
+          if (typeof legacySet === 'function') await legacySet(remote.value);
+          return remote.value;
+        }
+        if (remote.tombstone === true && typeof legacyRemove === 'function') await legacyRemove();
+        return null;
+      } catch (error) {
+        setStatus('server_unavailable_local_only', error?.message || error, { mode: MODE_MIRROR, key: compact(key, 160), space });
+        return null;
+      }
+    }
+    const remote = await remoteGet(space, key);
+    if (remote.exists === true) return remote.value;
+    if (remote.tombstone === true) return null;
+    const migrated = await migrateFromLegacy(space, key, legacyGet);
+    return migrated.value;
+  };
+
+  const set = async (space, key, value, legacySet = null) => {
+    if (!matchesRoute(space, key)) return typeof legacySet === 'function' ? await legacySet(value) : false;
+    const config = await readConfig();
+    if (config.mode === MODE_PLUGIN_ONLY) return typeof legacySet === 'function' ? await legacySet(value) : false;
+    if (config.mode === MODE_MIRROR) {
+      const localOk = typeof legacySet === 'function' ? await legacySet(value) : false;
+      if (!localOk) return false;
+      try {
+        await serializeMutation(space, key, () => remoteMutate('set', space, key, value));
+        setStatus('synced', '', { mode: MODE_MIRROR, key: compact(key, 160), space });
+      } catch (error) {
+        setStatus('local_ahead', error?.message || error, { mode: MODE_MIRROR, key: compact(key, 160), space });
+        warnOnce(`mirror_server_write_${compact(key, 80)}`, error);
+      }
+      return true;
+    }
+    await serializeMutation(space, key, () => remoteMutate('set', space, key, value));
+    return true;
+  };
+
+  const remove = async (space, key, legacyGet = null, legacySet = null, legacyRemove = null) => {
+    if (!matchesRoute(space, key)) return typeof legacyRemove === 'function' ? await legacyRemove() : false;
+    const config = await readConfig();
+    if (config.mode === MODE_PLUGIN_ONLY) return typeof legacyRemove === 'function' ? await legacyRemove() : false;
+    if (config.mode === MODE_MIRROR) {
+      const previousLocal = typeof legacyGet === 'function' ? await legacyGet() : null;
+      try {
+        await serializeMutation(space, key, () => remoteMutate('remove', space, key, null));
+      } catch (error) {
+        setStatus('mirror_delete_blocked', error?.message || error, { mode: MODE_MIRROR, key: compact(key, 160), space });
+        return false;
+      }
+      const localOk = typeof legacyRemove === 'function' ? await legacyRemove() : false;
+      if (!localOk) {
+        if (!isNullishStorageValue(previousLocal)) {
+          try { await serializeMutation(space, key, () => remoteMutate('set', space, key, previousLocal)); } catch (_) {}
+        }
+        setStatus('mirror_delete_rolled_back', 'pluginStorage remove failed', { mode: MODE_MIRROR, key: compact(key, 160), space });
+        return false;
+      }
+      setStatus('synced', '', { mode: MODE_MIRROR, key: compact(key, 160), space });
+      return true;
+    }
+    await serializeMutation(space, key, () => remoteMutate('remove', space, key, null));
+    return true;
+  };
+
+  const keys = async (space, prefix = '', legacyKeysFn = null) => {
+    const config = await readConfig();
+    const legacy = typeof legacyKeysFn === 'function' ? await legacyKeysFn() : [];
+    const legacyList = Array.isArray(legacy) ? legacy.map(String).filter(Boolean) : [];
+    if (config.mode === MODE_PLUGIN_ONLY) return legacyList;
+    let remote = { keys: [], tombstones: [] };
+    try { remote = await remoteKeys(space, prefix); }
+    catch (error) {
+      if (config.mode === MODE_MIRROR) return legacyList;
+      throw error;
+    }
+    const serverKeys = Array.isArray(remote.keys) ? remote.keys.map(String) : [];
+    const tombstones = new Set(Array.isArray(remote.tombstones) ? remote.tombstones.map(String) : []);
+    const hiddenLegacyKey = key => {
+      if (!matchesRoute(space, key)) return false;
+      if (tombstones.has(key)) return true;
+      for (const tombstone of tombstones) if (key.startsWith(`${tombstone}::chunk:v1:`)) return true;
+      return false;
+    };
+    return [...new Set([...serverKeys, ...legacyList.filter(key => !hiddenLegacyKey(key))])];
+  };
+
+  const createProxy = (legacy, space, cache) => {
+    if (!legacy || (typeof legacy !== 'object' && typeof legacy !== 'function')) return legacy;
+    state.legacy[space] = legacy;
+    if (space === 'plugin') setTimeout(() => { void resumePendingSyncJob().catch(() => {}); }, 0);
+    if (cache.has(legacy)) { scheduleLegacyMigration(legacy, space); return cache.get(legacy); }
+    const proxy = Object.freeze({
+      getItem: async key => await get(
+        space,
+        String(key),
+        async () => typeof legacy.getItem === 'function' ? await legacy.getItem(key) : null,
+        async next => typeof legacy.setItem === 'function' ? (await legacy.setItem(key, next)) !== false : false,
+        async () => {
+          if (typeof legacy.removeItem === 'function') return (await legacy.removeItem(key)) !== false;
+          if (typeof legacy.setItem === 'function') return (await legacy.setItem(key, null)) !== false;
+          return false;
+        }
+      ),
+      setItem: async (key, value) => await set(space, String(key), value, async next => typeof legacy.setItem === 'function' ? (await legacy.setItem(key, next)) !== false : false),
+      removeItem: async key => await remove(
+        space,
+        String(key),
+        async () => typeof legacy.getItem === 'function' ? await legacy.getItem(key) : null,
+        async next => typeof legacy.setItem === 'function' ? (await legacy.setItem(key, next)) !== false : false,
+        async () => {
+          if (typeof legacy.removeItem === 'function') return (await legacy.removeItem(key)) !== false;
+          if (typeof legacy.setItem === 'function') return (await legacy.setItem(key, null)) !== false;
+          return false;
+        }
+      ),
+      keys: async () => await keys(space, '', async () => typeof legacy.keys === 'function' ? await legacy.keys() : []),
+      migrateAll: async () => await migrateAllLegacy(legacy, space)
+    });
+    cache.set(legacy, proxy);
+    scheduleLegacyMigration(legacy, space);
+    return proxy;
+  };
+
+  const connectionPanelIdBase = `memory-suite-connection-${namespace}`.replace(/[^A-Za-z0-9_-]/g, '_');
+  let connectionPanelSequence = 0;
+
+  const htmlEscape = value => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  const mountConnectionPanel = async (container, panelOptions = {}) => {
+    if (!container || typeof container.querySelector !== 'function') return false;
+    const instanceId = `${connectionPanelIdBase}-${++connectionPanelSequence}`;
+    const title = String(panelOptions.title || `${displayName} · 서버 연결`).trim();
+    const description = String(panelOptions.description || '저장 방식과 Memory Suite 서버 주소를 설정하고 연결 상태를 확인합니다.').trim();
+    const config = await readConfig(true).catch(error => ({ mode: MODE_PLUGIN_ONLY, url: defaultUrl, error: compact(error?.message || error, 300) }));
+    const fmtBytes = bytes => {
+      const value = Math.max(0, Number(bytes || 0) || 0);
+      if (value < 1024) return `${Math.round(value)} B`;
+      if (value < 1024 ** 2) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
+      if (value < 1024 ** 3) return `${(value / (1024 ** 2)).toFixed(value < 10 * 1024 ** 2 ? 1 : 0)} MB`;
+      return `${(value / (1024 ** 3)).toFixed(2)} GB`;
+    };
+    const fmtDuration = ms => {
+      const total = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+      if (total < 60) return `${total}초`;
+      const minutes = Math.floor(total / 60);
+      const seconds = total % 60;
+      if (minutes < 60) return `${minutes}분 ${seconds}초`;
+      return `${Math.floor(minutes / 60)}시간 ${minutes % 60}분`;
+    };
+    const phaseLabel = phase => ({
+      queued: '작업 준비', starting: '작업 시작', resuming: '이전 작업 재개', resume_pending: '재개 대기',
+      configuration_start: '설정 변경 준비', connection_test: '서버 연결 확인', connection_ready: '서버 연결 확인 완료',
+      seed_new_server: '새 서버 기준선 생성', mode_transition: '저장 모드 전환 준비',
+      integrity_before: '서버 무결성 확인', inventory: '데이터 조사 중', inventory_complete: '데이터 조사 완료',
+      sync_local: 'pluginStorage → 서버 동기화', restore_missing_local: '서버 → pluginStorage 보충',
+      restore_before_url_change: '기존 서버 데이터 복구', prune_local: '로컬 정리', restore_values: '서버 데이터 복구',
+      restore_tombstones: '삭제 상태 복구', integrity_after: '최종 무결성 확인', space_complete: '저장소 동기화 완료',
+      space_incomplete: '동기화 확인 필요', configuration_complete: '설정 적용 완료', configuration_rollback: '이전 설정 복구',
+      waiting_for_server: '서버 재연결 대기', completed: '완료', failed: '실패'
+    }[String(phase || '')] || String(phase || '작업 중'));
+    const jobTitle = job => job?.kind === 'manual_sync' ? '수동 동기화'
+      : (job?.kind === 'server_restore' ? '서버 → pluginStorage 복구'
+        : ((job?.sourceMode === MODE_PLUGIN_ONLY && job?.targetMode !== MODE_PLUGIN_ONLY) ? '초기 서버 동기화' : '저장 설정 전환'));
+
+    container.innerHTML = `
+      <section class="mscx" data-memory-suite-connection-panel="${htmlEscape(namespace)}">
+        <style>
+          #${instanceId}{--mscx-bg:rgba(15,23,42,.72);--mscx-card:rgba(30,41,59,.76);--mscx-soft:rgba(15,23,42,.68);--mscx-line:rgba(148,163,184,.25);--mscx-text:#eef4ff;--mscx-muted:#9eabc1;--mscx-accent:#7aa2ff;--mscx-good:#56d49b;--mscx-warn:#f0b65a;--mscx-danger:#fb7185;color:var(--mscx-text);display:grid;gap:14px;font:500 13px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-width:0}
+          #${instanceId} *{box-sizing:border-box} #${instanceId} .mscx-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:2px 2px 0} #${instanceId} h2{margin:0;font-size:20px;line-height:1.25;color:var(--mscx-text)} #${instanceId} .mscx-head p{margin:6px 0 0;color:var(--mscx-muted);font-size:12px}
+          #${instanceId} .mscx-state{display:inline-flex;align-items:center;gap:7px;padding:6px 9px;border:1px solid var(--mscx-line);border-radius:999px;background:var(--mscx-soft);white-space:nowrap;font-size:11px;font-weight:800;color:var(--mscx-muted)} #${instanceId} .mscx-dot{width:8px;height:8px;border-radius:50%;background:var(--mscx-muted)} #${instanceId} .mscx-state.good .mscx-dot{background:var(--mscx-good);box-shadow:0 0 0 4px rgba(86,212,155,.12)} #${instanceId} .mscx-state.warn .mscx-dot{background:var(--mscx-warn)} #${instanceId} .mscx-state.error .mscx-dot{background:var(--mscx-danger)}
+          #${instanceId} .mscx-card{padding:14px;border:1px solid var(--mscx-line);border-radius:15px;background:var(--mscx-card);min-width:0} #${instanceId} .mscx-card-title{display:block;margin-bottom:9px;font-size:12px;font-weight:850;color:var(--mscx-text)}
+          #${instanceId} .mscx-modes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px} #${instanceId} .mscx-mode{position:relative;display:grid;gap:4px;padding:12px;border:1px solid var(--mscx-line);border-radius:12px;background:var(--mscx-soft);cursor:pointer;min-width:0} #${instanceId} .mscx-mode.selected,#${instanceId} .mscx-mode:has(input:checked){border-color:var(--mscx-accent);box-shadow:0 0 0 1px var(--mscx-accent) inset;background:rgba(81,116,200,.13)} #${instanceId} .mscx-mode input{position:absolute;right:10px;top:10px;accent-color:var(--mscx-accent)} #${instanceId} .mscx-mode strong{padding-right:22px;font-size:12px;color:var(--mscx-text)} #${instanceId} .mscx-mode small{color:var(--mscx-muted);font-size:10px;line-height:1.45}
+          #${instanceId} .mscx-url-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px} #${instanceId} input[type="url"]{width:100%;min-width:0;padding:10px 11px;border:1px solid var(--mscx-line);border-radius:10px;background:var(--mscx-soft);color:var(--mscx-text);font:500 12px ui-monospace,SFMono-Regular,Consolas,monospace;outline:none} #${instanceId} input[type="url"]:focus{border-color:var(--mscx-accent);box-shadow:0 0 0 3px rgba(122,162,255,.12)}
+          #${instanceId} .mscx-actions{display:flex;flex-wrap:wrap;gap:8px} #${instanceId} button{min-height:38px;padding:8px 12px;border:1px solid var(--mscx-line);border-radius:10px;background:var(--mscx-soft);color:var(--mscx-text);font:750 11px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:pointer} #${instanceId} button:hover{border-color:rgba(122,162,255,.65);background:rgba(70,94,150,.22)} #${instanceId} button.primary{background:rgba(55,97,181,.72);border-color:rgba(122,162,255,.75)} #${instanceId} button.danger{color:#ffe4e8;background:rgba(126,34,52,.55);border-color:rgba(251,113,133,.55)} #${instanceId} button:disabled{opacity:.45;cursor:not-allowed}
+          #${instanceId} .mscx-info{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px} #${instanceId} .mscx-info div{padding:9px 10px;border:1px solid var(--mscx-line);border-radius:10px;background:var(--mscx-soft);min-width:0} #${instanceId} .mscx-info span{display:block;color:var(--mscx-muted);font-size:9px;font-weight:800} #${instanceId} .mscx-info strong{display:block;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--mscx-text)}
+          #${instanceId} .mscx-job{display:grid;gap:10px;border-color:rgba(122,162,255,.34);background:linear-gradient(180deg,rgba(35,55,97,.45),rgba(15,23,42,.58))} #${instanceId} .mscx-job[hidden]{display:none} #${instanceId} .mscx-job-head{display:flex;justify-content:space-between;gap:10px;align-items:center} #${instanceId} .mscx-job-head strong{font-size:13px} #${instanceId} .mscx-job-badge{font-size:10px;font-weight:850;color:var(--mscx-muted)}
+          #${instanceId} .mscx-progress{height:9px;border-radius:999px;overflow:hidden;background:rgba(2,6,23,.6);border:1px solid rgba(148,163,184,.18)} #${instanceId} .mscx-progress>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--mscx-accent),var(--mscx-good));transition:width .25s ease} #${instanceId} .mscx-progress.indeterminate>i{width:38%;animation:mscx-slide 1.2s ease-in-out infinite}@keyframes mscx-slide{0%{transform:translateX(-110%)}100%{transform:translateX(290%)}}
+          #${instanceId} .mscx-job-phase{font-size:12px;font-weight:800;color:var(--mscx-text)} #${instanceId} .mscx-job-message{font-size:10px;color:var(--mscx-muted)} #${instanceId} .mscx-job-stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px} #${instanceId} .mscx-job-stat{padding:8px;border-radius:9px;background:rgba(2,6,23,.38);border:1px solid rgba(148,163,184,.16);min-width:0} #${instanceId} .mscx-job-stat span{display:block;font-size:8px;color:var(--mscx-muted);font-weight:800} #${instanceId} .mscx-job-stat b{display:block;margin-top:2px;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} #${instanceId} .mscx-job-current{padding:8px 9px;border-radius:9px;background:rgba(2,6,23,.35);font:500 9px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--mscx-muted);overflow-wrap:anywhere}
+          #${instanceId} .mscx-message{min-height:56px;padding:11px 12px;border:1px solid var(--mscx-line);border-radius:11px;background:var(--mscx-soft);color:var(--mscx-muted);white-space:pre-wrap;font-size:11px} #${instanceId} .mscx-message.good{border-color:rgba(86,212,155,.35);color:#c9f8e4} #${instanceId} .mscx-message.error{border-color:rgba(251,113,133,.38);color:#ffd0d8} #${instanceId} .mscx-note{color:var(--mscx-muted);font-size:10px;line-height:1.5}
+          @media(max-width:760px){#${instanceId} .mscx-modes{grid-template-columns:1fr}#${instanceId} .mscx-info{grid-template-columns:repeat(2,minmax(0,1fr))}#${instanceId} .mscx-job-stats{grid-template-columns:repeat(2,minmax(0,1fr))}#${instanceId} .mscx-url-row{grid-template-columns:1fr}#${instanceId} .mscx-head{display:grid}#${instanceId} .mscx-state{justify-self:start}}
+        </style>
+        <div id="${instanceId}">
+          <div class="mscx-head"><div><h2>${htmlEscape(title)}</h2><p>${htmlEscape(description)}</p></div><div class="mscx-state" data-mscx-state><span class="mscx-dot"></span><span data-mscx-state-text>상태 확인 중</span></div></div>
+          <div class="mscx-card"><span class="mscx-card-title">저장 방식</span><div class="mscx-modes">
+            <label class="mscx-mode"><input type="radio" name="${instanceId}-mode" value="plugin_only"><strong>플러그인 단독 · 기본</strong><small>RisuAI pluginStorage만 사용합니다. 서버가 없어도 정상 작동합니다.</small></label>
+            <label class="mscx-mode"><input type="radio" name="${instanceId}-mode" value="mirror"><strong>플러그인 + 서버 병존</strong><small>pluginStorage와 DATA 서버를 계속 동기화합니다.</small></label>
+            <label class="mscx-mode"><input type="radio" name="${instanceId}-mode" value="server_only"><strong>서버 단독</strong><small>Memory Suite DATA를 영구 정본으로 사용합니다.</small></label>
+          </div></div>
+          <div class="mscx-card"><span class="mscx-card-title">서버 주소</span><div class="mscx-url-row"><input data-mscx-url type="url" spellcheck="false" value="${htmlEscape(config.url || defaultUrl)}"><button data-mscx-test type="button">연결 테스트</button></div><div class="mscx-note" style="margin-top:8px">보안을 위해 localhost·127.0.0.1·::1의 HTTP 주소만 허용합니다. 기본 주소는 http://127.0.0.1:47630 입니다.</div></div>
+          <div class="mscx-info"><div><span>현재 모드</span><strong data-mscx-mode-label>${htmlEscape(modeLabel(config.mode || MODE_PLUGIN_ONLY))}</strong></div><div><span>서버 버전</span><strong data-mscx-version>-</strong></div><div><span>프로토콜</span><strong data-mscx-protocol>-</strong></div><div><span>서버 데이터</span><strong data-mscx-records>-</strong></div><div><span>namespace</span><strong>${htmlEscape(namespace)}</strong></div></div>
+          <div class="mscx-actions"><button data-mscx-apply class="primary" type="button">설정 적용</button><button data-mscx-sync type="button">지금 동기화</button><button data-mscx-restore type="button">서버 → pluginStorage 복구</button><button data-mscx-delete class="danger" type="button">플러그인 스토리지 삭제</button></div>
+          <div class="mscx-card mscx-job" data-mscx-job hidden><div class="mscx-job-head"><strong data-mscx-job-title>초기 서버 동기화</strong><span class="mscx-job-badge" data-mscx-job-badge>작업 중</span></div><div class="mscx-progress" data-mscx-progress><i></i></div><div><div class="mscx-job-phase" data-mscx-job-phase>작업 준비</div><div class="mscx-job-message" data-mscx-job-message></div></div><div class="mscx-job-stats"><div class="mscx-job-stat"><span>진행</span><b data-mscx-job-items>-</b></div><div class="mscx-job-stat"><span>처리 용량</span><b data-mscx-job-bytes>-</b></div><div class="mscx-job-stat"><span>전송·복구</span><b data-mscx-job-transfer>-</b></div><div class="mscx-job-stat"><span>경과 시간</span><b data-mscx-job-elapsed>-</b></div><div class="mscx-job-stat"><span>마지막 활동</span><b data-mscx-job-activity>-</b></div><div class="mscx-job-stat"><span>재시도 / 실패</span><b data-mscx-job-retry>-</b></div></div><div class="mscx-job-current" data-mscx-job-current>현재 작업을 준비하고 있습니다.</div><div class="mscx-note">이 화면을 닫아도 작업은 계속됩니다. 새로고침 후에는 저장된 작업 영수증을 읽고 이미 서버에 일치하는 항목을 다시 전송하지 않고 이어서 확인합니다.</div></div>
+          <div class="mscx-message" data-mscx-message>${htmlEscape(config.error ? `설정 읽기 실패: ${config.error}` : `현재 모드: ${modeLabel(config.mode || MODE_PLUGIN_ONLY)}`)}</div>
+        </div>
+      </section>`;
+
+    const root = container.querySelector(`#${instanceId}`);
+    if (!root) return false;
+    let currentConfig = { ...config };
+    let lastTerminalHandled = '';
+    const q = selector => root.querySelector(selector);
+    const modeInputs = () => Array.from(root.querySelectorAll(`input[name="${instanceId}-mode"]`));
+    const selectedMode = () => modeInputs().find(input => input.checked)?.value || MODE_PLUGIN_ONLY;
+    const updateModeSelectionStyles = () => modeInputs().forEach(input => input.closest?.('.mscx-mode')?.classList?.toggle('selected', input.checked === true));
+    modeInputs().forEach(input => { input.checked = input.value === (currentConfig.mode || MODE_PLUGIN_ONLY); input.addEventListener?.('change', updateModeSelectionStyles); });
+    updateModeSelectionStyles();
+    const messageNode = q('[data-mscx-message]');
+    const stateNode = q('[data-mscx-state]');
+    const setMessage = (value, tone = '') => { if (messageNode) { messageNode.textContent = String(value || ''); messageNode.className = `mscx-message${tone ? ` ${tone}` : ''}`; } };
+    const setConnectionUi = result => {
+      const ok = result?.ok === true;
+      if (stateNode) stateNode.className = `mscx-state ${ok ? 'good' : 'error'}`;
+      const stateText = q('[data-mscx-state-text]'); if (stateText) stateText.textContent = ok ? '서버 연결됨' : ((currentConfig.mode || MODE_PLUGIN_ONLY) === MODE_PLUGIN_ONLY ? '플러그인 단독' : '서버 연결 안 됨');
+      const version = q('[data-mscx-version]'); if (version) version.textContent = ok ? (result.serverVersion || '-') : '-';
+      const protocol = q('[data-mscx-protocol]'); if (protocol) protocol.textContent = ok ? `${Number(result.protocol?.major || 0)}.${Number(result.protocol?.minor || 0)}` : '-';
+      const records = q('[data-mscx-records]'); if (records) records.textContent = ok ? `${Number(result.liveRecords || 0).toLocaleString()}건` : '-';
+    };
+    const setPluginOnlyUi = () => {
+      if (stateNode) stateNode.className = 'mscx-state warn';
+      const stateText = q('[data-mscx-state-text]'); if (stateText) stateText.textContent = '플러그인 단독';
+      const version = q('[data-mscx-version]'); if (version) version.textContent = '-';
+      const protocol = q('[data-mscx-protocol]'); if (protocol) protocol.textContent = '-';
+      const records = q('[data-mscx-records]'); if (records) records.textContent = '-';
+    };
+    const renderJob = job => {
+      const node = q('[data-mscx-job]');
+      if (!node) return;
+      if (!job) { node.hidden = true; return; }
+      node.hidden = false;
+      const terminal = syncJobTerminal(job.status);
+      const total = Math.max(0, Number(job.totalItems || 0) || 0);
+      const processed = Math.max(0, Number(job.processedItems || 0) || 0);
+      const percent = total > 0 ? Math.max(0, Math.min(100, processed / total * 100)) : 0;
+      const progressNode = q('[data-mscx-progress]');
+      if (progressNode) {
+        progressNode.classList.toggle('indeterminate', !terminal && total <= 0);
+        const bar = progressNode.querySelector('i'); if (bar && total > 0) bar.style.width = `${percent.toFixed(2)}%`; else if (bar && terminal) bar.style.width = job.status === 'completed' ? '100%' : '0%';
+      }
+      q('[data-mscx-job-title]').textContent = jobTitle(job);
+      q('[data-mscx-job-badge]').textContent = job.status === 'completed' ? '완료' : (job.status === 'failed' ? '실패' : (job.status === 'paused' ? '일시 중지 · 자동 재시도' : (total > 0 ? `${percent.toFixed(1)}%` : '작업 중')));
+      q('[data-mscx-job-phase]').textContent = phaseLabel(job.phase);
+      q('[data-mscx-job-message]').textContent = job.message || (job.error ? job.error : '');
+      q('[data-mscx-job-items]').textContent = total > 0 ? `${processed.toLocaleString()} / ${total.toLocaleString()}건` : `${processed.toLocaleString()}건 확인`;
+      q('[data-mscx-job-bytes]').textContent = fmtBytes(job.processedBytes || 0);
+      q('[data-mscx-job-transfer]').textContent = fmtBytes(job.transferredBytes || 0);
+      const endAt = job.finishedAt || Date.now(); q('[data-mscx-job-elapsed]').textContent = fmtDuration(endAt - Number(job.startedAt || endAt));
+      const activityAge = Math.max(0, Date.now() - Number(job.lastActivityAt || job.updatedAt || Date.now())); q('[data-mscx-job-activity]').textContent = activityAge < 1500 ? '방금 전' : `${fmtDuration(activityAge)} 전`;
+      q('[data-mscx-job-retry]').textContent = `${Number(job.retryCount || 0)} / ${Number(job.failures || 0)}`;
+      const currentBits = [job.currentAction, job.currentSpace ? `[${job.currentSpace}]` : '', job.currentKey].filter(Boolean); q('[data-mscx-job-current]').textContent = currentBits.join(' · ') || (terminal ? (job.status === 'completed' ? '모든 검증이 완료되었습니다.' : (job.error || '작업이 중단되었습니다.')) : '현재 작업을 준비하고 있습니다.');
+      const active = !terminal;
+      if (active && stateNode) {
+        stateNode.className = job.status === 'paused' ? 'mscx-state warn' : 'mscx-state warn';
+        const stateText = q('[data-mscx-state-text]'); if (stateText) stateText.textContent = job.status === 'paused' ? '동기화 일시 중지' : `${jobTitle(job)} 중`;
+      }
+      if (terminal && job.jobId && lastTerminalHandled !== job.jobId) {
+        lastTerminalHandled = job.jobId;
+        setMessage(job.status === 'completed'
+          ? `${jobTitle(job)} 완료\n업로드 ${Number(job.uploaded || 0).toLocaleString()} · 복구 ${Number(job.restored || 0).toLocaleString()} · 일치 ${Number(job.matched || 0).toLocaleString()}`
+          : `${jobTitle(job)} 실패\n${job.error || '상세 오류를 확인하세요.'}`, job.status === 'completed' ? 'good' : 'error');
+        setTimeout(() => { void refreshActionState().then(async latest => { if (latest.mode === MODE_PLUGIN_ONLY) setPluginOnlyUi(); else setConnectionUi(await testConnection(latest.url)); }); }, 0);
+      }
+    };
+    const refreshActionState = async () => {
+      const current = await readConfig(true).catch(() => currentConfig); currentConfig = { ...current };
+      const job = getSyncJob(); const activeJob = !!job && !syncJobTerminal(job.status);
+      const modeLabelNode = q('[data-mscx-mode-label]'); if (modeLabelNode) modeLabelNode.textContent = modeLabel(current.mode);
+      q('[data-mscx-apply]').disabled = activeJob;
+      q('[data-mscx-sync]').disabled = activeJob || current.mode !== MODE_MIRROR;
+      q('[data-mscx-restore]').disabled = activeJob || current.mode !== MODE_SERVER_ONLY;
+      q('[data-mscx-delete]').disabled = activeJob || current.mode === MODE_PLUGIN_ONLY;
+      modeInputs().forEach(input => { input.disabled = activeJob; input.checked = input.value === (activeJob ? (job.targetMode || current.mode) : current.mode); }); updateModeSelectionStyles();
+      const url = q('[data-mscx-url]'); if (url) { url.disabled = activeJob; if (typeof document === 'undefined' || document.activeElement !== url) url.value = activeJob ? (job.targetUrl || current.url) : current.url; }
+      renderJob(job);
+      return current;
+    };
+
+    q('[data-mscx-test]').onclick = async () => {
+      setMessage('서버 연결을 확인하고 있습니다…'); q('[data-mscx-test]').disabled = true;
+      const result = await testConnection(q('[data-mscx-url]').value); setConnectionUi(result); renderJob(getSyncJob());
+      setMessage(result.ok ? `연결 성공\nMemory Suite ${result.serverVersion || '-'} · Protocol ${Number(result.protocol?.major || 0)}.${Number(result.protocol?.minor || 0)} · DB ${result.integrity?.result || 'ok'} · 데이터 ${Number(result.liveRecords || 0).toLocaleString()}건 · ${result.durationMs}ms` : `연결 실패\n${result.error || '서버에 연결할 수 없습니다.'}`, result.ok ? 'good' : 'error');
+      q('[data-mscx-test]').disabled = false;
+    };
+
+    q('[data-mscx-apply]').onclick = async () => {
+      const targetMode = selectedMode(); const targetUrl = q('[data-mscx-url]').value;
+      try {
+        const current = await readConfig(true);
+        if (targetMode === current.mode && normalizeServerUrl(targetUrl) === current.url) { setMessage('변경할 설정이 없습니다.', 'good'); return; }
+        if (targetMode === MODE_PLUGIN_ONLY && current.mode === MODE_PLUGIN_ONLY) {
+          q('[data-mscx-apply]').disabled = true; setMessage('서버 주소 설정을 적용하고 있습니다…');
+          const result = await configureConnection({ mode: targetMode, url: targetUrl });
+          setMessage(`설정 적용 완료\n${modeLabel(result.to.mode)} · ${result.to.url}`, 'good'); setPluginOnlyUi();
+          await refreshActionState(); return;
+        }
+        const job = await startConnectionConfigurationJob({ mode: targetMode, url: targetUrl });
+        setMessage(`설정 변경을 접수했습니다.\n현재 저장 모드는 데이터 안전을 위해 그대로 유지하며, ${jobTitle(job)}가 끝나면 ${modeLabel(job.targetMode)}로 자동 확정됩니다.`, 'good');
+        renderJob(job); await refreshActionState();
+      } catch (error) { setMessage(`설정 적용 시작 실패\n${error?.message || error}`, 'error'); await refreshActionState(); }
+    };
+
+    q('[data-mscx-sync]').onclick = async () => {
+      try { const job = await startSynchronizationJob(); setMessage('수동 동기화를 백그라운드에서 시작했습니다. 이 화면을 닫아도 계속됩니다.', 'good'); renderJob(job); await refreshActionState(); }
+      catch (error) { setMessage(`동기화 시작 실패\n${error?.message || error}`, 'error'); }
+    };
+    q('[data-mscx-restore]').onclick = async () => {
+      try { const job = await startRestoreJob(); setMessage('서버 DATA 복구를 백그라운드에서 시작했습니다. 진행 상황은 아래에 계속 표시됩니다.', 'good'); renderJob(job); await refreshActionState(); }
+      catch (error) { setMessage(`복구 시작 실패\n${error?.message || error}`, 'error'); }
+    };
+
+    let deleteArmedUntil = 0;
+    q('[data-mscx-delete]').onclick = async () => {
+      const button = q('[data-mscx-delete]'); if (getSyncJob() && !syncJobTerminal(getSyncJob().status)) { setMessage('진행 중인 동기화가 끝난 뒤 삭제할 수 있습니다.', 'error'); return; }
+      if (Date.now() > deleteArmedUntil) {
+        button.disabled = true; setMessage('삭제 전에 서버 DATA의 무결성과 보존 범위를 확인하고 있습니다…');
+        try { const checked = await verifyServerPreservation(state.legacy.plugin); deleteArmedUntil = Date.now() + 30000; button.textContent = '검증 완료 · 다시 눌러 삭제'; setMessage(`서버 보존 검증 완료\nDB 무결성: ${checked.integrity?.result || 'ok'} · 항목 ${checked.checked}\n30초 안에 다시 누르면 pluginStorage를 삭제하고 서버 단독으로 전환합니다.`, 'good'); }
+        catch (error) { deleteArmedUntil = 0; button.textContent = '플러그인 스토리지 삭제'; setMessage(`삭제 차단\n서버에 안전하게 보존됐다고 확인할 수 없습니다.\n${error?.message || error}`, 'error'); }
+        finally { await refreshActionState(); if (deleteArmedUntil > Date.now()) button.disabled = false; }
+        return;
+      }
+      deleteArmedUntil = 0; button.disabled = true; setMessage('서버 보존 상태를 다시 확인한 뒤 pluginStorage를 삭제합니다…');
+      try { const result = await deletePluginStorageAfterServerVerification(); button.textContent = '플러그인 스토리지 삭제'; await clearPersistedSyncJob(); setMessage(`삭제 완료\n삭제 항목 ${result.deleted} · 저장 방식 서버 단독\n필요하면 복구 버튼으로 pluginStorage를 다시 만들 수 있습니다.`, 'good'); }
+      catch (error) { button.textContent = '플러그인 스토리지 삭제'; setMessage(`삭제 실패 또는 중단\n${error?.message || error}\n검증되지 않은 데이터는 삭제하지 않았습니다.`, 'error'); }
+      finally { await refreshActionState(); }
+    };
+
+    const unsubscribe = subscribeSyncJob(renderJob);
+    const tick = setInterval(() => {
+      if (!root.isConnected) { clearInterval(tick); unsubscribe(); return; }
+      renderJob(getSyncJob());
+    }, 1000);
+    try { tick?.unref?.(); } catch (_) {}
+    await resumePendingSyncJob().catch(() => null);
+    await refreshActionState();
+    if ((currentConfig.mode || MODE_PLUGIN_ONLY) !== MODE_PLUGIN_ONLY) void testConnection(currentConfig.url).then(result => { setConnectionUi(result); renderJob(getSyncJob()); }).catch(() => {}); else setPluginOnlyUi();
+    renderJob(getSyncJob());
+    return true;
+  };
+
+  const managementRootId = `memory-suite-management-${namespace}`.replace(/[^A-Za-z0-9_-]/g, '_');
+  const managementButtonId = `memory-suite-management-button-${namespace}`.replace(/[^A-Za-z0-9_-]/g, '_');
+
+  const closeManagementDialog = async () => {
+    try { state.management.root?.remove?.(); } catch (_) {}
+    state.management.root = null;
+    for (const api of apiCandidates()) {
+      try { if (typeof api?.hideContainer === 'function') { await api.hideContainer(); break; } } catch (_) {}
+    }
+  };
+
+  const openManagementDialog = async () => {
+    for (const api of apiCandidates()) {
+      try { if (typeof api?.showContainer === 'function') { await api.showContainer('fullscreen'); break; } } catch (_) {}
+    }
+    if (typeof document === 'undefined' || !document.body) throw new Error('memory_suite_management_dom_unavailable');
+    try { document.getElementById(managementRootId)?.remove?.(); } catch (_) {}
+    const root = document.createElement('div');
+    root.id = managementRootId;
+    root.innerHTML = `<style>
+      #${managementRootId}{position:fixed;inset:0;z-index:2147483000;background:rgba(4,8,15,.72);display:flex;align-items:center;justify-content:center;padding:18px}
+      #${managementRootId} .ms-dialog-card{width:min(820px,100%);max-height:94vh;overflow:auto;background:#101827;border:1px solid #334155;border-radius:17px;padding:18px;box-shadow:0 24px 80px rgba(0,0,0,.48)}
+      #${managementRootId} .ms-dialog-close{display:flex;justify-content:flex-end;margin-top:12px} #${managementRootId} .ms-dialog-close button{padding:9px 14px;border:1px solid #475569;border-radius:9px;background:#1e293b;color:#eef3ff;cursor:pointer;font-weight:700}
+    </style><div class="ms-dialog-card"><div data-ms-dialog-panel></div><div class="ms-dialog-close"><button data-ms-dialog-close type="button">닫기</button></div></div>`;
+    document.body.appendChild(root);
+    state.management.root = root;
+    const host = root.querySelector('[data-ms-dialog-panel]');
+    await mountConnectionPanel(host, { title: `${displayName} · 서버 연결`, description: '저장 방식, 서버 주소, 연결 상태와 복구·삭제 작업을 관리합니다.' });
+    root.querySelector('[data-ms-dialog-close]').onclick = () => { void closeManagementDialog(); };
+    return true;
+  };
+
+  const registerManagementButton = async () => {
+    if (!managementButtonEnabled || state.management.registered || state.management.registering) return state.management.handle;
+    state.management.registering = true;
+    try {
+      const api = apiCandidates().find(candidate => typeof candidate?.registerButton === 'function');
+      if (!api) return null;
+      const handle = await api.registerButton({
+        name: `${displayName} 데이터 저장`, icon: '💾', iconType: 'html', location: 'hamburger', id: managementButtonId
+      }, openManagementDialog);
+      state.management.handle = handle || { id: managementButtonId };
+      state.management.registered = true;
+      return state.management.handle;
+    } catch (error) {
+      const message = String(error?.message || error || '');
+      if (/duplicate|already|exists/i.test(message)) {
+        state.management.registered = true;
+        state.management.handle = { id: managementButtonId, duplicate: true };
+        return state.management.handle;
+      }
+      warnOnce('management_button_registration_failed', error);
+      return null;
+    } finally { state.management.registering = false; }
+  };
+
+  const scheduleManagementRegistration = () => {
+    if (!managementButtonEnabled || state.management.registered || state.management.timer) return;
+    let attempts = 0;
+    const tryRegister = async () => {
+      state.management.timer = null; attempts += 1;
+      const result = await registerManagementButton();
+      if (!result && attempts < 8) {
+        state.management.timer = setTimeout(tryRegister, Math.min(5000, 500 + attempts * 650));
+        try { state.management.timer?.unref?.(); } catch (_) {}
+      }
+    };
+    state.management.timer = setTimeout(tryRegister, 300);
+    try { state.management.timer?.unref?.(); } catch (_) {}
+  };
+
+
+  // ---------------------------------------------------------------------------
+  // Scope-routed storage layer v1.7
+  // ---------------------------------------------------------------------------
+  const normalizeScopeDescriptor = (value, fallbackId = '') => {
+    const source = value && typeof value === 'object' ? value : (value ? { scopeId: value } : {});
+    const scopeId = String(source.scopeId || source.scopeKey || source.key || fallbackId || '').trim().slice(0, 700);
+    const canonicalCharacterIdRaw = String(source.canonicalCharacterId || source.canonical_character_id || '').trim().slice(0, 240);
+    const canonicalChatIdRaw = String(source.canonicalChatId || source.canonical_chat_id || '').trim().slice(0, 240);
+    const canonicalScopeIdRaw = String(source.canonicalScopeId || source.canonical_scope_id || '').trim().slice(0, 700);
+    const aliases = [...new Set((Array.isArray(source.aliases) ? source.aliases : [])
+      .concat([source.scopeKey, source.key, source.storageHash, source.chatId, source.chat_id, canonicalChatIdRaw, canonicalScopeIdRaw])
+      .map(item => String(item || '').trim()).filter(Boolean))].slice(0, 24);
+    if (!scopeId) return { scopeId: '', scopeKey: '', label: '현재 스코프 확인 불가', aliases, available: false };
+    const characterId = String(source.characterId || source.character_id || '').trim().slice(0, 240);
+    const chatId = String(source.chatId || source.chat_id || '').trim().slice(0, 240);
+    const canonicalCharacterId = canonicalCharacterIdRaw || characterId;
+    const canonicalChatId = canonicalChatIdRaw || chatId;
+    const canonicalScopeId = canonicalScopeIdRaw || (canonicalCharacterId && canonicalChatId ? `canonical:char:${canonicalCharacterId}|chat:${canonicalChatId}` : '');
+    const personaId = String(source.personaId || source.persona_id || '').trim().slice(0, 240);
+    const characterName = String(source.characterName || source.character_name || '').trim().slice(0, 160);
+    const chatTitle = String(source.chatTitle || source.chat_title || source.title || '').trim().slice(0, 200);
+    const personaName = String(source.personaName || source.persona_name || '').trim().slice(0, 160);
+    const label = String(source.label || source.displayName || [characterName, chatTitle].filter(Boolean).join(' / ') || chatTitle || chatId || scopeId).trim().slice(0, 260);
+    return { ...source, scopeId, scopeKey: String(source.scopeKey || source.key || scopeId).trim().slice(0, 700), aliases, characterId, chatId, canonicalCharacterId, canonicalChatId, canonicalScopeId, personaId, characterName, chatTitle, personaName, label, available: source.available !== false };
+  };
+
+  const defaultCurrentScope = async () => {
+    const apis = apiCandidates();
+    let charIndex = -1, chatIndex = -1, character = null, chat = null, db = null;
+    for (const api of apis) {
+      try {
+        if (charIndex < 0 && typeof api?.getCurrentCharacterIndex === 'function') charIndex = Number(await api.getCurrentCharacterIndex());
+        if (chatIndex < 0 && typeof api?.getCurrentChatIndex === 'function') chatIndex = Number(await api.getCurrentChatIndex());
+        if (!character && Number.isInteger(charIndex) && charIndex >= 0 && typeof api?.getCharacterFromIndex === 'function') character = await api.getCharacterFromIndex(charIndex);
+        if (!chat && Number.isInteger(charIndex) && charIndex >= 0 && Number.isInteger(chatIndex) && chatIndex >= 0 && typeof api?.getChatFromIndex === 'function') chat = await api.getChatFromIndex(charIndex, chatIndex);
+        if (!db && typeof api?.getDatabase === 'function') db = await api.getDatabase(['selectedPersona', 'personas']);
+      } catch (_) {}
+    }
+    character = character && typeof character === 'object' ? character : {};
+    chat = chat && typeof chat === 'object' ? chat : {};
+    db = db && typeof db === 'object' ? db : {};
+    const first = (...values) => values.map(item => String(item == null ? '' : item).trim()).find(Boolean) || '';
+    // Keep the legacy physical routing IDs unchanged, but carry a canonical
+    // RisuAI identity beside them. This prevents an update from orphaning existing
+    // server/pluginStorage routes while allowing owner plugins to converge on chaId/chat.id.
+    const characterId = first(character.id, character._id, character.uid, character.uuid, character.key, Number.isInteger(charIndex) && charIndex >= 0 ? `charIndex:${charIndex}` : '');
+    const chatId = first(chat.id, chat._id, chat.uid, chat.uuid, chat.key, chat.chatId, Number.isInteger(chatIndex) && chatIndex >= 0 ? `chatIndex:${chatIndex}` : '');
+    const canonicalCharacterId = first(character.chaId, character.characterId, character.charId, character.id, character._id, character.uid, character.uuid, character.key, characterId);
+    const canonicalChatId = first(chat.id, chat.chatId, chat._id, chat.uid, chat.uuid, chat.key, chatId);
+    const canonicalScopeId = canonicalCharacterId && canonicalChatId ? `canonical:char:${canonicalCharacterId}|chat:${canonicalChatId}` : '';
+    let personaId = first(chat.bindedPersona, chat.boundPersonaId, chat.personaId);
+    const selectedPersona = Number(db.selectedPersona);
+    if (!personaId && Number.isInteger(selectedPersona) && Array.isArray(db.personas)) personaId = first(db.personas[selectedPersona]?.id, db.personas[selectedPersona]?._id, `personaIndex:${selectedPersona}`);
+    if (!characterId || !chatId) return normalizeScopeDescriptor(null);
+    const scopeId = `memory-suite:${namespace}:char:${characterId}|chat:${chatId}|persona:${personaId || 'default'}`;
+    return normalizeScopeDescriptor({
+      scopeId, scopeKey: scopeId, characterId, chatId, canonicalCharacterId, canonicalChatId, canonicalScopeId, personaId,
+      characterName: first(character.nickname, character.name, character.charName),
+      chatTitle: first(chat.name, chat.title, chat.chatName, chat.filename, chatId),
+      aliases: [chatId, canonicalChatId, canonicalScopeId].filter(Boolean)
+    });
+  };
+
+  const rawPluginStorage = () => {
+    if (state.legacy.plugin?.getItem && state.legacy.plugin?.setItem) return state.legacy.plugin;
+    for (const api of apiCandidates()) {
+      try { if (api?.pluginStorage?.getItem && api?.pluginStorage?.setItem) return api.pluginStorage; } catch (_) {}
+    }
+    return null;
+  };
+
+  const rawDeviceStorage = async () => {
+    if (state.legacy.local?.getItem && state.legacy.local?.setItem) return state.legacy.local;
+    for (const api of apiCandidates()) {
+      try {
+        if (typeof api?.getLocalPluginStorage === 'function') {
+          const store = await api.getLocalPluginStorage();
+          if (store?.getItem && store?.setItem) return store;
+        }
+        if (api?.safeLocalStorage?.getItem && api?.safeLocalStorage?.setItem) return api.safeLocalStorage;
+      } catch (_) {}
+    }
+    return null;
+  };
+
+  const parseScopeRegistry = raw => {
+    let source = raw;
+    if (typeof source === 'string') { try { source = JSON.parse(source); } catch (_) { source = null; } }
+    source = source && typeof source === 'object' && !Array.isArray(source) ? source : {};
+    const entries = {};
+    const incoming = source.entries && typeof source.entries === 'object' && !Array.isArray(source.entries) ? source.entries : {};
+    for (const [scopeIdRaw, rowRaw] of Object.entries(incoming)) {
+      const row = rowRaw && typeof rowRaw === 'object' ? rowRaw : {};
+      const scope = normalizeScopeDescriptor(row, scopeIdRaw);
+      if (!scope.scopeId) continue;
+      entries[scope.scopeId] = { ...scope, mode: normalizeMode(row.mode), updatedAt: Math.max(0, Number(row.updatedAt || 0) || 0), source: String(row.source || 'registry').slice(0, 100) };
+    }
+    return {
+      schema: SCOPE_ROUTING_SCHEMA,
+      version: 1,
+      namespace,
+      pluginId,
+      defaultMode: MODE_PLUGIN_ONLY,
+      updatedAt: Math.max(0, Number(source.updatedAt || 0) || 0),
+      legacyGlobalModeImported: source.legacyGlobalModeImported === true,
+      entries
+    };
+  };
+
+  const mergeScopeRegistries = (...values) => {
+    const result = parseScopeRegistry(null);
+    for (const value of values) {
+      const registry = parseScopeRegistry(value);
+      result.legacyGlobalModeImported = result.legacyGlobalModeImported || registry.legacyGlobalModeImported;
+      result.updatedAt = Math.max(result.updatedAt, registry.updatedAt);
+      for (const [scopeId, row] of Object.entries(registry.entries)) {
+        const previous = result.entries[scopeId];
+        if (!previous || Number(row.updatedAt || 0) >= Number(previous.updatedAt || 0)) result.entries[scopeId] = row;
+      }
+    }
+    return result;
+  };
+
+  const writeScopeRegistryLocal = async registryValue => {
+    const registry = parseScopeRegistry(registryValue);
+    registry.updatedAt = Date.now();
+    const payload = JSON.stringify(registry);
+    let success = false;
+    const pluginStore = rawPluginStorage();
+    if (pluginStore?.setItem) {
+      try {
+        const result = await pluginStore.setItem(SCOPE_ROUTING_LOCAL_KEY, payload);
+        if (result !== false) {
+          const readback = await pluginStore.getItem?.(SCOPE_ROUTING_LOCAL_KEY);
+          success = String(readback || '') === payload;
+        }
+      } catch (_) {}
+    }
+    const deviceStore = await rawDeviceStorage().catch(() => null);
+    if (deviceStore?.setItem) {
+      try { await deviceStore.setItem(SCOPE_ROUTING_LOCAL_KEY, payload); success = true; } catch (_) {}
+    }
+    if (!success) {
+      const error = new Error('memory_suite_scope_routing_storage_unavailable');
+      error.code = 'MEMORY_SUITE_SCOPE_ROUTING_STORAGE_UNAVAILABLE';
+      throw error;
+    }
+    state.scopeRouting.registry = registry;
+    state.scopeRouting.registryLoaded = true;
+    return registry;
+  };
+
+  const loadScopeRegistry = async (force = false, tryServer = false) => {
+    if (!force && state.scopeRouting.registryLoaded && state.scopeRouting.registry) return state.scopeRouting.registry;
+    if (!force && state.scopeRouting.registryLoading) return await state.scopeRouting.registryLoading;
+    const task = (async () => {
+      let pluginRaw = null, deviceRaw = null, serverRaw = null;
+      const pluginStore = rawPluginStorage();
+      try { pluginRaw = await pluginStore?.getItem?.(SCOPE_ROUTING_LOCAL_KEY); } catch (_) {}
+      const deviceStore = await rawDeviceStorage().catch(() => null);
+      try { deviceRaw = await deviceStore?.getItem?.(SCOPE_ROUTING_LOCAL_KEY); } catch (_) {}
+      if (tryServer && !pluginRaw && !deviceRaw) {
+        try {
+          const remote = await remoteGet('plugin', SCOPE_ROUTING_SERVER_KEY, { allowPluginOnly: true });
+          if (remote.exists === true) serverRaw = remote.value;
+        } catch (_) {}
+      }
+      const registry = mergeScopeRegistries(serverRaw, pluginRaw, deviceRaw);
+      state.scopeRouting.registry = registry;
+      state.scopeRouting.registryLoaded = true;
+      return registry;
+    })();
+    state.scopeRouting.registryLoading = task;
+    try { return await task; } finally { state.scopeRouting.registryLoading = null; }
+  };
+
+  const synchronizeScopeRegistryToServer = async registryValue => {
+    const registry = parseScopeRegistry(registryValue || await loadScopeRegistry());
+    try {
+      await remoteMutate('set', 'plugin', SCOPE_ROUTING_SERVER_KEY, registry, { allowPluginOnly: true });
+      return true;
+    } catch (error) {
+      setStatus('scope_route_server_pending', error?.message || error);
+      return false;
+    }
+  };
+
+  const hydrateScopeRegistryFromServer = async () => {
+    if (!scopeRoutingEnabled) return null;
+    try {
+      const remote = await remoteGet('plugin', SCOPE_ROUTING_SERVER_KEY, { allowPluginOnly:true });
+      if (remote.exists !== true || !remote.value) return null;
+      const local = await loadScopeRegistry(false, false);
+      const merged = mergeScopeRegistries(remote.value, local);
+      const saved = await writeScopeRegistryLocal(merged);
+      state.scopeRouting.routeCache.clear();
+      setStatus('scope_routes_hydrated', '', { routeCount:Object.keys(saved.entries || {}).length });
+      return saved;
+    } catch (error) {
+      // Scope metadata hydration is best-effort. It must never prevent plugin UI,
+      // request hooks, or plugin-only scopes from starting while the server is down.
+      setStatus('scope_routes_server_unavailable', error?.message || error);
+      return null;
+    }
+  };
+
+  const resolveCurrentScope = async (force = false) => {
+    if (!scopeRoutingEnabled) return normalizeScopeDescriptor({ scopeId: '__plugin_global__', scopeKey: '__plugin_global__', label: `${displayName} 전역`, global: true });
+    if (!force && scopeCacheMs > 0 && state.scopeRouting.current?.scopeId && Date.now() - Number(state.scopeRouting.currentAt || 0) < scopeCacheMs) return state.scopeRouting.current;
+    let value = null;
+    try { value = currentScopeProvider ? await currentScopeProvider({ namespace, pluginId, pluginVersion, force }) : await defaultCurrentScope(); }
+    catch (error) { setStatus('scope_unavailable', error?.message || error); }
+    const scope = normalizeScopeDescriptor(value);
+    state.scopeRouting.current = scope;
+    state.scopeRouting.currentAt = Date.now();
+    state.scopeRouting.routeCache.clear();
+    return scope;
+  };
+
+  const registryEntryByAlias = (registry, aliasValue) => {
+    const alias = String(aliasValue || '').trim();
+    if (!alias) return null;
+    for (const row of Object.values(registry?.entries || {})) {
+      if (row.scopeId === alias || row.scopeKey === alias || (Array.isArray(row.aliases) && row.aliases.includes(alias))) return row;
+    }
+    return null;
+  };
+
+  const maybeImportLegacyGlobalMode = async (scope, registry) => {
+    if (!scope?.scopeId || registry.entries[scope.scopeId] || registry.legacyGlobalModeImported) return registry;
+    const legacyMode = normalizeMode(await getArgumentValue(modeArguments, MODE_PLUGIN_ONLY));
+    registry.legacyGlobalModeImported = true;
+    if (legacyMode !== MODE_PLUGIN_ONLY) {
+      registry.entries[scope.scopeId] = { ...scope, mode: legacyMode, updatedAt: Date.now(), source: 'legacy_global_mode_current_scope' };
+      state.scopeRouting.lastLegacyImport = { scopeId: scope.scopeId, mode: legacyMode, at: Date.now() };
+    }
+    const saved = await writeScopeRegistryLocal(registry);
+    try { await setArgumentValue(modeArguments[0] || 'memory_suite_server_mode', MODE_PLUGIN_ONLY); } catch (_) {}
+    return saved;
+  };
+
+  const readScopeMode = async (scopeInput = null, force = false) => {
+    const scope = normalizeScopeDescriptor(scopeInput || await resolveCurrentScope(force));
+    if (!scope.scopeId) return { scope, mode: MODE_PLUGIN_ONLY, modeLabel: modeLabel(MODE_PLUGIN_ONLY), explicit: false };
+    let registry = await loadScopeRegistry(force, false);
+    if (!scopeInput || scope.scopeId === state.scopeRouting.current?.scopeId) registry = await maybeImportLegacyGlobalMode(scope, registry);
+    const stored = registry.entries[scope.scopeId];
+    const transient = state.scopeRouting.transientModes.get(scope.scopeId);
+    const mode = VALID_MODES.has(transient) ? transient : normalizeMode(stored?.mode || MODE_PLUGIN_ONLY);
+    return { scope: stored ? normalizeScopeDescriptor(stored, scope.scopeId) : scope, mode, modeLabel: modeLabel(mode), explicit: !!stored };
+  };
+
+  const persistScopedMode = async (modeValue, scopeInput = null, persistOptions = {}) => {
+    const target = normalizeMode(modeValue);
+    const scope = normalizeScopeDescriptor(scopeInput || await resolveCurrentScope(true));
+    if (!scope.scopeId || scope.available === false) {
+      const error = new Error('memory_suite_current_scope_unavailable');
+      error.code = 'MEMORY_SUITE_SCOPE_UNAVAILABLE';
+      throw error;
+    }
+    const registry = await loadScopeRegistry(true, false);
+    registry.entries[scope.scopeId] = { ...(registry.entries[scope.scopeId] || {}), ...scope, mode: target, updatedAt: Date.now(), source: String(persistOptions.source || 'user_scope_setting') };
+    registry.legacyGlobalModeImported = true;
+    const saved = await writeScopeRegistryLocal(registry);
+    state.scopeRouting.transientModes.delete(scope.scopeId);
+    state.config = { ...state.config, at: Date.now(), mode: target };
+    void synchronizeScopeRegistryToServer(saved);
+    setStatus('scope_mode_changed', '', { scopeId: scope.scopeId, scopeLabel: scope.label, mode: target, modeLabel: modeLabel(target) });
+    return { scope, mode: target, modeLabel: modeLabel(target), registry: saved };
+  };
+
+  const anyServerScopedMode = async () => {
+    const registry = await loadScopeRegistry(false, false);
+    return Object.values(registry.entries || {}).some(row => normalizeMode(row.mode) !== MODE_PLUGIN_ONLY);
+  };
+
+  const normalizeRouteDescriptor = async (rawValue, space, key, currentScope) => {
+    let raw = rawValue;
+    if (typeof raw === 'string') raw = { scopeId: raw };
+    raw = raw && typeof raw === 'object' ? raw : {};
+    let kind = String(raw.kind || raw.type || '').trim().toLowerCase();
+    if (!['scope', 'shared', 'global'].includes(kind)) kind = raw.global === true ? 'global' : (raw.shared === true ? 'shared' : 'scope');
+    // Resolve an explicit scope or alias before falling back to the current scope.
+    // Falling back first would silently assign an unknown historical key to the
+    // currently open chat, which is unsafe for per-scope routing.
+    let scope = normalizeScopeDescriptor(raw.scope || raw, '');
+    if (kind === 'scope' && !scope.scopeId && raw.scopeAlias) {
+      const registry = await loadScopeRegistry(false, false);
+      scope = normalizeScopeDescriptor(registryEntryByAlias(registry, raw.scopeAlias));
+    }
+    if (kind === 'scope' && !scope.scopeId) scope = normalizeScopeDescriptor(currentScope);
+    let mode = MODE_PLUGIN_ONLY;
+    if (kind === 'scope') mode = (await readScopeMode(scope, false)).mode;
+    else if (kind === 'shared') mode = (await anyServerScopedMode()) ? normalizeMode(sharedRouteModeRaw) : MODE_PLUGIN_ONLY;
+    const remoteKey = String(raw.remoteKey || (raw.scopedContainer === true && scope.scopeId
+      ? `${key}${SCOPED_REMOTE_KEY_MARKER}${encodeURIComponent(scope.scopeId)}`
+      : key));
+    return {
+      routed: true, kind, space, key: String(key), logicalKey: String(key), remoteKey,
+      scope, scopeId: scope.scopeId || '', scopeLabel: scope.label || '', mode,
+      projectValue: typeof raw.projectValue === 'function' ? raw.projectValue : null,
+      mergeValue: typeof raw.mergeValue === 'function' ? raw.mergeValue : null,
+      removeValue: typeof raw.removeValue === 'function' ? raw.removeValue : null,
+      scopedContainer: raw.scopedContainer === true,
+      // Shared/global infrastructure is never swept or deleted as part of one chat scope.
+      // A plugin may opt a truly scope-owned shared record in explicitly.
+      includeInScopeSync: raw.includeInScopeSync === true || (raw.includeInScopeSync !== false && kind === 'scope'),
+      metadata: raw.metadata && typeof raw.metadata === 'object' ? raw.metadata : {}
+    };
+  };
+
+  const resolveScopedRoute = async (space, key, routeOptions = {}) => {
+    const normalizedKey = String(key || '');
+    if (!matchesRoute(space, normalizedKey)) return { routed: false, kind: 'global', space, key: normalizedKey, logicalKey: normalizedKey, remoteKey: normalizedKey, scopeId: '', mode: MODE_PLUGIN_ONLY };
+    if (!scopeRoutingEnabled) return { routed: true, kind: 'global', space, key: normalizedKey, logicalKey: normalizedKey, remoteKey: normalizedKey, scopeId: '', mode: MODE_PLUGIN_ONLY };
+    const currentScope = normalizeScopeDescriptor(routeOptions.scope || await resolveCurrentScope(routeOptions.forceScope === true));
+    const cacheKey = `${space}\n${normalizedKey}\n${currentScope.scopeId}`;
+    if (!routeOptions.noCache && state.scopeRouting.routeCache.has(cacheKey)) return state.scopeRouting.routeCache.get(cacheKey);
+    let raw = null;
+    try {
+      raw = resolveKeyScopeProvider
+        ? await resolveKeyScopeProvider({ namespace, pluginId, pluginVersion, space, key: normalizedKey, currentScope, registry: await loadScopeRegistry(false, false) })
+        : { kind: 'scope', ...currentScope };
+    } catch (error) {
+      setStatus('scope_route_failed', error?.message || error, { key: compact(normalizedKey, 180), space });
+      raw = { kind: 'scope', ...currentScope };
+    }
+    const route = await normalizeRouteDescriptor(raw, space, normalizedKey, currentScope);
+    state.scopeRouting.routeCache.set(cacheKey, route);
+    return route;
+  };
+
+  const scopedRemoteKeyInfo = remoteKeyValue => {
+    const remoteKey = String(remoteKeyValue || '');
+    const index = remoteKey.lastIndexOf(SCOPED_REMOTE_KEY_MARKER);
+    if (index < 0) return { logicalKey: remoteKey, scopeId: '' };
+    let scopeId = '';
+    try { scopeId = decodeURIComponent(remoteKey.slice(index + SCOPED_REMOTE_KEY_MARKER.length)); } catch (_) {}
+    return { logicalKey: remoteKey.slice(0, index), scopeId };
+  };
+
+  const routeProjectValue = async (route, value) => {
+    if (typeof route?.projectValue === 'function') return await route.projectValue(value, { route, scope: route.scope, namespace, pluginId });
+    return value;
+  };
+
+  const routeMergeValue = async (route, remoteValue, localValue) => {
+    if (typeof route?.mergeValue === 'function') return await route.mergeValue(remoteValue, localValue, { route, scope: route.scope, namespace, pluginId });
+    return remoteValue;
+  };
+
+  const routeRemoveLocal = async (route, legacyGet, legacySet, legacyRemove) => {
+    if (typeof route?.removeValue === 'function') {
+      const local = typeof legacyGet === 'function' ? await legacyGet() : null;
+      const next = await route.removeValue(local, { route, scope: route.scope, namespace, pluginId });
+      if (next === undefined || next === null || next === '') return typeof legacyRemove === 'function' ? await legacyRemove() : false;
+      return typeof legacySet === 'function' ? await legacySet(next) : false;
+    }
+    return typeof legacyRemove === 'function' ? await legacyRemove() : false;
+  };
+
+  const scopedBootstrap = async (force = false) => await bootstrap(force, true);
+  const scopedServerGet = async (space, key) => await remoteGet(String(space || 'plugin'), String(key || ''), { allowPluginOnly: true });
+  const scopedServerGetMany = async (space = 'plugin', keys = []) => await remoteGetMany(String(space || 'plugin'), keys, { allowPluginOnly: true });
+  const scopedServerKeys = async (space = 'plugin', prefix = '') => await remoteKeys(String(space || 'plugin'), String(prefix || ''), { allowPluginOnly: true });
+  const scopedServerIntegrity = async () => await remoteIntegrity({ allowPluginOnly: true });
+
+  const scopedGet = async (space, key, legacyGet = null, legacySet = null, legacyRemove = null) => {
+    const route = await resolveScopedRoute(space, key);
+    if (!route.routed || route.mode === MODE_PLUGIN_ONLY) return typeof legacyGet === 'function' ? await legacyGet() : null;
+    if (route.mode === MODE_MIRROR) {
+      const localValue = typeof legacyGet === 'function' ? await legacyGet() : null;
+      const projected = isNullishStorageValue(localValue) ? null : await routeProjectValue(route, localValue);
+      if (!isNullishStorageValue(projected)) {
+        try {
+          const remote = await remoteGet(space, route.remoteKey, { allowPluginOnly: true });
+          if (remote.tombstone === true) {
+            await routeRemoveLocal(route, legacyGet, legacySet, legacyRemove);
+            setStatus('server_tombstone_applied', '', { scopeId: route.scopeId, mode: route.mode, key: compact(key, 160), space });
+            return typeof legacyGet === 'function' ? await legacyGet() : null;
+          }
+          void serializeMutation(space, route.remoteKey, async () => {
+            try {
+              if (remote.exists !== true || jsonComparable(remote.value) !== jsonComparable(projected)) {
+                await remoteMutate('set', space, route.remoteKey, projected, { allowPluginOnly: true });
+              }
+              setStatus('synced', '', { scopeId: route.scopeId, mode: route.mode, key: compact(key, 160), space });
+            } catch (error) {
+              setStatus('local_ahead', error?.message || error, { scopeId: route.scopeId, mode: route.mode, key: compact(key, 160), space });
+            }
+          });
+          return localValue;
+        } catch (error) {
+          setStatus('server_unavailable_local_only', error?.message || error, { scopeId: route.scopeId, mode: route.mode, key: compact(key, 160), space });
+          return localValue;
+        }
+      }
+      try {
+        const remote = await remoteGet(space, route.remoteKey, { allowPluginOnly: true });
+        if (remote.exists === true) {
+          const merged = await routeMergeValue(route, remote.value, localValue);
+          if (typeof legacySet === 'function') await legacySet(merged);
+          return merged;
+        }
+        if (remote.tombstone === true) await routeRemoveLocal(route, legacyGet, legacySet, legacyRemove);
+        return typeof legacyGet === 'function' ? await legacyGet() : null;
+      } catch (error) {
+        setStatus('server_unavailable_local_only', error?.message || error, { scopeId: route.scopeId, mode: route.mode, key: compact(key, 160), space });
+        return localValue;
+      }
+    }
+    // server_only: never fall back silently when the server is unavailable.
+    const remote = await remoteGet(space, route.remoteKey, { allowPluginOnly: true });
+    if (remote.exists === true) return await routeMergeValue(route, remote.value, null);
+    if (remote.tombstone === true) return null;
+    const localValue = typeof legacyGet === 'function' ? await legacyGet() : null;
+    const projected = isNullishStorageValue(localValue) ? null : await routeProjectValue(route, localValue);
+    if (!isNullishStorageValue(projected)) {
+      try { await remoteMutate('set', space, route.remoteKey, projected, { expectedRevision: 0, allowPluginOnly: true }); }
+      catch (error) {
+        if (error?.status !== 409) throw error;
+      }
+      const migrated = await remoteGet(space, route.remoteKey, { allowPluginOnly: true });
+      if (migrated.exists === true) return await routeMergeValue(route, migrated.value, null);
+    }
+    return null;
+  };
+
+  const scopedSet = async (space, key, value, legacySet = null) => {
+    const route = await resolveScopedRoute(space, key);
+    if (!route.routed || route.mode === MODE_PLUGIN_ONLY) return typeof legacySet === 'function' ? await legacySet(value) : false;
+    const projected = await routeProjectValue(route, value);
+    if (route.mode === MODE_MIRROR) {
+      const localOk = typeof legacySet === 'function' ? await legacySet(value) : false;
+      if (!localOk) return false;
+      try {
+        await serializeMutation(space, route.remoteKey, () => remoteMutate('set', space, route.remoteKey, projected, { allowPluginOnly: true }));
+        setStatus('synced', '', { scopeId: route.scopeId, mode: route.mode, key: compact(key, 160), space });
+      } catch (error) {
+        setStatus('local_ahead', error?.message || error, { scopeId: route.scopeId, mode: route.mode, key: compact(key, 160), space });
+        warnOnce(`mirror_server_write_${compact(key, 80)}`, error);
+      }
+      return true;
+    }
+    await serializeMutation(space, route.remoteKey, () => remoteMutate('set', space, route.remoteKey, projected, { allowPluginOnly: true }));
+    return true;
+  };
+
+  const scopedRemove = async (space, key, legacyGet = null, legacySet = null, legacyRemove = null) => {
+    const route = await resolveScopedRoute(space, key);
+    if (!route.routed || route.mode === MODE_PLUGIN_ONLY) return typeof legacyRemove === 'function' ? await legacyRemove() : false;
+    if (route.mode === MODE_MIRROR) {
+      try { await serializeMutation(space, route.remoteKey, () => remoteMutate('remove', space, route.remoteKey, null, { allowPluginOnly: true })); }
+      catch (error) { setStatus('mirror_delete_blocked', error?.message || error, { scopeId: route.scopeId, key: compact(key, 160), space }); return false; }
+      const localOk = await routeRemoveLocal(route, legacyGet, legacySet, legacyRemove);
+      if (!localOk) return false;
+      return true;
+    }
+    await serializeMutation(space, route.remoteKey, () => remoteMutate('remove', space, route.remoteKey, null, { allowPluginOnly: true }));
+    return true;
+  };
+
+  const scopedKeys = async (space, prefix = '', legacyKeysFn = null) => {
+    const currentScope = await resolveCurrentScope(false);
+    const legacy = typeof legacyKeysFn === 'function' ? await legacyKeysFn() : [];
+    const legacyList = Array.isArray(legacy) ? legacy.map(String).filter(Boolean) : [];
+    const visible = [];
+    let requiresServer = false;
+    for (const key of legacyList) {
+      if (!matchesRoute(space, key)) { visible.push(key); continue; }
+      const route = await resolveScopedRoute(space, key, { scope: currentScope });
+      if (route.mode !== MODE_SERVER_ONLY) visible.push(key);
+      if (route.mode !== MODE_PLUGIN_ONLY) requiresServer = true;
+    }
+    let remote = { keys: [], tombstones: [] };
+    try { remote = await remoteKeys(space, prefix, { allowPluginOnly: true }); }
+    catch (error) {
+      if (requiresServer && (await readScopeMode(currentScope)).mode === MODE_SERVER_ONLY) throw error;
+      return [...new Set(visible)];
+    }
+    const tombstones = new Set();
+    for (const raw of Array.isArray(remote.tombstones) ? remote.tombstones : []) tombstones.add(scopedRemoteKeyInfo(raw).logicalKey);
+    for (const remoteKey of Array.isArray(remote.keys) ? remote.keys : []) {
+      const decoded = scopedRemoteKeyInfo(remoteKey);
+      if (decoded.scopeId && decoded.scopeId !== currentScope.scopeId) continue;
+      const route = await resolveScopedRoute(space, decoded.logicalKey, { scope: decoded.scopeId ? { ...currentScope, scopeId: decoded.scopeId, scopeKey: decoded.scopeId } : currentScope });
+      if (route.mode !== MODE_PLUGIN_ONLY && !tombstones.has(decoded.logicalKey)) visible.push(decoded.logicalKey);
+    }
+    return [...new Set(visible.filter(key => !tombstones.has(key)))];
+  };
+
+  const scheduleScopedAutomaticMigration = (legacy, space) => {
+    const enabled = space === 'plugin' ? autoMigratePlugin : autoMigrateLocal;
+    if (!enabled || !legacy || typeof legacy.keys !== 'function') return;
+    const migration = state.migration[space];
+    if (!migration || migration.scheduled === true || migration.state === 'running') return;
+    migration.scheduled = true;
+    const run = async () => {
+      migration.scheduled = false;
+      let scope = null;
+      try {
+        scope = await resolveCurrentScope(false);
+        if (!scope?.scopeId) {
+          state.migration[space] = { ...migration, state:'lazy_only', at:Date.now(), reason:'current_scope_unavailable', scheduled:false };
+          return;
+        }
+        const modeState = await readScopeMode(scope, false);
+        if (modeState.mode === MODE_PLUGIN_ONLY) {
+          state.migration[space] = { ...migration, state:'idle', at:Date.now(), reason:'scope_plugin_only', scheduled:false };
+          return;
+        }
+        state.migration[space] = { ...migration, state:'running', at:Date.now(), reason:'scope_automatic_migration', scheduled:false };
+        const result = await scopedSynchronizeSpace(legacy, space, {
+          scope, allowOverwrite:false, restoreMissingLocal:modeState.mode === MODE_MIRROR
+        });
+        state.migration[space] = {
+          state:'complete', scanned:Number(result.totalItems || 0), migrated:Number(result.uploaded || 0),
+          skipped:Number(result.matched || 0), failed:Number(result.failures?.length || 0), at:Date.now(),
+          reason:`scope:${scope.scopeId}`, scheduled:false
+        };
+      } catch (error) {
+        const keyEnumerationMissing = error?.code === 'MEMORY_SUITE_KEYS_UNAVAILABLE' || /key_enumeration/i.test(String(error?.message || ''));
+        state.migration[space] = {
+          ...state.migration[space], state:keyEnumerationMissing?'lazy_only':'partial', at:Date.now(),
+          failed:Math.max(1, Number(error?.result?.failures?.length || 0) || 1), reason:compact(error?.message || error, 300), scheduled:false
+        };
+        if (!keyEnumerationMissing && retryableSyncError(error)) {
+          setTimeout(() => scheduleScopedAutomaticMigration(legacy, space), migrationRetryMs);
+        }
+      }
+    };
+    const timer = setTimeout(() => { void run(); }, migrationDelayMs);
+    try { timer?.unref?.(); } catch (_) {}
+  };
+
+  const createScopedProxy = (legacy, space, cache) => {
+    if (!legacy || (typeof legacy !== 'object' && typeof legacy !== 'function')) return legacy;
+    state.legacy[space] = legacy;
+    if (cache.has(legacy)) return cache.get(legacy);
+    const proxy = Object.freeze({
+      getItem: async key => await scopedGet(
+        space, String(key),
+        async () => typeof legacy.getItem === 'function' ? await legacy.getItem(key) : null,
+        async next => typeof legacy.setItem === 'function' ? (await legacy.setItem(key, next)) !== false : false,
+        async () => {
+          if (typeof legacy.removeItem === 'function') return (await legacy.removeItem(key)) !== false;
+          if (typeof legacy.setItem === 'function') return (await legacy.setItem(key, null)) !== false;
+          return false;
+        }
+      ),
+      setItem: async (key, value) => await scopedSet(space, String(key), value, async next => typeof legacy.setItem === 'function' ? (await legacy.setItem(key, next)) !== false : false),
+      removeItem: async key => await scopedRemove(
+        space, String(key),
+        async () => typeof legacy.getItem === 'function' ? await legacy.getItem(key) : null,
+        async next => typeof legacy.setItem === 'function' ? (await legacy.setItem(key, next)) !== false : false,
+        async () => {
+          if (typeof legacy.removeItem === 'function') return (await legacy.removeItem(key)) !== false;
+          if (typeof legacy.setItem === 'function') return (await legacy.setItem(key, null)) !== false;
+          return false;
+        }
+      ),
+      keys: async prefix => await scopedKeys(space, String(prefix || ''), async () => typeof legacy.keys === 'function' ? await legacy.keys() : [])
+    });
+    cache.set(legacy, proxy);
+    scheduleScopedAutomaticMigration(legacy, space);
+    if (space === 'plugin') setTimeout(() => {
+      void hydrateScopeRegistryFromServer().then(() => scopedResumePendingSyncJob()).catch(() => {});
+    }, 0);
+    return proxy;
+  };
+
+  const scopeRouteMatches = (route, targetScope) => {
+    if (!route?.routed || route.kind === 'global' || route.includeInScopeSync === false) return false;
+    if (route.kind === 'shared') return route.includeInScopeSync === true;
+    return !!targetScope?.scopeId && route.scopeId === targetScope.scopeId;
+  };
+
+  const collectScopedLegacyRows = async (legacy, space, scope) => {
+    const listed = await legacyKeys(legacy);
+    if (listed == null) {
+      const error = new Error('memory_suite_pluginstorage_key_enumeration_required');
+      error.code = 'MEMORY_SUITE_KEYS_UNAVAILABLE';
+      throw error;
+    }
+    const rows = [];
+    for (const key of listed.map(String).filter(Boolean)) {
+      if (!matchesRoute(space, key)) continue;
+      const route = await resolveScopedRoute(space, key, { scope, noCache: true });
+      if (scopeRouteMatches(route, scope)) rows.push({ key, route });
+    }
+    return rows;
+  };
+
+  const scopedSynchronizeSpace = async (legacy, space = 'plugin', syncOptions = {}) => {
+    if (!legacy) throw new Error('memory_suite_pluginstorage_unavailable');
+    const scope = normalizeScopeDescriptor(syncOptions.scope || await resolveCurrentScope(true));
+    if (!scope.scopeId) throw new Error('memory_suite_current_scope_unavailable');
+    const onProgress = typeof syncOptions.onProgress === 'function' ? syncOptions.onProgress : null;
+    const progress = {
+      schema: 'memory-suite.sync-progress.v2', namespace, space, scopeId: scope.scopeId, scopeLabel: scope.label,
+      phase: 'integrity_before', currentAction: '서버 무결성 확인', currentKey: '', totalItems: 0, processedItems: 0,
+      processedBytes: 0, transferredBytes: 0, uploaded: 0, restored: 0, matched: 0, removedByTombstone: 0,
+      failureCount: 0, conflictCount: 0, startedAt: Date.now(), lastActivityAt: Date.now()
+    };
+    const report = (phase, patch = {}) => {
+      Object.assign(progress, patch || {}, { phase: String(phase || progress.phase), lastActivityAt: Date.now() });
+      try { onProgress?.({ ...progress }); } catch (_) {}
+    };
+    const integrityBefore = await remoteIntegrity({ allowPluginOnly: true });
+    report('inventory', { message: `${scope.label || scope.scopeId} 데이터 목록을 조사하고 있습니다.` });
+    const localRows = await collectScopedLegacyRows(legacy, space, scope);
+    const listing = await remoteKeys(space, '', { allowPluginOnly: true });
+    const remoteRecords = new Map((Array.isArray(listing.records) ? listing.records : []).map(row => [String(row?.key || ''), row]));
+    const remoteKeysForScope = new Set();
+    for (const remoteKey of Array.isArray(listing.keys) ? listing.keys : []) {
+      const decoded = scopedRemoteKeyInfo(remoteKey);
+      if (decoded.scopeId === scope.scopeId) remoteKeysForScope.add(remoteKey);
+      else if (!decoded.scopeId) {
+        const route = await resolveScopedRoute(space, decoded.logicalKey, { scope, noCache: true });
+        if (scopeRouteMatches(route, scope) && route.remoteKey === remoteKey) remoteKeysForScope.add(remoteKey);
+      }
+    }
+    const localRemoteKeys = new Set(localRows.map(row => row.route.remoteKey));
+    const missingRemoteRows = syncOptions.restoreMissingLocal === true
+      ? Array.from(remoteKeysForScope).filter(remoteKey => !localRemoteKeys.has(remoteKey))
+      : [];
+    progress.totalItems = localRows.length + missingRemoteRows.length;
+    report('inventory_complete', { totalItems: progress.totalItems, currentAction: '목록 조사 완료' });
+    const result = {
+      schema: 'memory-suite.scope-sync.v1', namespace, space, scope, startedAt: progress.startedAt,
+      totalItems: progress.totalItems, processedItems: 0, processedBytes: 0, transferredBytes: 0,
+      uploaded: 0, restored: 0, matched: 0, removedByTombstone: 0, conflicts: [], failures: [],
+      integrityBefore, integrityAfter: null
+    };
+    for (const row of localRows) {
+      let bytes = 0, action = '비교';
+      try {
+        report('sync_local', { currentKey: row.key, currentAction: 'pluginStorage → 서버 비교' });
+        const local = await legacyRead(legacy, row.key);
+        const projected = isNullishStorageValue(local) ? null : await routeProjectValue(row.route, local);
+        bytes = isNullishStorageValue(projected) ? 0 : storageValueBytes(projected);
+        if (isNullishStorageValue(projected)) action = '빈 값 건너뜀';
+        else {
+          const remote = await remoteGet(space, row.route.remoteKey, { allowPluginOnly: true });
+          if (remote.exists === true && jsonComparable(remote.value) === jsonComparable(projected)) { result.matched += 1; action = '일치 확인'; }
+          else if (remote.tombstone === true && syncOptions.allowOverwrite === false) {
+            result.conflicts.push({ key: row.key, remoteKey: row.route.remoteKey, reason: 'server_tombstone', localPreserved: true });
+            action = '삭제 충돌 보존';
+          } else {
+            await remoteMutate('set', space, row.route.remoteKey, projected, { allowPluginOnly: true });
+            result.uploaded += 1; result.transferredBytes += bytes; action = '서버 저장·검증 완료';
+          }
+        }
+      } catch (error) { result.failures.push({ key: row.key, error: compact(error?.message || error, 240) }); action = '실패'; }
+      finally {
+        result.processedItems += 1; result.processedBytes += bytes;
+        Object.assign(progress, { processedItems: result.processedItems, processedBytes: result.processedBytes, transferredBytes: result.transferredBytes, uploaded: result.uploaded, restored: result.restored, matched: result.matched, failureCount: result.failures.length, conflictCount: result.conflicts.length });
+        report('sync_local', { currentKey: row.key, currentAction: action });
+      }
+    }
+    for (const remoteKey of missingRemoteRows) {
+      let bytes = Math.max(0, Number(remoteRecords.get(remoteKey)?.valueBytes || 0) || 0), action = '서버 → pluginStorage 복구';
+      try {
+        const decoded = scopedRemoteKeyInfo(remoteKey);
+        const route = await resolveScopedRoute(space, decoded.logicalKey, { scope, noCache: true });
+        const remote = await remoteGet(space, remoteKey, { allowPluginOnly: true });
+        if (remote.exists === true) {
+          const current = await legacyRead(legacy, decoded.logicalKey);
+          const merged = await routeMergeValue(route, remote.value, current);
+          if (!await legacyWriteVerified(legacy, decoded.logicalKey, merged)) throw new Error('pluginstorage_restore_failed');
+          result.restored += 1; result.transferredBytes += bytes; action = '복구·readback 완료';
+        }
+      } catch (error) { result.failures.push({ key: remoteKey, error: compact(error?.message || error, 240) }); action = '복구 실패'; }
+      finally {
+        result.processedItems += 1; result.processedBytes += bytes;
+        Object.assign(progress, { processedItems: result.processedItems, processedBytes: result.processedBytes, transferredBytes: result.transferredBytes, uploaded: result.uploaded, restored: result.restored, matched: result.matched, failureCount: result.failures.length, conflictCount: result.conflicts.length });
+        report('sync_remote', { currentKey: remoteKey, currentAction: action });
+      }
+    }
+    report('integrity_after', { currentKey: '', currentAction: '최종 무결성 확인', message: '현재 스코프 동기화 후 서버 DATA 무결성을 확인하고 있습니다.' });
+    result.integrityAfter = await remoteIntegrity({ allowPluginOnly: true });
+    result.ok = result.failures.length === 0 && result.conflicts.length === 0;
+    report(result.ok ? 'scope_complete' : 'scope_incomplete', { currentKey: '', currentAction: result.ok ? '스코프 동기화 완료' : '확인 필요', message: result.ok ? `${scope.label || scope.scopeId} 동기화를 완료했습니다.` : `실패 ${result.failures.length} · 충돌 ${result.conflicts.length}` });
+    if (!result.ok) {
+      const error = new Error(`memory_suite_scope_sync_incomplete:${scope.scopeId}:failures=${result.failures.length},conflicts=${result.conflicts.length}`);
+      error.code = 'MEMORY_SUITE_SCOPE_SYNC_INCOMPLETE'; error.result = result; throw error;
+    }
+    return result;
+  };
+
+  const scopedSynchronizeAll = async (syncOptions = {}) => {
+    const scope = normalizeScopeDescriptor(syncOptions.scope || await resolveCurrentScope(true));
+    const result = { schema: 'memory-suite.scope-sync-all.v1', namespace, scope, plugin: null, local: null, uploaded: 0, restored: 0, matched: 0, failures: [], totalItems: 0, processedItems: 0, processedBytes: 0, transferredBytes: 0 };
+    const forward = progress => { try { syncOptions.onProgress?.(progress); } catch (_) {} };
+    if (state.legacy.plugin) {
+      result.plugin = await scopedSynchronizeSpace(state.legacy.plugin, 'plugin', { ...syncOptions, scope, onProgress: forward });
+      for (const field of ['uploaded','restored','matched','totalItems','processedItems','processedBytes','transferredBytes']) result[field] += Number(result.plugin?.[field] || 0);
+    }
+    if (state.legacy.local && typeof state.legacy.local?.keys === 'function') {
+      result.local = await scopedSynchronizeSpace(state.legacy.local, 'local', { ...syncOptions, scope, onProgress: forward });
+      for (const field of ['uploaded','restored','matched','totalItems','processedItems','processedBytes','transferredBytes']) result[field] += Number(result.local?.[field] || 0);
+    }
+    result.ok = true;
+    return result;
+  };
+
+  const scopedRestoreSpace = async (legacy, space = 'plugin', restoreOptions = {}) => {
+    if (!legacy) throw new Error('memory_suite_pluginstorage_unavailable');
+    const scope = normalizeScopeDescriptor(restoreOptions.scope || await resolveCurrentScope(true));
+    if (!scope.scopeId) throw new Error('memory_suite_current_scope_unavailable');
+    const onProgress = typeof restoreOptions.onProgress === 'function' ? restoreOptions.onProgress : null;
+    const listing = await remoteKeys(space, '', { allowPluginOnly: true });
+    const candidates = [];
+    for (const remoteKey of Array.isArray(listing.keys) ? listing.keys : []) {
+      const decoded = scopedRemoteKeyInfo(remoteKey);
+      if (decoded.scopeId === scope.scopeId) candidates.push({ remoteKey, logicalKey: decoded.logicalKey });
+      else if (!decoded.scopeId) {
+        const route = await resolveScopedRoute(space, decoded.logicalKey, { scope, noCache: true });
+        if (scopeRouteMatches(route, scope) && route.remoteKey === remoteKey) candidates.push({ remoteKey, logicalKey: decoded.logicalKey });
+      }
+    }
+    const tombstones = [];
+    for (const remoteKey of Array.isArray(listing.tombstones) ? listing.tombstones : []) {
+      const decoded = scopedRemoteKeyInfo(remoteKey);
+      if (decoded.scopeId === scope.scopeId) tombstones.push({ remoteKey, logicalKey: decoded.logicalKey });
+    }
+    const result = { schema: 'memory-suite.scope-restore.v1', namespace, space, scope, totalItems: candidates.length + tombstones.length, processedItems: 0, restored: 0, removed: 0, verified: 0, failures: [] };
+    const report = (phase, patch = {}) => { try { onProgress?.({ schema:'memory-suite.sync-progress.v2', namespace, space, scopeId:scope.scopeId, scopeLabel:scope.label, phase, totalItems:result.totalItems, processedItems:result.processedItems, restored:result.restored, removedByTombstone:result.removed, failureCount:result.failures.length, lastActivityAt:Date.now(), ...patch }); } catch (_) {} };
+    for (const row of candidates) {
+      try {
+        report('restore_values', { currentKey: row.logicalKey, currentAction: '서버 → pluginStorage 복구' });
+        const route = await resolveScopedRoute(space, row.logicalKey, { scope, noCache: true });
+        const remote = await remoteGet(space, row.remoteKey, { allowPluginOnly: true });
+        if (remote.exists !== true) throw new Error('server_record_missing');
+        const current = await legacyRead(legacy, row.logicalKey);
+        const merged = await routeMergeValue(route, remote.value, current);
+        if (!await legacyWriteVerified(legacy, row.logicalKey, merged)) throw new Error('pluginstorage_restore_failed');
+        result.restored += 1; result.verified += 1;
+      } catch (error) { result.failures.push({ key: row.logicalKey, error: compact(error?.message || error, 220) }); }
+      finally { result.processedItems += 1; }
+    }
+    for (const row of tombstones) {
+      try {
+        const route = await resolveScopedRoute(space, row.logicalKey, { scope, noCache: true });
+        await routeRemoveLocal(route, async () => legacyRead(legacy, row.logicalKey), async next => legacyWriteVerified(legacy, row.logicalKey, next), async () => legacyRemoveVerified(legacy, row.logicalKey));
+        result.removed += 1;
+      } catch (error) { result.failures.push({ key: row.logicalKey, error: compact(error?.message || error, 220) }); }
+      finally { result.processedItems += 1; }
+    }
+    result.ok = result.failures.length === 0;
+    if (!result.ok) { const error = new Error(`memory_suite_scope_restore_incomplete:${scope.scopeId}:${result.failures.length}`); error.code='MEMORY_SUITE_SCOPE_RESTORE_INCOMPLETE'; error.result=result; throw error; }
+    state.management.lastResult = result;
+    return result;
+  };
+
+  const scopedRestoreAll = async (restoreOptions = {}) => {
+    const scope = normalizeScopeDescriptor(restoreOptions.scope || await resolveCurrentScope(true));
+    const result = { schema:'memory-suite.scope-restore-all.v1', namespace, scope, plugin:null, local:null, failures:[], restored:0, removed:0, totalItems:0, processedItems:0 };
+    const forward = progress => { try { restoreOptions.onProgress?.(progress); } catch (_) {} };
+    if (state.legacy.plugin) { result.plugin = await scopedRestoreSpace(state.legacy.plugin, 'plugin', { ...restoreOptions, scope, onProgress:forward }); result.restored += result.plugin.restored; result.removed += result.plugin.removed; result.totalItems += result.plugin.totalItems; result.processedItems += result.plugin.processedItems; }
+    if (state.legacy.local && typeof state.legacy.local?.keys === 'function') { result.local = await scopedRestoreSpace(state.legacy.local, 'local', { ...restoreOptions, scope, onProgress:forward }); result.restored += result.local.restored; result.removed += result.local.removed; result.totalItems += result.local.totalItems; result.processedItems += result.local.processedItems; }
+    result.ok = true; return result;
+  };
+
+  const scopedVerifyPreservation = async (_legacy = state.legacy.plugin, verifyOptions = {}) => {
+    const scope = normalizeScopeDescriptor(verifyOptions.scope || await resolveCurrentScope(true));
+    if (!scope.scopeId) throw new Error('memory_suite_current_scope_unavailable');
+    const integrity = await remoteIntegrity({ allowPluginOnly: true });
+    const result = {
+      schema:'memory-suite.scope-preservation.v2', namespace, scope, checked:0,
+      failures:[], integrity, spaces:{ plugin:null, local:null }
+    };
+    const verifySpace = async (legacy, space) => {
+      if (!legacy || typeof legacy.getItem !== 'function' || typeof legacy.keys !== 'function') return null;
+      const rows = await collectScopedLegacyRows(legacy, space, scope);
+      const spaceResult = { space, checked:0, total:rows.length, failures:[] };
+      for (const row of rows) {
+        if (row.route.kind !== 'scope') continue; // Shared/global metadata is not deleted by current-scope cleanup.
+        try {
+          const local = await legacyRead(legacy, row.key);
+          const projected = isNullishStorageValue(local) ? null : await routeProjectValue(row.route, local);
+          if (isNullishStorageValue(projected)) continue;
+          const remote = await remoteGet(space, row.route.remoteKey, { allowPluginOnly:true });
+          if (remote.exists !== true || jsonComparable(remote.value) !== jsonComparable(projected)) {
+            spaceResult.failures.push({ key:row.key, remoteKey:row.route.remoteKey, reason:remote.tombstone?'server_tombstone':'value_mismatch_or_missing' });
+          } else {
+            spaceResult.checked += 1;
+          }
+        } catch (error) {
+          spaceResult.failures.push({ key:row.key, remoteKey:row.route.remoteKey, reason:compact(error?.message || error, 240) });
+        }
+      }
+      result.checked += spaceResult.checked;
+      result.failures.push(...spaceResult.failures.map(row => ({ ...row, space })));
+      return spaceResult;
+    };
+    result.spaces.plugin = await verifySpace(state.legacy.plugin, 'plugin');
+    result.spaces.local = await verifySpace(state.legacy.local, 'local');
+    result.ok = result.failures.length === 0;
+    if (!result.ok) {
+      const error = new Error(`memory_suite_scope_preservation_failed:${scope.scopeId}:${result.failures.length}`);
+      error.code='MEMORY_SUITE_SCOPE_PRESERVATION_FAILED'; error.result=result; throw error;
+    }
+    return result;
+  };
+
+  const scopedSetModeSafely = async (requestedMode, operationOptions = {}) => {
+    const target = normalizeMode(requestedMode);
+    const scope = normalizeScopeDescriptor(operationOptions.scope || await resolveCurrentScope(true));
+    const current = await readScopeMode(scope, true);
+    if (target === current.mode) return { changed:false, from:current.mode, to:target, scope, modeLabel:modeLabel(target) };
+    if (!state.legacy.plugin) throw new Error('memory_suite_pluginstorage_unavailable');
+    const onProgress = typeof operationOptions.onProgress === 'function' ? operationOptions.onProgress : null;
+    try {
+      if (current.mode === MODE_PLUGIN_ONLY && target !== MODE_PLUGIN_ONLY) {
+        const seeded = await scopedSynchronizeAll({ scope, allowOverwrite:false, restoreMissingLocal:target===MODE_MIRROR, onProgress });
+        state.scopeRouting.transientModes.set(scope.scopeId, MODE_MIRROR);
+        const settled = await scopedSynchronizeAll({ scope, allowOverwrite:true, restoreMissingLocal:target===MODE_MIRROR, onProgress });
+        if (!seeded.ok || !settled.ok) throw new Error('memory_suite_scope_mode_seed_failed');
+        await remoteIntegrity({ allowPluginOnly:true });
+      } else if (current.mode === MODE_MIRROR && target === MODE_SERVER_ONLY) {
+        await scopedSynchronizeAll({ scope, allowOverwrite:true, restoreMissingLocal:true, onProgress });
+        await remoteIntegrity({ allowPluginOnly:true });
+      } else if (current.mode === MODE_SERVER_ONLY && target !== MODE_SERVER_ONLY) {
+        await scopedRestoreAll({ scope, onProgress });
+      }
+      const saved = await persistScopedMode(target, scope, { source:'safe_scope_mode_transition' });
+      return { changed:true, from:current.mode, to:target, scope, modeLabel:modeLabel(target), config:saved };
+    } catch (error) {
+      state.scopeRouting.transientModes.delete(scope.scopeId);
+      throw error;
+    }
+  };
+
+  const scopedConfigureConnection = async (settings, operationOptions = {}) => {
+    const source = settings && typeof settings === 'object' ? settings : {};
+    const scope = normalizeScopeDescriptor(operationOptions.scope || await resolveCurrentScope(true));
+    const currentUrl = normalizeServerUrl(await getArgumentValue(urlArguments, defaultUrl));
+    const currentMode = (await readScopeMode(scope, true)).mode;
+    const targetUrl = normalizeServerUrl(source.url || currentUrl);
+    const targetMode = normalizeMode(source.mode || currentMode);
+
+    // The server URL is plugin-global while storage modes are scope-local. Moving the
+    // global URL while even one scope still depends on the old server would silently
+    // split that plugin's scopes between two DATA roots. Refuse the change until every
+    // known scope has been brought back to plugin_only. This is intentionally stricter
+    // than timestamp-based migration and never rewrites another scope behind the user's back.
+    if (targetUrl !== currentUrl) {
+      const registry = await loadScopeRegistry(true, false);
+      const serverBackedScopes = Object.values(registry?.entries || {})
+        .filter(row => normalizeMode(row?.mode) !== MODE_PLUGIN_ONLY)
+        .map(row => ({ scopeId:String(row?.scopeId || ''), scopeLabel:String(row?.label || row?.scopeId || ''), mode:normalizeMode(row?.mode) }));
+      if (serverBackedScopes.length) {
+        const error = new Error(`memory_suite_server_url_in_use:${serverBackedScopes.length}`);
+        error.code = 'MEMORY_SUITE_SERVER_URL_IN_USE';
+        error.details = { currentUrl, targetUrl, serverBackedScopes };
+        error.userMessage = '서버를 사용하는 스코프가 남아 있어 서버 주소를 변경할 수 없습니다. 해당 스코프들을 먼저 플러그인 단독으로 전환해 주세요.';
+        throw error;
+      }
+    }
+
+    let connectionTest = null;
+    if (targetMode !== MODE_PLUGIN_ONLY || targetUrl !== currentUrl) {
+      connectionTest = await testConnection(targetUrl);
+      if (!connectionTest.ok) { const error = new Error(`memory_suite_connection_test_failed:${connectionTest.error || 'unknown'}`); error.code='MEMORY_SUITE_CONNECTION_TEST_FAILED'; error.result=connectionTest; throw error; }
+    }
+    if (targetUrl !== currentUrl) await persistServerUrl(targetUrl);
+    const modeResult = await scopedSetModeSafely(targetMode, { ...operationOptions, scope });
+    const from = { mode:currentMode, modeLabel:modeLabel(currentMode), url:currentUrl, scope };
+    const to = { mode:targetMode, modeLabel:modeLabel(targetMode), url:targetUrl, scope };
+    return { ok:true, scope, url:targetUrl, mode:targetMode, modeLabel:modeLabel(targetMode), from, to, transition:modeResult, modeResult, connectionTest };
+  };
+
+  const scopedGetConnectionSettings = async (settingsOptions = {}) => {
+    const scope = normalizeScopeDescriptor(settingsOptions.scope || await resolveCurrentScope(settingsOptions.force === true));
+    const modeState = await readScopeMode(scope, settingsOptions.force === true);
+    const url = normalizeServerUrl(await getArgumentValue(urlArguments, defaultUrl));
+    state.config = { ...state.config, at: Date.now(), mode: modeState.mode, url };
+    const connection = settingsOptions.test === true ? await testConnection(url) : null;
+    return { namespace, pluginId, pluginVersion, scope, scopeId:scope.scopeId, scopeLabel:scope.label, mode:modeState.mode, modeLabel:modeLabel(modeState.mode), url, defaultMode:MODE_PLUGIN_ONLY, status:{...state.status, mode:modeState.mode, scopeId:scope.scopeId, scopeLabel:scope.label}, connection, syncJob:getSyncJob() };
+  };
+
+  const scopedCreateBackgroundJob = async (kind, target = {}) => {
+    const scope = normalizeScopeDescriptor(target.scope || await resolveCurrentScope(true));
+    if (!scope.scopeId || scope.available === false) {
+      const error = new Error('memory_suite_current_scope_unavailable');
+      error.code = 'MEMORY_SUITE_SCOPE_UNAVAILABLE';
+      throw error;
+    }
+    const existing = state.syncJob.current;
+    if (existing && !syncJobTerminal(existing.status)) {
+      const sameTarget = String(existing.kind || '') === String(kind || '')
+        && String(existing.scopeId || '') === scope.scopeId
+        && String(existing.targetMode || '') === String(target.mode || '')
+        && String(existing.targetUrl || '') === String(target.url || '');
+      if (sameTarget) return cloneSyncJob(existing);
+      const error = new Error(`memory_suite_background_job_busy:${existing.kind}:${existing.status}`);
+      error.code = 'MEMORY_SUITE_SYNC_JOB_BUSY';
+      error.job = cloneSyncJob(existing);
+      throw error;
+    }
+    const now = Date.now();
+    let random = '';
+    try { random = globalThis?.crypto?.randomUUID?.() || ''; } catch (_) {}
+    if (!random) random = `${now.toString(36)}_${Math.random().toString(36).slice(2,10)}`;
+    const jobId = `${namespace}_${kind}_${scope.scopeId}_${random}`.replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 240);
+    const currentMode = (await readScopeMode(scope, true)).mode;
+    const currentUrl = normalizeServerUrl(await getArgumentValue(urlArguments, defaultUrl));
+    state.syncJob.current = {
+      schema: SYNC_JOB_SCHEMA, namespace, pluginId, pluginVersion,
+      jobId, id: jobId, kind: String(kind || 'manual_sync'),
+      scopeId: scope.scopeId, scopeKey: scope.scopeKey, scopeLabel: scope.label,
+      sourceMode: currentMode, sourceUrl: currentUrl,
+      targetMode: target.mode ? normalizeMode(target.mode) : currentMode,
+      targetUrl: target.url ? normalizeServerUrl(target.url) : currentUrl,
+      status: 'queued', phase: 'queued', message: '작업을 준비하고 있습니다.',
+      startedAt: now, updatedAt: now, lastActivityAt: now, finishedAt: 0,
+      totalItems: 0, processedItems: 0, processedBytes: 0, transferredBytes: 0,
+      uploaded: 0, restored: 0, matched: 0, removedByTombstone: 0,
+      failures: 0, conflicts: 0, retryCount: 0, nextRetryAt: 0,
+      currentSpace: '', currentKey: '', currentAction: '', spaces: {}, completedPasses: {},
+      result: null, error: ''
+    };
+    state.syncJob.loaded = true;
+    notifySyncJob();
+    await persistSyncJobNow();
+    return getSyncJob();
+  };
+
+  const scopedExecuteBackgroundJob = async () => {
+    const job = state.syncJob.current;
+    if (!job || syncJobTerminal(job.status)) return getSyncJob();
+    if (state.syncJob.promise) return state.syncJob.promise;
+    if (state.syncJob.retryTimer) { clearTimeout(state.syncJob.retryTimer); state.syncJob.retryTimer = null; }
+    const scope = normalizeScopeDescriptor({
+      scopeId: job.scopeId, scopeKey: job.scopeKey || job.scopeId, label: job.scopeLabel || job.scopeId
+    });
+    updateSyncJob({
+      status: 'running', phase: job.phase === 'resume_pending' ? 'resuming' : (job.phase || 'starting'),
+      nextRetryAt: 0, error: ''
+    });
+    const runner = (async () => {
+      try {
+        let result;
+        if (job.kind === 'connection_config') {
+          result = await scopedConfigureConnection({ mode: job.targetMode, url: job.targetUrl }, { scope, onProgress: applySyncProgressToJob });
+        } else if (job.kind === 'manual_sync') {
+          const mode = (await readScopeMode(scope, true)).mode;
+          if (mode !== MODE_MIRROR) throw new Error('memory_suite_manual_sync_requires_mirror_mode');
+          result = await scopedSynchronizeAll({ scope, allowOverwrite: true, restoreMissingLocal: true, onProgress: applySyncProgressToJob });
+        } else if (job.kind === 'server_restore') {
+          const mode = (await readScopeMode(scope, true)).mode;
+          if (mode !== MODE_SERVER_ONLY) throw new Error('memory_suite_restore_requires_server_only_mode');
+          result = await scopedRestoreAll({ scope, onProgress: applySyncProgressToJob });
+        } else {
+          throw new Error(`memory_suite_unknown_background_job:${job.kind}`);
+        }
+        updateSyncJob({
+          status: 'completed', phase: 'completed', currentAction: '완료', currentKey: '',
+          message: '작업이 안전하게 완료되었습니다.', result: cloneSyncJob(result), error: '',
+          nextRetryAt: 0, finishedAt: Date.now()
+        }, { persist: 'immediate' });
+        return result;
+      } catch (error) {
+        if (retryableSyncError(error) && Number(state.syncJob.current?.retryCount || 0) < 120) {
+          const retryCount = Number(state.syncJob.current?.retryCount || 0) + 1;
+          const delay = SYNC_JOB_RETRY_DELAYS_MS[Math.min(SYNC_JOB_RETRY_DELAYS_MS.length - 1, retryCount - 1)];
+          updateSyncJob({
+            status: 'paused', phase: 'waiting_for_server', currentAction: '서버 재연결 대기',
+            message: `서버 연결이 일시적으로 끊겼습니다. ${Math.ceil(delay / 1000)}초 후 현재 스코프 작업을 이어서 확인합니다.`,
+            error: compact(error?.message || error, 420), retryCount, nextRetryAt: Date.now() + delay
+          }, { persist: 'immediate' });
+          state.syncJob.retryTimer = setTimeout(() => {
+            state.syncJob.retryTimer = null;
+            void scopedExecuteBackgroundJob();
+          }, delay);
+          try { state.syncJob.retryTimer?.unref?.(); } catch (_) {}
+          return null;
+        }
+        updateSyncJob({
+          status: 'failed', phase: 'failed', currentAction: '작업 중단', currentKey: '',
+          message: '작업을 완료하지 못했습니다.', error: compact(error?.message || error, 700),
+          nextRetryAt: 0, finishedAt: Date.now()
+        }, { persist: 'immediate' });
+        throw error;
+      }
+    })();
+    state.syncJob.promise = runner.finally(() => { state.syncJob.promise = null; });
+    return state.syncJob.promise;
+  };
+
+  const scopedStartConnectionConfigurationJob = async settings => {
+    const source = settings && typeof settings === 'object' ? settings : {};
+    const scope = normalizeScopeDescriptor(source.scope || await resolveCurrentScope(true));
+    const modeState = await readScopeMode(scope, true);
+    const currentUrl = normalizeServerUrl(await getArgumentValue(urlArguments, defaultUrl));
+    const job = await scopedCreateBackgroundJob('connection_config', {
+      scope, mode: normalizeMode(source.mode ?? modeState.mode), url: normalizeServerUrl(source.url ?? currentUrl)
+    });
+    void scopedExecuteBackgroundJob().catch(() => {});
+    return job;
+  };
+  const scopedStartSynchronizationJob = async (options = {}) => {
+    const scope = normalizeScopeDescriptor(options.scope || await resolveCurrentScope(true));
+    const modeState = await readScopeMode(scope, true);
+    if (modeState.mode !== MODE_MIRROR) throw new Error('memory_suite_manual_sync_requires_mirror_mode');
+    const url = normalizeServerUrl(await getArgumentValue(urlArguments, defaultUrl));
+    const job = await scopedCreateBackgroundJob('manual_sync', { scope, mode: modeState.mode, url });
+    void scopedExecuteBackgroundJob().catch(() => {});
+    return job;
+  };
+  const scopedStartRestoreJob = async (options = {}) => {
+    const scope = normalizeScopeDescriptor(options.scope || await resolveCurrentScope(true));
+    const modeState = await readScopeMode(scope, true);
+    if (modeState.mode !== MODE_SERVER_ONLY) throw new Error('memory_suite_restore_requires_server_only_mode');
+    const url = normalizeServerUrl(await getArgumentValue(urlArguments, defaultUrl));
+    const job = await scopedCreateBackgroundJob('server_restore', { scope, mode: modeState.mode, url });
+    void scopedExecuteBackgroundJob().catch(() => {});
+    return job;
+  };
+  const scopedResumePendingSyncJob = async () => {
+    await loadPersistedSyncJob();
+    const job = getSyncJob();
+    if (!job || syncJobTerminal(job.status) || state.syncJob.promise) return job;
+    const scope = await resolveCurrentScope(false);
+    if (!scope.scopeId || String(job.scopeId || '') !== scope.scopeId) return job;
+    void scopedExecuteBackgroundJob().catch(() => {});
+    return getSyncJob();
+  };
+  const scopedWaitForSyncJob = async (jobId = '', timeoutMs = 15 * 60 * 1000) => {
+    const wanted = String(jobId || state.syncJob.current?.jobId || state.syncJob.current?.id || '');
+    if (!wanted) return null;
+    const current = state.syncJob.current;
+    if ((current?.jobId === wanted || current?.id === wanted) && syncJobTerminal(current.status)) return cloneSyncJob(current);
+    return await new Promise((resolve, reject) => {
+      let timer = null;
+      const unsubscribe = subscribeSyncJob(job => {
+        if (!job || (job.jobId !== wanted && job.id !== wanted) || !syncJobTerminal(job.status)) return;
+        if (timer) clearTimeout(timer);
+        unsubscribe();
+        resolve(job);
+      });
+      timer = setTimeout(() => {
+        unsubscribe();
+        reject(new Error(`memory_suite_sync_job_wait_timeout:${wanted}`));
+      }, Math.max(1000, Number(timeoutMs || 0) || 15 * 60 * 1000));
+    });
+  };
+
+  const scopedDeletePluginStorageAfterVerification = async () => {
+    const scope = await resolveCurrentScope(true);
+    const checked = await scopedVerifyPreservation(state.legacy.plugin, { scope });
+    await persistScopedMode(MODE_SERVER_ONLY, scope, { source:'scope_pluginstorage_delete' });
+    const result = {
+      ok:true, schema:'memory-suite.scope-pluginstorage-delete.v2', namespace, scope,
+      deleted:0, deletedPlugin:0, deletedLocal:0, checked:checked.checked,
+      mode:MODE_SERVER_ONLY, spaces:{ plugin:null, local:null }
+    };
+    const deleteSpace = async (legacy, space) => {
+      if (!legacy || typeof legacy.keys !== 'function') return null;
+      const rows = await collectScopedLegacyRows(legacy, space, scope);
+      const rowResult = { space, examined:rows.length, deleted:0, retainedShared:0, failures:[] };
+      for (const row of rows) {
+        if (row.route.kind !== 'scope') { rowResult.retainedShared += 1; continue; }
+        try {
+          const ok = await routeRemoveLocal(
+            row.route,
+            async()=>legacyRead(legacy,row.key),
+            async next=>legacyWriteVerified(legacy,row.key,next),
+            async()=>legacyRemoveVerified(legacy,row.key)
+          );
+          if (!ok) throw new Error('scope_local_delete_readback_failed');
+          rowResult.deleted += 1;
+        } catch (error) {
+          rowResult.failures.push({ key:row.key, error:compact(error?.message || error, 240) });
+        }
+      }
+      if (rowResult.failures.length) {
+        const error = new Error(`memory_suite_scope_local_delete_incomplete:${space}:${rowResult.failures.length}`);
+        error.code='MEMORY_SUITE_SCOPE_LOCAL_DELETE_INCOMPLETE'; error.result=rowResult; throw error;
+      }
+      return rowResult;
+    };
+    result.spaces.plugin = await deleteSpace(state.legacy.plugin, 'plugin');
+    result.spaces.local = await deleteSpace(state.legacy.local, 'local');
+    result.deletedPlugin = Number(result.spaces.plugin?.deleted || 0);
+    result.deletedLocal = Number(result.spaces.local?.deleted || 0);
+    result.deleted = result.deletedPlugin + result.deletedLocal;
+    return result;
+  };
+
+  const scopedPrepareServerScopeDeletion = async (deleteOptions = {}) => {
+    const scope = normalizeScopeDescriptor(deleteOptions.scope || { scopeId:deleteOptions.scopeId, scopeKey:deleteOptions.scopeId, label:deleteOptions.scopeLabel || deleteOptions.scopeId });
+    if (!scope.scopeId) throw new Error('memory_suite_scope_delete_owner_scope_missing');
+    // Restore only this scope before allowing RE:TRACE to delete its server copy.
+    await scopedRestoreAll({ scope });
+    const localRows = await collectScopedLegacyRows(state.legacy.plugin, 'plugin', scope).catch(() => []);
+    await persistScopedMode(MODE_PLUGIN_ONLY, scope, { source:'retrace_server_scope_delete_owner_proof' });
+    return {
+      schema:'memory-suite.server-scope-delete-owner-receipt.v1', namespace, pluginId, scopeId:scope.scopeId,
+      verified:true, modeAfter:MODE_PLUGIN_ONLY, restoredKeys:localRows.length, checkedAt:Date.now(),
+      members:Array.isArray(deleteOptions.members)?deleteOptions.members.length:0
+    };
+  };
+
+  const scopedEnsureHandoffReady = async (handoffOptions = {}) => {
+    const phase = String(handoffOptions.phase || 'handoff').trim() || 'handoff';
+    const scope = normalizeScopeDescriptor(handoffOptions.scope || await resolveCurrentScope(true));
+    const modeState = await readScopeMode(scope, true);
+    const base = { schema:'memory-suite.handoff-storage.v2', namespace, pluginId, phase, scope, scopeId:scope.scopeId, mode:modeState.mode, modeLabel:modeLabel(modeState.mode), serverRequired:modeState.mode!==MODE_PLUGIN_ONLY, verified:true, pluginSync:null, localSync:null, integrity:null, checkedAt:Date.now() };
+    if (modeState.mode === MODE_PLUGIN_ONLY) return base;
+    const before = await remoteIntegrity({ allowPluginOnly:true });
+    let sync = null;
+    if (modeState.mode === MODE_MIRROR) sync = await scopedSynchronizeAll({ scope, allowOverwrite:true, restoreMissingLocal:true });
+    const after = await remoteIntegrity({ allowPluginOnly:true });
+    return { ...base, checkedAt:Date.now(), pluginSync:sync?.plugin||null, localSync:sync?.local||null, integrity:after, integrityBefore:before };
+  };
+
+  const scopedMountConnectionPanel = async (container, panelOptions = {}) => {
+    if (!container || typeof container.innerHTML === 'undefined') throw new Error('memory_suite_connection_panel_container_required');
+    const initial = await scopedGetConnectionSettings({ force:true });
+    const rootId = `memory-suite-scope-connection-${namespace}-${Math.random().toString(36).slice(2,8)}`;
+    const esc = value => safeText(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    container.innerHTML = `<div id="${rootId}" class="mscx-scope-root"><style>
+      #${rootId}{font-family:system-ui,-apple-system,sans-serif;color:#e8eefc;display:grid;gap:14px} #${rootId} *{box-sizing:border-box}
+      #${rootId} .mscx-card{border:1px solid #34425b;background:#111a2a;border-radius:14px;padding:15px;display:grid;gap:12px}
+      #${rootId} h3{margin:0;font-size:18px} #${rootId} .muted{color:#9eacc3;font-size:12px;line-height:1.5}
+      #${rootId} .scope{padding:11px 12px;background:#172236;border:1px solid #3b4d6b;border-radius:10px} #${rootId} .scope b{display:block;margin-bottom:4px}
+      #${rootId} .modes{display:grid;gap:8px} #${rootId} label.mode{display:flex;gap:9px;align-items:flex-start;border:1px solid #34425b;border-radius:10px;padding:10px;cursor:pointer}
+      #${rootId} input[type=text]{width:100%;padding:10px 11px;border-radius:9px;border:1px solid #465a79;background:#0b1321;color:#fff}
+      #${rootId} .actions{display:flex;flex-wrap:wrap;gap:8px} #${rootId} button{border:1px solid #50658a;background:#1d2a42;color:#fff;border-radius:9px;padding:9px 12px;font-weight:700;cursor:pointer} #${rootId} button.primary{background:#2d5bd1;border-color:#4c79e4} #${rootId} button.danger{background:#51212a;border-color:#8e4350}
+      #${rootId} button:disabled{opacity:.45;cursor:not-allowed} #${rootId} .status{white-space:pre-wrap;border:1px solid #34425b;background:#0c1422;border-radius:10px;padding:11px;min-height:46px;font-size:12px;line-height:1.55}
+      #${rootId} .job{display:none;border:1px solid #365275;background:#101d31;border-radius:12px;padding:12px;gap:9px} #${rootId} .job.show{display:grid}
+      #${rootId} .bar{height:9px;background:#25344d;border-radius:99px;overflow:hidden} #${rootId} .bar>i{display:block;height:100%;background:#5d88ff;width:0%}
+      #${rootId} .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;font-size:12px} @media(max-width:540px){#${rootId} .grid{grid-template-columns:1fr}}
+    </style>
+      <div class="mscx-card"><div><h3>${esc(panelOptions.title || `${displayName} · 서버 연결`)}</h3><div class="muted">${esc(panelOptions.description || '현재 스코프의 저장 방식만 변경합니다.')}</div></div>
+        <div class="scope"><b>현재 스코프</b><span data-scope-label>${esc(initial.scopeLabel || '확인 불가')}</span><div class="muted" data-scope-id>${esc(initial.scopeId || '')}</div></div>
+        <div class="muted"><b>이 설정은 현재 스코프에만 적용됩니다.</b><br>새 스코프의 기본값은 항상 플러그인 단독입니다. 서버 주소만 플러그인 공통 설정입니다.</div>
+        <div class="modes">
+          <label class="mode"><input type="radio" name="${rootId}-mode" value="plugin_only"><span><b>플러그인 단독 · 기본</b><br><small>현재 스코프를 RisuAI pluginStorage에만 저장합니다.</small></span></label>
+          <label class="mode"><input type="radio" name="${rootId}-mode" value="mirror"><span><b>플러그인 + 서버 병존</b><br><small>현재 스코프만 양쪽에 실시간 동기화합니다.</small></span></label>
+          <label class="mode"><input type="radio" name="${rootId}-mode" value="server_only"><span><b>서버 단독</b><br><small>현재 스코프의 영구 정본을 Memory Suite DATA에 저장합니다.</small></span></label>
+        </div>
+        <label><b>서버 주소</b><input data-url type="text" value="${esc(initial.url)}"></label>
+        <div class="actions"><button data-test>연결 테스트</button><button class="primary" data-apply>설정 적용</button><button data-sync>지금 동기화</button><button data-restore>서버 → pluginStorage 복구</button><button class="danger" data-delete>현재 스코프 pluginStorage 삭제</button></div>
+        <div class="status" data-status>현재 모드: ${esc(initial.modeLabel)}\n서버 상태를 확인할 수 있습니다.</div>
+      </div>
+      <div class="job" data-job><b data-job-title>작업 진행 중</b><div class="bar"><i data-job-bar></i></div><div class="grid"><span data-job-phase></span><span data-job-count></span><span data-job-bytes></span><span data-job-time></span><span data-job-retry></span><span data-job-key></span></div></div>
+    </div>`;
+    const root = container.querySelector(`#${rootId}`);
+    const q = sel => root.querySelector(sel);
+    const setMessage = (message, tone='') => { const box=q('[data-status]'); box.textContent=String(message||''); box.dataset.tone=tone; };
+    const radio = root.querySelector(`input[name="${rootId}-mode"][value="${initial.mode}"]`) || root.querySelector(`input[name="${rootId}-mode"][value="plugin_only"]`); if (radio) radio.checked=true;
+    const formatBytes = bytes => { const n=Math.max(0,Number(bytes||0)); if(n<1024)return `${n} B`; if(n<1048576)return `${(n/1024).toFixed(1)} KB`; if(n<1073741824)return `${(n/1048576).toFixed(1)} MB`; return `${(n/1073741824).toFixed(2)} GB`; };
+    const renderJob = job => {
+      const card=q('[data-job]');
+      if (!job || job.scopeId !== initial.scopeId || syncJobTerminal(job.status)) { card.classList.remove('show'); return; }
+      card.classList.add('show'); const total=Math.max(0,Number(job.totalItems||0)), done=Math.max(0,Number(job.processedItems||0)); const percent=total?Math.min(100,Math.round(done/total*100)):0;
+      q('[data-job-title]').textContent = `${job.message || '작업 진행 중'}${total ? ` · ${percent}%` : ''}`; q('[data-job-bar]').style.width=`${percent}%`;
+      q('[data-job-phase]').textContent=`현재 단계: ${job.phase || '준비'}`; q('[data-job-count]').textContent=`진행: ${done.toLocaleString()} / ${total ? total.toLocaleString() : '조사 중'}`;
+      q('[data-job-bytes]').textContent=`처리: ${formatBytes(job.processedBytes)} · 전송: ${formatBytes(job.transferredBytes)}`; q('[data-job-time]').textContent=`경과: ${Math.max(0,Math.floor((Date.now()-Number(job.startedAt||Date.now()))/1000))}초`;
+      q('[data-job-retry]').textContent=`재시도 ${Number(job.retryCount||0)} · 실패 ${Number(job.failures||0)}`; q('[data-job-key]').textContent=`현재: ${job.currentKey || job.currentAction || '-'}`;
+    };
+    q('[data-test]').onclick = async()=>{ setMessage('서버 연결을 확인하고 있습니다…'); const result=await testConnection(q('[data-url]').value); setMessage(result.ok?`연결됨\nMemory Suite ${result.serverVersion}\nProtocol ${result.protocol?.major}.${result.protocol?.minor}\nnamespace ${namespace} · 항목 ${result.liveRecords}`:`연결 실패\n${result.error}`,result.ok?'good':'error'); };
+    q('[data-apply]').onclick = async()=>{ const mode=root.querySelector(`input[name="${rootId}-mode"]:checked`)?.value||MODE_PLUGIN_ONLY; try{ const job=await scopedStartConnectionConfigurationJob({mode,url:q('[data-url]').value,scope:initial.scope}); setMessage('설정 적용과 현재 스코프 초기 동기화를 시작했습니다.'); renderJob(job);}catch(error){setMessage(`설정 적용 시작 실패\n${error?.message||error}`,'error');} };
+    q('[data-sync]').onclick = async()=>{ try{const job=await scopedStartSynchronizationJob();setMessage('현재 스코프 동기화를 시작했습니다.');renderJob(job);}catch(error){setMessage(`동기화 시작 실패\n${error?.message||error}`,'error');} };
+    q('[data-restore]').onclick = async()=>{ try{const job=await scopedStartRestoreJob();setMessage('현재 스코프 복구를 시작했습니다.');renderJob(job);}catch(error){setMessage(`복구 시작 실패\n${error?.message||error}`,'error');} };
+    let armedUntil=0;
+    q('[data-delete]').onclick = async()=>{ const button=q('[data-delete]'); if(Date.now()>armedUntil){button.disabled=true;setMessage('현재 스코프가 서버에 안전하게 보존됐는지 확인하고 있습니다…');try{const checked=await scopedVerifyPreservation(state.legacy.plugin,{scope:initial.scope});armedUntil=Date.now()+30000;button.textContent='검증 완료 · 다시 눌러 삭제';setMessage(`보존 검증 완료 · ${checked.checked}개\n30초 안에 다시 누르면 현재 스코프의 payload만 삭제합니다.`,'good');}catch(error){armedUntil=0;setMessage(`삭제 차단\n${error?.message||error}`,'error');}finally{button.disabled=false;}return;} armedUntil=0;button.disabled=true;try{const result=await scopedDeletePluginStorageAfterVerification();button.textContent='현재 스코프 pluginStorage 삭제';setMessage(`삭제 완료 · ${result.deleted}개\n현재 스코프는 서버 단독입니다.`,'good');}catch(error){setMessage(`삭제 실패\n${error?.message||error}`,'error');}finally{button.disabled=false;} };
+    const unsubscribe=subscribeSyncJob(renderJob); const tick=setInterval(()=>{if(!root.isConnected){clearInterval(tick);unsubscribe();return;}renderJob(getSyncJob());},1000); try{tick?.unref?.();}catch(_){}
+    await scopedResumePendingSyncJob().catch(()=>null); renderJob(getSyncJob());
+    return true;
+  };
+
+
+  const ensureHandoffReady = async (options = {}) => {
+    const phase = String(options.phase || 'handoff').trim() || 'handoff';
+    const config = await readConfig(true);
+    const base = {
+      schema: 'memory-suite.handoff-storage.v1',
+      namespace,
+      pluginId,
+      phase,
+      mode: config.mode,
+      modeLabel: modeLabel(config.mode),
+      serverRequired: config.mode !== MODE_PLUGIN_ONLY,
+      verified: true,
+      pluginSync: null,
+      localSync: null,
+      integrity: null,
+      checkedAt: Date.now()
+    };
+    if (config.mode === MODE_PLUGIN_ONLY) return base;
+
+    const before = await remoteIntegrity();
+    let pluginSync = null;
+    let localSync = null;
+    if (config.mode === MODE_MIRROR) {
+      if (state.legacy.plugin) {
+        pluginSync = await synchronizeLegacyWithServer(state.legacy.plugin, 'plugin', {
+          allowOverwrite: true,
+          restoreMissingLocal: true
+        });
+        if (Array.isArray(pluginSync?.failures) && pluginSync.failures.length) {
+          const error = new Error(`memory_suite_handoff_plugin_sync_failed:${pluginSync.failures.length}`);
+          error.code = 'MEMORY_SUITE_HANDOFF_SYNC_FAILED';
+          error.sync = pluginSync;
+          throw error;
+        }
+      }
+      if (state.legacy.local && typeof state.legacy.local?.keys === 'function') {
+        localSync = await synchronizeLegacyWithServer(state.legacy.local, 'local', {
+          allowOverwrite: true,
+          restoreMissingLocal: true
+        });
+        if (Array.isArray(localSync?.failures) && localSync.failures.length) {
+          const error = new Error(`memory_suite_handoff_local_sync_failed:${localSync.failures.length}`);
+          error.code = 'MEMORY_SUITE_HANDOFF_SYNC_FAILED';
+          error.sync = localSync;
+          throw error;
+        }
+      }
+    }
+    const after = await remoteIntegrity();
+    const result = {
+      ...base,
+      checkedAt: Date.now(),
+      pluginSync,
+      localSync,
+      integrity: after,
+      integrityBefore: before
+    };
+    setStatus('handoff_storage_ready', '', {
+      mode: config.mode,
+      phase,
+      serverVersion: state.status.serverVersion || '',
+      records: Number(after?.records || 0) || 0
+    });
+    return result;
+  };
+
+  const serverGet = async (space, key) => await remoteGet(String(space || 'plugin'), String(key || ''));
+  const serverGetMany = async (space = 'plugin', keys = []) => await remoteGetMany(String(space || 'plugin'), keys);
+  const serverKeys = async (space = 'plugin', prefix = '') => await remoteKeys(String(space || 'plugin'), String(prefix || ''));
+  const serverIntegrity = async () => await remoteIntegrity();
+
+  const cloneDiagnosticValue = value => {
+    if (!value || typeof value !== 'object') return value || null;
+    try { return JSON.parse(JSON.stringify(value)); } catch (_) { return { ...value }; }
+  };
+  const offlineDiagnostics = async (error = null, manager = false) => {
+    let scope = null;
+    let mode = MODE_PLUGIN_ONLY;
+    try {
+      scope = await resolveCurrentScope(false);
+      mode = (await readScopeMode(scope, false)).mode;
+    } catch (_) {}
+    return {
+      schema: manager ? 'memory-suite.manager-server-diagnostics.v1' : 'memory-suite.plugin-server-diagnostics.v1',
+      generatedAt: Date.now(),
+      reachable: false,
+      namespace: manager ? '' : namespace,
+      pluginId,
+      pluginVersion,
+      scope: scope ? { label: String(scope.label || ''), available: scope.available !== false } : null,
+      storageMode: mode,
+      error: compact(error?.message || error || 'server_unavailable', 900),
+      status: { ...state.status }
+    };
+  };
+  const getCachedDiagnostics = () => cloneDiagnosticValue(state.diagnostics.value) || {
+    schema: 'memory-suite.plugin-server-diagnostics.v1',
+    generatedAt: 0,
+    reachable: null,
+    namespace,
+    pluginId,
+    pluginVersion,
+    status: { ...state.status },
+    reason: 'diagnostics_not_loaded'
+  };
+  const getDiagnostics = async (options = {}) => {
+    const force = options.force === true;
+    const maxAgeMs = Math.max(0, Math.min(10 * 60 * 1000, Number(options.maxAgeMs ?? 30000) || 0));
+    if (!force && state.diagnostics.value && Date.now() - Number(state.diagnostics.at || 0) <= maxAgeMs) return cloneDiagnosticValue(state.diagnostics.value);
+    if (!force && state.diagnostics.pending) return await state.diagnostics.pending;
+    const pending = (async () => {
+      let scope = null;
+      let mode = MODE_PLUGIN_ONLY;
+      try {
+        scope = normalizeScopeDescriptor(options.scope || await resolveCurrentScope(false));
+        mode = (await readScopeMode(scope, false)).mode;
+        const connection = await bootstrap(force, true);
+        if (connection?.capabilities?.['server-diagnostics.v1'] !== true) {
+          const result = {
+            schema: 'memory-suite.plugin-server-diagnostics.v1',
+            generatedAt: Date.now(),
+            reachable: true,
+            supported: false,
+            reason: 'server_diagnostics_unsupported',
+            namespace,
+            pluginId,
+            pluginVersion,
+            storageMode: mode,
+            scope: scope ? { label: String(scope.label || ''), available: scope.available !== false } : null,
+            server: { version: String(connection?.version || ''), protocol: cloneDiagnosticValue(connection?.protocol || {}) },
+            clientStatus: { ...state.status }
+          };
+          state.diagnostics.value = result;
+          state.diagnostics.at = Date.now();
+          return cloneDiagnosticValue(result);
+        }
+        const limit = Math.max(1, Math.min(1000, Number(options.limit || 500) || 500));
+        const since = Math.max(0, Number(options.since || 0) || 0);
+        const query = [
+          `namespace=${encodeURIComponent(namespace)}`,
+          `limit=${limit}`,
+          `since=${since}`,
+          `includeGlobal=${options.includeGlobal === false ? '0' : '1'}`,
+          `includeTextLogs=${options.includeTextLogs === true ? '1' : '0'}`,
+          ...(scope?.scopeId ? [`scopeId=${encodeURIComponent(scope.scopeId)}`] : [])
+        ].join('&');
+        const payload = await request('GET', `/v1/diagnostics?${query}`, null, { allowPluginOnly: true, scope, storageMode: mode, forceBootstrap: force });
+        const result = {
+          ...(payload?.result || {}),
+          schema: 'memory-suite.plugin-server-diagnostics.v1',
+          reachable: true,
+          namespace,
+          pluginId,
+          pluginVersion,
+          storageMode: mode,
+          scope: scope ? { label: String(scope.label || ''), available: scope.available !== false } : null,
+          clientStatus: { ...state.status }
+        };
+        state.diagnostics.value = result;
+        state.diagnostics.at = Date.now();
+        return cloneDiagnosticValue(result);
+      } catch (error) {
+        const result = await offlineDiagnostics(error, false);
+        state.diagnostics.value = result;
+        state.diagnostics.at = Date.now();
+        return cloneDiagnosticValue(result);
+      } finally {
+        state.diagnostics.pending = null;
+      }
+    })();
+    state.diagnostics.pending = pending;
+    return await pending;
+  };
+  const refreshDiagnostics = async (options = {}) => await getDiagnostics({ ...options, force: true });
+  const scheduleDiagnosticsRefresh = (delayMs = 0, options = {}) => {
+    if (state.diagnostics.timer) clearTimeout(state.diagnostics.timer);
+    state.diagnostics.timer = setTimeout(() => {
+      state.diagnostics.timer = null;
+      refreshDiagnostics(options).catch(() => {});
+    }, Math.max(0, Number(delayMs || 0) || 0));
+    return true;
+  };
+
+  const decorateDebugExport = async (payload, options = {}) => {
+    const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : { value: payload };
+    const memorySuite = await getDiagnostics({ force: options.force !== false, limit: options.limit || 500, since: options.since || 0, includeGlobal: options.includeGlobal !== false, includeTextLogs: options.includeTextLogs === true });
+    return { ...source, memorySuite };
+  };
+  const decorateDebugExportSync = payload => {
+    const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : { value: payload };
+    return { ...source, memorySuite: getCachedDiagnostics() };
+  };
+
+  const assertManagerOwner = () => {
+    if (pluginId !== 'flashback_hayaku_bridge') {
+      const error = new Error('memory_suite_manager_is_retrace_only');
+      error.code = 'MEMORY_SUITE_MANAGER_OWNER_REQUIRED';
+      throw error;
+    }
+  };
+  const managerHeaders = Object.freeze({
+    'X-Memory-Suite-Manager': 'retrace',
+    'X-Memory-Suite-Plugin': 'flashback_hayaku_bridge'
+  });
+  const managerRequest = async (method, route, body = null) => {
+    assertManagerOwner();
+    return await request(method, route, body, { extraHeaders: managerHeaders, allowPluginOnly: true });
+  };
+  const managerConnection = async () => {
+    assertManagerOwner();
+    return await bootstrap(false, true);
+  };
+  const managerGetDiagnostics = async (options = {}) => {
+    try {
+      const connection = await managerConnection();
+      if (connection?.capabilities?.['manager-diagnostics.v1'] !== true) {
+        return {
+          schema: 'memory-suite.manager-server-diagnostics.v1',
+          generatedAt: Date.now(),
+          reachable: true,
+          supported: false,
+          reason: 'manager_server_diagnostics_unsupported',
+          pluginId,
+          pluginVersion,
+          server: { version: String(connection?.version || ''), protocol: cloneDiagnosticValue(connection?.protocol || {}) },
+          clientStatus: { ...state.status }
+        };
+      }
+      const limit = Math.max(1, Math.min(1000, Number(options.limit || 1000) || 1000));
+      const since = Math.max(0, Number(options.since || 0) || 0);
+      const namespaceFilter = String(options.namespace || '').trim().toLowerCase();
+      const scope = options.scope || options.currentScope === true
+        ? normalizeScopeDescriptor(options.scope || await resolveCurrentScope(false))
+        : null;
+      const query = [
+        `limit=${limit}`,
+        `since=${since}`,
+        `includeGlobal=${options.includeGlobal === false ? '0' : '1'}`,
+        `includeTextLogs=${options.includeTextLogs === false ? '0' : '1'}`,
+        ...(namespaceFilter ? [`namespace=${encodeURIComponent(namespaceFilter)}`] : []),
+        ...(scope?.scopeId ? [`scopeId=${encodeURIComponent(scope.scopeId)}`] : [])
+      ].join('&');
+      const payload = await managerRequest('GET', `/v1/manager/diagnostics?${query}`);
+      return { ...(payload?.result || {}), reachable: true, pluginId, pluginVersion, clientStatus: { ...state.status } };
+    } catch (error) {
+      return await offlineDiagnostics(error, true);
+    }
+  };
+  const managerServerGet = async (targetNamespace, space, key) => {
+    const ns = String(targetNamespace || '').trim().toLowerCase();
+    const payload = await managerRequest('GET', `/v1/kv/get?namespace=${encodeURIComponent(ns)}&space=${encodeURIComponent(String(space || 'plugin'))}&key=${encodeURIComponent(String(key || ''))}`);
+    return payload?.result || {};
+  };
+  const managerServerGetMany = async (targetNamespace, space = 'plugin', keys = []) => {
+    const ns = String(targetNamespace || '').trim().toLowerCase();
+    const list = Array.isArray(keys) ? keys.map(String).filter(Boolean).slice(0, 512) : [];
+    if (!list.length) return { values: {} };
+    const payload = await managerRequest('POST', '/v1/kv/get-many', { namespace: ns, space: String(space || 'plugin'), keys: list });
+    return payload?.result || { values: {} };
+  };
+  const managerServerKeys = async (targetNamespace, space = 'plugin', prefix = '') => {
+    const ns = String(targetNamespace || '').trim().toLowerCase();
+    const payload = await managerRequest('GET', `/v1/kv/keys?namespace=${encodeURIComponent(ns)}&space=${encodeURIComponent(String(space || 'plugin'))}&prefix=${encodeURIComponent(String(prefix || ''))}`);
+    return payload?.result || { keys: [], tombstones: [], records: [] };
+  };
+  const managerServerIntegrity = async targetNamespace => {
+    const ns = String(targetNamespace || '').trim().toLowerCase();
+    const payload = await managerRequest('GET', `/v1/integrity?namespace=${encodeURIComponent(ns)}`);
+    const result = payload?.result || {};
+    if (result.ok !== true || String(result.result || '') !== 'ok') throw new Error(`memory_suite_manager_integrity_failed:${ns}:${result.result || 'unknown'}`);
+    return result;
+  };
+  const managerReplaceScopeIndex = async (targetNamespace, scopes = []) => {
+    const connection = await managerConnection();
+    if (connection?.capabilities?.['scope-catalog.v1'] !== true) {
+      const error = new Error('memory_suite_scope_catalog_capability_missing');
+      error.code = 'MEMORY_SUITE_MANAGER_CAPABILITY_MISSING';
+      throw error;
+    }
+    const response = await managerRequest('POST', '/v1/manager/scopes/index', {
+      namespace: String(targetNamespace || namespace || ''),
+      scopes: Array.isArray(scopes) ? scopes : []
+    });
+    return response?.result || null;
+  };
+  const managerListScopes = async () => {
+    const response = await managerRequest('GET', '/v1/manager/scopes');
+    return response?.result || { scopes: [] };
+  };
+  const managerPlanScopeDeletion = async payload => {
+    const connection = await managerConnection();
+    if (connection?.capabilities?.['scope-delete-preview.v1'] !== true) {
+      const error = new Error('memory_suite_scope_delete_capability_missing');
+      error.code = 'MEMORY_SUITE_MANAGER_CAPABILITY_MISSING';
+      throw error;
+    }
+    const response = await managerRequest('POST', '/v1/manager/scope-delete/plan', payload || {});
+    return response?.result || null;
+  };
+  const managerExecuteScopeDeletion = async (planId, mutationFingerprint) => {
+    const connection = await managerConnection();
+    if (connection?.capabilities?.['scope-delete-commit.v1'] !== true) throw new Error('memory_suite_scope_delete_commit_capability_missing');
+    const response = await managerRequest('POST', '/v1/manager/scope-delete/execute', {
+      planId: String(planId || ''),
+      mutationFingerprint: String(mutationFingerprint || '')
+    });
+    return response?.result || null;
+  };
+  const managerSetScopePinned = async (targetNamespace, scopeId, pinned) => {
+    const connection = await managerConnection();
+    if (connection?.capabilities?.['scope-pin.v1'] !== true) {
+      const error = new Error('memory_suite_scope_pin_capability_missing');
+      error.code = 'MEMORY_SUITE_MANAGER_CAPABILITY_MISSING';
+      throw error;
+    }
+    const response = await managerRequest('POST', '/v1/manager/scope-pin', {
+      namespace: String(targetNamespace || namespace || ''),
+      scopeId: String(scopeId || ''),
+      pinned: pinned === true
+    });
+    return response?.result || null;
+  };
+
+  const bridge = Object.freeze({
+    namespace,
+    pluginId,
+    get: scopedGet,
+    set: scopedSet,
+    remove: scopedRemove,
+    keys: scopedKeys,
+    bootstrap: scopedBootstrap,
+    shouldRoute: matchesRoute,
+    createPluginStorageProxy: legacy => createScopedProxy(legacy, 'plugin', proxyCache),
+    createLocalStorageProxy: legacy => createScopedProxy(legacy, 'local', localProxyCache),
+    synchronizeNow: async () => await scopedSynchronizeAll({ allowOverwrite: true, restoreMissingLocal: true }),
+    startSynchronizationJob: scopedStartSynchronizationJob,
+    startConnectionConfigurationJob: scopedStartConnectionConfigurationJob,
+    startRestoreJob: scopedStartRestoreJob,
+    resumePendingSyncJob: scopedResumePendingSyncJob,
+    waitForSyncJob: scopedWaitForSyncJob,
+    getSyncJob,
+    subscribeSyncJob,
+    verifyServerPreservation: async () => await scopedVerifyPreservation(state.legacy.plugin),
+    restorePluginStorage: async () => await scopedRestoreAll({}),
+    testConnection,
+    setServerUrl: persistServerUrl,
+    configureConnection: scopedConfigureConnection,
+    getConnectionSettings: scopedGetConnectionSettings,
+    mountConnectionPanel: scopedMountConnectionPanel,
+    restoreServerSpaceToLegacy: scopedRestoreSpace,
+    prepareServerScopeDeletion: scopedPrepareServerScopeDeletion,
+    deletePluginStorageAfterServerVerification: scopedDeletePluginStorageAfterVerification,
+    setMode: scopedSetModeSafely,
+    getMode: async () => (await readScopeMode(null, true)).mode,
+    getCurrentScope: async () => await resolveCurrentScope(true),
+    getScopeMode: async scope => await readScopeMode(scope, true),
+    setScopeMode: async (scope, mode) => await scopedSetModeSafely(mode, { scope }),
+    ensureHandoffReady: scopedEnsureHandoffReady,
+    serverGet: scopedServerGet,
+    serverGetMany: scopedServerGetMany,
+    serverKeys: scopedServerKeys,
+    serverIntegrity: scopedServerIntegrity,
+    getDiagnostics,
+    refreshDiagnostics,
+    scheduleDiagnosticsRefresh,
+    getCachedDiagnostics,
+    decorateDebugExport,
+    decorateDebugExportSync,
+    managerGetDiagnostics,
+    managerConnection,
+    managerServerGet,
+    managerServerGetMany,
+    managerServerKeys,
+    managerServerIntegrity,
+    managerReplaceScopeIndex,
+    managerListScopes,
+    managerPlanScopeDeletion,
+    managerExecuteScopeDeletion,
+    managerSetScopePinned,
+    openManagementDialog,
+    registerManagementButton,
+    status: () => ({
+      ...state.status,
+      scope: state.scopeRouting.current ? { ...state.scopeRouting.current } : null,
+      mode: state.config.mode,
+      modeLabel: modeLabel(state.config.mode),
+      lastLegacyImport: state.scopeRouting.lastLegacyImport,
+      lastManagementResult: state.management.lastResult,
+      migration: { plugin: { ...state.migration.plugin }, local: { ...state.migration.local } },
+      syncJob: getSyncJob()
+    })
+  });
+  scheduleManagementRegistration();
+  scheduleDiagnosticsRefresh(1200, { limit: 250 });
+  return bridge;
+
+};
+
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.35';
+  const PLUGIN_VERSION = '1.9.43';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v2';
   const HANDOFF_ACCEPTED_SCHEMAS = new Set(['memory-session-bridge-v1', HANDOFF_SCHEMA]);
   const HANDOFF_JOURNAL_SCHEMA = 'memory-session-bridge-handoff-journal-v1';
@@ -98,12 +3916,22 @@
   const HAYAKU_IPC_SCHEMA = 'hayaku-memory-bridge-ipc-v1';
   const HAYAKU_IPC_REQUEST_CHANNEL = 'hayaku_memory_bridge_request_v1';
   const HAYAKU_IPC_RESPONSE_CHANNEL = 'hayaku_memory_bridge_response_v1';
+  const HAYAKU_RECOVERY_DEBT_EVENT_SCHEMA = 'hayaku-retrace-event-v1';
+  const HAYAKU_RECOVERY_DEBT_EVENT_CHANNEL = 'hayaku_retrace_event_v1';
+  const HAYAKU_RECOVERY_DEBT_CONTRACT = 'hayaku_recovery_debt_worldline_v1';
+  const HAYAKU_AUTO_REPAIR_RUN_SCHEMA = 'retrace.hayaku_auto_repair_run.v1';
+  const HAYAKU_AUTO_REPAIR_RUN_PREFIX = 'memory_session_bridge:hayaku_auto_repair_run:';
+  const HAYAKU_AUTO_REPAIR_CAPSULE_PREFIX = 'memory_session_bridge:hayaku_auto_repair_capsule:';
+  const HAYAKU_OWNER_GATE_CACHE_MS = 10_000;
+  const HAYAKU_AUTO_REPAIR_RETRY_MS = 15_000;
   const HAYAKU_RETRACE_COMPATIBILITY_BEACON_SCHEMA = 'hayaku.retrace_compatibility_beacon.v1';
   const HAYAKU_RETRACE_COMPATIBILITY_BEACON_KEY = 'hayaku.v2.retrace_compatibility.v1';
   const HAYAKU_IPC_MUTATION_ACTIONS = new Set([
     'adopt_cold_start',
     'adopt_incremental_recovery',
     'sync_analysis_capsules',
+    'acquire_recovery_debt_lease',
+    'release_recovery_debt_lease',
     'adopt_session_handoff',
     'forget'
   ]);
@@ -170,6 +3998,7 @@
     lastColdStart: null,
     lastIncrementalRecovery: null,
     lastHayakuBackup: null,
+    memorySuitePeerServer: null,
     compatibilitySuite: null,
     compatibilityCheckedAt: 0,
     compatibilityAcknowledgedAt: 0,
@@ -195,6 +4024,21 @@
     hayakuIpcRegistered: false,
     hayakuIpcPending: new Map(),
     hayakuIpcUnavailableUntil: 0,
+    hayakuRecoveryEventRegistered: false,
+    hayakuRecoveryEventHandler: null,
+    hayakuOwnerGate: { state: 'unknown', ready: false, reason: '', checkedAt: 0, capabilities: null },
+    hayakuAutoRepair: {
+      timer: null,
+      inFlight: false,
+      queuedReason: '',
+      runId: '',
+      debtId: '',
+      lastResult: null,
+      lastError: '',
+      runs: 0,
+      successes: 0,
+      failures: 0
+    },
     libraIpcRegistered: false,
     libraIpcPending: new Map(),
     libraIpcLastSeenAt: 0,
@@ -384,6 +4228,31 @@
       && text(receipt?.sourceFingerprintBefore || '') === text(receipt?.sourceFingerprintAfter || '')
       && physicalValue === 0;
   };
+  const memorySuiteStorageReceiptMatches = (receipt, namespace = '') => {
+    const storage = receipt?.memorySuiteStorage;
+    if (!storage || typeof storage !== 'object') {
+      const serverRow = Runtime.memorySuitePeerServer?.namespaces?.[text(namespace || '').trim().toLowerCase()];
+      // If RE:TRACE can see durable server data for this owner, a legacy/runtime
+      // receipt without Memory Suite synchronization proof is not enough to claim
+      // that the server-side copy moved with the handoff.
+      return !(serverRow?.available === true && Number(serverRow?.liveRecords || 0) > 0);
+    }
+    const phases = storage.before || storage.after
+      ? [storage.before, storage.after].filter(Boolean)
+      : [storage];
+    if (!phases.length) return false;
+    return phases.every(phase => {
+      if (!phase || typeof phase !== 'object') return false;
+      const mode = text(phase.mode || 'plugin_only').trim().toLowerCase();
+      if (mode === 'plugin_only') return phase.verified !== false;
+      return phase.schema === 'memory-suite.handoff-storage.v1'
+        && phase.serverRequired === true
+        && phase.verified === true
+        && phase.integrity?.ok === true
+        && text(phase.integrity?.result || '') === 'ok';
+    });
+  };
+
   const normalizedHayakuPacketMaxChars = value => {
     const number = Math.floor(Number(value));
     return Number.isFinite(number) && number >= HAYAKU_PACKET_FALLBACK_MAX_CHARS
@@ -619,20 +4488,211 @@
     })[0] || null;
   };
 
-  const storageGet = async key => {
+  const legacyStorageGet = async key => {
     const api = liveApi();
     if (!api?.pluginStorage?.getItem) return null;
-    try { return await api.pluginStorage.getItem(key); } catch (error) { warn(`storage read failed: ${key}`, error); return null; }
+    try { return await api.pluginStorage.getItem(key); }
+    catch (error) { warn(`storage read failed: ${key}`, error); return null; }
   };
 
-  const storageSet = async (key, value) => {
+  const legacyStorageSet = async (key, value) => {
     const api = liveApi();
     if (!api?.pluginStorage?.setItem) return false;
     try {
-      await api.pluginStorage.setItem(key, value);
+      const result = await api.pluginStorage.setItem(key, value);
+      if (result === false) return false;
+      if (typeof api.pluginStorage.getItem === 'function') {
+        const readback = await api.pluginStorage.getItem(key);
+        if (JSON.stringify(readback) !== JSON.stringify(value)) throw new Error('retrace_pluginstorage_readback_mismatch');
+      }
       return true;
     } catch (error) {
       warn(`storage write failed: ${key}`, error);
+      return false;
+    }
+  };
+
+  const legacyStorageRemove = async key => {
+    const api = liveApi();
+    if (!api?.pluginStorage) return false;
+    try {
+      if (typeof api.pluginStorage.removeItem === 'function') return (await api.pluginStorage.removeItem(key)) !== false;
+      if (typeof api.pluginStorage.setItem === 'function') return (await api.pluginStorage.setItem(key, null)) !== false;
+    } catch (error) { warn(`storage remove failed: ${key}`, error); }
+    return false;
+  };
+
+  const legacyStorageKeys = async () => {
+    const api = liveApi();
+    if (typeof api?.pluginStorage?.keys !== 'function') return [];
+    try {
+      const values = await api.pluginStorage.keys();
+      return Array.isArray(values) ? values.map(String).filter(Boolean) : [];
+    } catch (error) {
+      warn('storage key enumeration failed', error);
+      return [];
+    }
+  };
+
+  const RetraceLegacyPluginStorage = Object.freeze({
+    getItem: legacyStorageGet,
+    setItem: legacyStorageSet,
+    removeItem: legacyStorageRemove,
+    keys: legacyStorageKeys
+  });
+
+
+const memorySuiteRetraceCurrentScope = async () => {
+  let context = null;
+  try { context = await getCurrentContext(); } catch (_) {}
+  const scope = context ? hayakuScopeFor(context) : null;
+  if (!scope?.scopeKey) return null;
+  return {
+    scopeId: scope.scopeKey, scopeKey: scope.scopeKey,
+    characterId: String(context?.character?.chaId || context?.character?.id || ''), chatId: String(context?.chat?.id || ''),
+    characterName: String(context?.character?.name || ''), chatTitle: String(context?.chat?.name || context?.chat?.title || ''),
+    label: [context?.character?.name, context?.chat?.name || context?.chat?.title].filter(Boolean).join(' / ') || scope.scopeKey,
+    aliases: [scope.scopeKey, String(context?.chat?.id || '')].filter(Boolean)
+  };
+};
+const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }) => {
+  const prefixes = [COLD_START_PREFIX,COLD_START_RUN_PREFIX,INCREMENTAL_RECOVERY_PREFIX,INCREMENTAL_RECOVERY_RUN_PREFIX,HAYAKU_BACKUP_PREFIX,HAYAKU_BACKUP_CATALOG_PREFIX];
+  const prefix = prefixes.find(item => key.startsWith(item));
+  if (!prefix) return { kind:'global' };
+  const tail = key.slice(prefix.length);
+  const candidates = [currentScope, ...Object.values(registry?.entries || {})]
+    .filter(item => item?.scopeId)
+    .sort((a, b) => String(b.scopeId).length - String(a.scopeId).length);
+  for (const candidate of candidates) {
+    const ids = [candidate.scopeId, candidate.scopeKey, ...(candidate.aliases || [])].map(String).filter(Boolean)
+      .sort((a, b) => b.length - a.length);
+    if (ids.some(id => tail === id || tail.startsWith(`${id}:`))) return { kind:'scope', ...candidate };
+  }
+  const scopeId = prefix === HAYAKU_BACKUP_PREFIX && tail.includes(':') ? tail.slice(0, tail.lastIndexOf(':')) : tail;
+  return scopeId ? { kind:'scope',scopeId,scopeKey:scopeId,aliases:[scopeId],label:scopeId } : { kind:'scope',scopeAlias:tail };
+};
+  const MemorySuiteStorageBridge = createMemorySuiteStorageBridge({
+    namespace:'retrace', displayName:'RE:TRACE', pluginId:'flashback_hayaku_bridge', pluginVersion:PLUGIN_VERSION, managementButton:false,
+    pluginPrefixes:[COLD_START_PREFIX,COLD_START_RUN_PREFIX,INCREMENTAL_RECOVERY_PREFIX,INCREMENTAL_RECOVERY_RUN_PREFIX,HAYAKU_BACKUP_PREFIX,HAYAKU_BACKUP_CATALOG_PREFIX],
+    excludedKeys:[SETTINGS_KEY,LOCAL_SETTINGS_BACKUP_KEY],
+    excludedContains:['api_key','apikey','authorization','bearer','credential','secret','password','token'],
+    currentScopeProvider:memorySuiteRetraceCurrentScope, resolveKeyScope:memorySuiteRetraceResolveKeyScope
+  });
+
+  const RetracePluginStorage = MemorySuiteStorageBridge.createPluginStorageProxy(RetraceLegacyPluginStorage);
+
+  const MemorySuitePeerServerBridges = Object.freeze(Object.fromEntries([
+    ['flashback', 'flashback_memory'],
+    ['hayaku', 'hayaku_locator_continuity'],
+    ['libra', 'libra'],
+    ['gradia', 'serial_gradation_agents_for_rp'],
+    ['lia', 'lia_persona_linker']
+  ].map(([namespace, peerPluginId]) => [namespace, createMemorySuiteStorageBridge({
+    namespace,
+    displayName: `RE:TRACE peer ${namespace}`,
+    pluginId: `flashback_hayaku_bridge:peer:${peerPluginId}`,
+    pluginVersion: PLUGIN_VERSION,
+    managementButton: false,
+    autoMigratePlugin: false,
+    autoMigrateLocal: false,
+    scopeRouting: false
+  })])));
+
+  const memorySuitePeerNamespaceForKey = keyValue => {
+    const key = text(keyValue || '');
+    if (key.startsWith('vector_rag_memory:')) return 'flashback';
+    if (key.startsWith('hayaku.v1') || key.startsWith('hayaku.archive.v1') || key.startsWith('hayaku.v2.')) return 'hayaku';
+    if (key.startsWith('libra:v1:')) return 'libra';
+    if (key.startsWith('serial_gradation_agents_for_rp:') || key.startsWith('gradia.narrative.local_vector.')) return 'gradia';
+    if (key.startsWith('liaPersona') || key.startsWith('dynamicPersonaLorebookGeneratorResultVault')) return 'lia';
+    return '';
+  };
+
+  const memorySuitePeerSpaceForKey = keyValue => {
+    const key = text(keyValue || '');
+    if (key.startsWith('gradia.narrative.local_vector.')) return 'local';
+    if (key.startsWith('vector_rag_memory:local-vector-shard:')) return 'local';
+    if (key.startsWith('libra:v1:local-vector:')) return 'local';
+    return 'plugin';
+  };
+
+  const peerServerRead = async (namespace, key, space = 'plugin') => {
+    const bridge = MemorySuitePeerServerBridges[namespace];
+    if (!bridge) return { available: false, exists: false, tombstone: false, value: null, reason: 'unknown_namespace' };
+    try {
+      const result = await bridge.serverGet(space, key);
+      return { available: true, ...result };
+    } catch (error) {
+      return { available: false, exists: false, tombstone: false, value: null, reason: compact(error?.message || error, 240) };
+    }
+  };
+
+  const inspectMemorySuitePeerServerData = async (options = {}) => {
+    const rows = {};
+    const entries = Object.entries({ ...MemorySuitePeerServerBridges, retrace: MemorySuiteStorageBridge })
+      .filter(([namespace]) => namespace !== 'hayaku' || options?.hayakuOwnerReady === true);
+    if (options?.hayakuOwnerReady !== true) {
+      rows.hayaku = {
+        available: false,
+        skipped: true,
+        integrityOk: false,
+        records: 0,
+        liveRecords: 0,
+        tombstones: 0,
+        reason: 'hayaku_owner_absent_disabled'
+      };
+    }
+    await Promise.all(entries.map(async ([namespace, bridge]) => {
+      try {
+        const integrity = await bridge.serverIntegrity();
+        const [pluginListing, localListing] = await Promise.all([
+          bridge.serverKeys('plugin', ''),
+          bridge.serverKeys('local', '')
+        ]);
+        rows[namespace] = {
+          available: true,
+          integrityOk: integrity?.ok === true && text(integrity?.result || '') === 'ok',
+          records: Math.max(0, Number(integrity?.records || 0) || 0),
+          liveRecords: Math.max(0, Number(integrity?.liveRecords || 0) || 0),
+          tombstones: Math.max(0, Number(integrity?.tombstones || 0) || 0),
+          pluginKeys: Array.isArray(pluginListing?.keys) ? pluginListing.keys.length : 0,
+          pluginTombstones: Array.isArray(pluginListing?.tombstones) ? pluginListing.tombstones.length : 0,
+          localKeys: Array.isArray(localListing?.keys) ? localListing.keys.length : 0,
+          localTombstones: Array.isArray(localListing?.tombstones) ? localListing.tombstones.length : 0
+        };
+      } catch (error) {
+        rows[namespace] = { available: false, integrityOk: false, records: 0, liveRecords: 0, tombstones: 0, reason: compact(error?.message || error, 240) };
+      }
+    }));
+    Runtime.memorySuitePeerServer = { at: Date.now(), namespaces: rows };
+    return Runtime.memorySuitePeerServer;
+  };
+
+  const storageGet = async key => {
+    const peerNamespace = memorySuitePeerNamespaceForKey(key);
+    if (peerNamespace) {
+      const space = memorySuitePeerSpaceForKey(key);
+      const [localValue, remote] = await Promise.all([
+        legacyStorageGet(key),
+        peerServerRead(peerNamespace, key, space)
+      ]);
+      // A server tombstone is authoritative for a serverized key and prevents
+      // stale pluginStorage remnants from resurrecting data after guarded deletion.
+      if (remote.available && remote.tombstone === true) return null;
+      // Mirror/plugin-only peers may have a newer local value while a background
+      // server sync is settling, so preserve local-first semantics when it exists.
+      if (localValue !== null && localValue !== undefined && localValue !== '') return localValue;
+      if (remote.available && remote.exists === true) return remote.value;
+      return null;
+    }
+    try { return await RetracePluginStorage.getItem(key); }
+    catch (error) { warn(`RE:TRACE storage read failed: ${key}`, error); return null; }
+  };
+
+  const storageSet = async (key, value) => {
+    try { return (await RetracePluginStorage.setItem(key, value)) !== false; }
+    catch (error) {
+      warn(`RE:TRACE storage write failed: ${key}`, error);
       return false;
     }
   };
@@ -967,7 +5027,8 @@
     extraBodyJson: ''
   });
   const DEFAULT_SETTINGS = Object.freeze({
-    primary: Object.freeze({ ...DEFAULT_PROFILE })
+    primary: Object.freeze({ ...DEFAULT_PROFILE }),
+    hayakuAutoRepair: false
   });
 
   // GRADIA v0.24.3 provider 추론 프리셋. auto는 provider/model 계열만
@@ -1035,7 +5096,9 @@
     const primaryHasConnection = Boolean(primary.key || providerAllowsEmptyKey(primary.provider));
     const legacyAuxHasConnection = Boolean(legacyAux && (legacyAux.key || providerAllowsEmptyKey(legacyAux.provider)));
     return {
-      primary: !primaryHasConnection && legacyAuxHasConnection ? legacyAux : primary
+      primary: !primaryHasConnection && legacyAuxHasConnection ? legacyAux : primary,
+      hayakuAutoRepair: value?.hayakuAutoRepair === true
+        || text(value?.hayakuAutoRepair ?? value?.retrace_hayaku_auto_repair).trim().toLowerCase() === 'true'
     };
   };
   const loadSettings = async force => {
@@ -1049,7 +5112,19 @@
       else if (!pluginState.savedAt && localState.savedAt) chosen = pluginState;
       else chosen = pluginState;
     }
-    const settings = normalizeSettings(chosen?.settings || {});
+    let settingsSource = chosen?.settings && typeof chosen.settings === 'object'
+      ? { ...chosen.settings }
+      : {};
+    if (!Object.prototype.hasOwnProperty.call(settingsSource, 'hayakuAutoRepair')) {
+      try {
+        const argumentApi = liveApi(['getArgument']);
+        const rawAutoRepair = typeof argumentApi?.getArgument === 'function'
+          ? text(await argumentApi.getArgument('retrace_hayaku_auto_repair')).trim()
+          : '';
+        if (rawAutoRepair) settingsSource.retrace_hayaku_auto_repair = rawAutoRepair;
+      } catch (_) {}
+    }
+    const settings = normalizeSettings(settingsSource);
     Runtime.settings = settings;
     const savedAt = Math.max(pluginState.savedAt, localState.savedAt, Date.now());
     const pluginNormalized = pluginState.present ? normalizeSettings(pluginState.settings || {}) : null;
@@ -2280,7 +6355,8 @@
         if (text(response.action || '').trim() !== text(pending.action || '').trim()) return;
         // Mutation receipts must be authenticated by the host-provided sender.
         // Read-only compatibility probes may still accept legacy hosts that omit it.
-        if (HAYAKU_IPC_MUTATION_ACTIONS.has(pending.action) && sender !== HAYAKU_PLUGIN_ID) return;
+        if ((HAYAKU_IPC_MUTATION_ACTIONS.has(pending.action) || pending.requireAuthenticatedSender === true)
+          && sender !== HAYAKU_PLUGIN_ID) return;
         Runtime.hayakuIpcPending.delete(requestId);
         Runtime.hayakuIpcUnavailableUntil = 0;
         clearTimeout(pending.timer);
@@ -2322,7 +6398,10 @@
         error.code = 'HAYAKU_IPC_TIMEOUT';
         reject(error);
       }, timeoutMs);
-      Runtime.hayakuIpcPending.set(requestId, { resolve, reject, timer, action, at: Date.now() });
+      Runtime.hayakuIpcPending.set(requestId, {
+        resolve, reject, timer, action, at: Date.now(),
+        requireAuthenticatedSender: options.requireAuthenticatedSender === true
+      });
       Promise.resolve(api.postPluginChannelMessage(
         HAYAKU_PLUGIN_ID,
         HAYAKU_IPC_REQUEST_CHANNEL,
@@ -2341,6 +6420,68 @@
         reject(error);
       });
     });
+  };
+
+  const setHayakuOwnerGate = (state, ready, reason = '', capabilities = null) => {
+    Runtime.hayakuOwnerGate = {
+      state,
+      ready: ready === true,
+      reason: compact(reason || '', 240),
+      checkedAt: Date.now(),
+      capabilities: capabilities ? clone(capabilities, {}) : null
+    };
+    return Runtime.hayakuOwnerGate;
+  };
+  const probeLiveHayakuOwner = async (options = {}) => {
+    const cached = Runtime.hayakuOwnerGate || {};
+    if (options.force !== true && Number(cached.checkedAt || 0) > 0
+      && Date.now() - Number(cached.checkedAt || 0) <= HAYAKU_OWNER_GATE_CACHE_MS) return cached;
+    try {
+      const capabilities = await requestHayakuIpc('capabilities', {}, {
+        timeoutMs: Math.max(600, Math.min(8000, Number(options.timeoutMs || 2200) || 2200)),
+        ignoreCooldown: true,
+        suppressCooldown: true,
+        requireAuthenticatedSender: true
+      });
+      const ownerMatches = text(capabilities?.ownerPluginId || '').trim() === HAYAKU_PLUGIN_ID;
+      const inspectReady = capabilities?.ipcCapabilities?.inspect === true || capabilities?.features?.inspect === true;
+      if (!ownerMatches || !inspectReady) {
+        return setHayakuOwnerGate('incompatible', false, 'hayaku_owner_contract_incomplete', capabilities);
+      }
+      return setHayakuOwnerGate('ready', true, 'hayaku_owner_ready', capabilities);
+    } catch (error) {
+      const code = text(error?.code || '').trim();
+      return setHayakuOwnerGate(
+        code === 'HAYAKU_IPC_REJECTED' ? 'incompatible' : 'absent',
+        false,
+        compact(error?.message || code || 'hayaku_owner_unavailable', 240),
+        null
+      );
+    }
+  };
+  const ensureHayakuOwnerReady = async (options = {}) => {
+    const gate = await probeLiveHayakuOwner(options);
+    if (gate.ready !== true) {
+      const error = new Error(gate.state === 'incompatible'
+        ? `HAYAKU owner가 호환되지 않아 ${options.action || 'HAYAKU 작업'}을 실행하지 않습니다.`
+        : `활성 HAYAKU owner가 없어 ${options.action || 'HAYAKU 작업'}을 실행하지 않습니다.`);
+      error.code = gate.state === 'incompatible' ? 'HAYAKU_OWNER_INCOMPATIBLE' : 'HAYAKU_OWNER_ABSENT';
+      error.ownerGate = gate;
+      throw error;
+    }
+    if (options.requireRecoveryDebtContract === true) {
+      const ipc = gate.capabilities?.ipcCapabilities || {};
+      if (ipc.recoveryDebtWorldlineV1 !== true
+        || ipc.inspectRecoveryDebts !== true
+        || ipc.acquireRecoveryDebtLease !== true
+        || ipc.releaseRecoveryDebtLease !== true
+        || ipc.repairTargetAdoptionV1 !== true) {
+        const error = new Error('HAYAKU owner가 자동 복구 debt/worldline 계약을 지원하지 않습니다.');
+        error.code = 'HAYAKU_RECOVERY_DEBT_CONTRACT_UNAVAILABLE';
+        throw error;
+      }
+    }
+    return gate;
   };
 
   const registerLibraIpc = async () => {
@@ -2669,6 +6810,7 @@
       && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptMatches(receipt, options)
       && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.gradia, { physicalField: 'physicalNarrativeArchiveCopies' })
+      && memorySuiteStorageReceiptMatches(receipt, 'gradia')
       && gradiaOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
   };
 
@@ -2690,6 +6832,7 @@
       && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptMatches(receipt, options)
       && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.gradia, { physicalField: 'physicalNarrativeArchiveCopies' })
+      && memorySuiteStorageReceiptMatches(receipt, 'gradia')
       && gradiaOwnerReceiptMatches(receipt, transport, 'adopt_session_handoff');
   };
 
@@ -2711,6 +6854,7 @@
       && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
       && gradiaArchiveReceiptMatches(receipt, options)
       && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.gradia, { physicalField: 'physicalNarrativeArchiveCopies' })
+      && memorySuiteStorageReceiptMatches(receipt, 'gradia')
       && gradiaOwnerReceiptMatches(receipt, transport, 'verify_session_handoff');
   };
 
@@ -2914,7 +7058,8 @@
       && text(receipt?.forkedFromLivePersonaId || '') === sourceLivePersonaId
       && text(receipt?.handoffSourceChatId || '') === sourceChatId
       && text(receipt?.handoffTransferId || '') === transferId
-      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.lia, { physicalField: 'physicalCopies' });
+      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.lia, { physicalField: 'physicalCopies' })
+      && memorySuiteStorageReceiptMatches(receipt, 'lia');
   };
 
   const adoptLiaLivePersonaHandoff = async options => {
@@ -3324,14 +7469,17 @@
       };
       try {
         let transport = '';
-        if (typeof runtime?.adopt === 'function') {
-          last = await runtime.adopt(request);
-          transport = 'same_realm_runtime';
-        } else {
+        try {
+          // Prefer the authenticated owner IPC because patched owners attach
+          // Memory Suite mirror/server synchronization proof to the receipt.
           last = await requestFlashbackIpc('adopt_session_handoff', request, {
             timeoutMs: Math.max(5000, Math.min(FLASHBACK_IPC_TIMEOUT_MAX_MS, Number(options.ipcTimeoutMs || FLASHBACK_ADOPT_TIMEOUT_MS) || FLASHBACK_ADOPT_TIMEOUT_MS))
           });
           transport = 'risu_plugin_ipc';
+        } catch (ipcError) {
+          if (typeof runtime?.adopt !== 'function') throw ipcError;
+          last = await runtime.adopt(request);
+          transport = 'same_realm_runtime';
         }
         const strictReceipt = text(last?.schema || '') === 'flashback_memory.session_handoff_adoption.v4';
         const identityMatches = text(last?.targetChatId || '') === targetChatId
@@ -3346,6 +7494,7 @@
         );
         const preservationReceipt = text(last?.schema || '') === FLASHBACK_HANDOFF_RECEIPT_SCHEMA
           && sourcePreservationReceiptMatches(last, RETRACE_PEER_REQUIREMENTS.flashback, { physicalField: 'physicalCopies' })
+          && memorySuiteStorageReceiptMatches(last, 'flashback')
           && Number(last?.compactedSourceRecords || 0) === 0;
         const sourceStorageAfter = await flashbackSourceStorageIntegritySnapshotForRetrace(sourceScopeKey);
         const sourceStorageComparison = compareFlashbackSourceStorageIntegrityForRetrace(sourceStorageBefore, sourceStorageAfter);
@@ -4172,200 +8321,88 @@
   const readHayakuSource = async (context, options = {}) => {
     const scope = hayakuScopeFor(context);
     const includeRecords = options?.includeRecords !== false;
-    if (!scope.available) return { available: false, reason: scope.reason, records: [], recordCount: 0, scope };
-
-    if (options?.skipOwnerInspect !== true) try {
-      const inspected = await requestHayakuIpc('inspect', { includeRecords }, { timeoutMs: includeRecords ? 2600 : 1500 });
-      const inspectedLedger = inspected?.ledger && typeof inspected.ledger === 'object'
-        ? inspected.ledger
-        : inspected;
-      if (inspectedLedger && typeof inspectedLedger === 'object') {
-        const ipcLedger = {
-          ...clone(inspectedLedger, {}),
-          version: text(inspectedLedger.version || inspected?.version || '').trim(),
-          scopeKey: text(inspectedLedger.scopeKey || inspected?.scopeKey || '').trim(),
-          recordsIncluded: inspected?.recordsIncluded ?? inspectedLedger?.recordsIncluded ?? includeRecords,
-          recordCount: Number(inspected?.recordCount ?? inspectedLedger?.recordCount ?? 0) || 0,
-          archiveRef: clone(inspected?.archiveRef || inspectedLedger?.archiveRef || null, null),
-          archiveVerified: inspected?.archiveVerified ?? inspectedLedger?.archiveVerified,
-          storageLimits: clone(
-            inspected?.storageLimits
-            || inspectedLedger?.storageLimits
-            || inspected?.runtime?.storageLimits
-            || inspected?.runtime?.storage
-            || {},
-            {}
-          )
-        };
-        const result = hayakuSourceResult(
-          ipcLedger,
-          scope,
-          'hayaku_plugin_ipc',
-          inspected?.packetAuthoring || inspectedLedger?.packetAuthoring
-        );
-        if (!['scope_mismatch', 'unsupported_schema'].includes(result.reason)) return result;
-        warn(`HAYAKU IPC ledger rejected: ${result.reason}`, result.schema || ipcLedger.scopeKey);
-      }
+    if (!scope.available) return { available: false, ownerReady: false, reason: scope.reason, records: [], recordCount: 0, scope };
+    let gate;
+    try {
+      gate = options?.ownerGate?.ready === true
+        ? options.ownerGate
+        : await ensureHayakuOwnerReady({ action: 'HAYAKU 원장 조회', force: options?.forceOwnerProbe === true });
     } catch (error) {
-      if (!['HAYAKU_IPC_UNAVAILABLE', 'HAYAKU_IPC_TIMEOUT'].includes(text(error?.code))) {
-        warn('HAYAKU IPC ledger inspection failed', error);
+      return {
+        available: false,
+        ownerReady: false,
+        ownerState: error?.ownerGate?.state || Runtime.hayakuOwnerGate?.state || 'absent',
+        reason: text(error?.code || 'hayaku_owner_absent').toLowerCase(),
+        error: text(error?.message || error),
+        records: [],
+        recordCount: 0,
+        scope
+      };
+    }
+    try {
+      const inspected = await requestHayakuIpc('inspect', { includeRecords }, {
+        timeoutMs: includeRecords ? 15000 : 5000,
+        ignoreCooldown: true,
+        suppressCooldown: true,
+        requireAuthenticatedSender: true
+      });
+      const inspectedLedger = inspected?.ledger && typeof inspected.ledger === 'object' ? inspected.ledger : inspected;
+      if (!inspectedLedger || typeof inspectedLedger !== 'object') {
+        return { available: false, ownerReady: true, ownerState: 'ready', reason: 'owner_inspect_empty', records: [], recordCount: 0, scope };
       }
+      const ipcLedger = {
+        ...clone(inspectedLedger, {}),
+        version: text(inspectedLedger.version || inspected?.version || '').trim(),
+        scopeKey: text(inspectedLedger.scopeKey || inspected?.scopeKey || '').trim(),
+        recordsIncluded: inspected?.recordsIncluded ?? inspectedLedger?.recordsIncluded ?? includeRecords,
+        recordCount: Number(inspected?.recordCount ?? inspectedLedger?.recordCount ?? 0) || 0,
+        archiveRef: clone(inspected?.archiveRef || inspectedLedger?.archiveRef || null, null),
+        archiveVerified: inspected?.archiveVerified ?? inspectedLedger?.archiveVerified,
+        storageLimits: clone(inspected?.storageLimits || inspectedLedger?.storageLimits || {}, {})
+      };
+      return {
+        ...hayakuSourceResult(ipcLedger, scope, 'hayaku_plugin_ipc', inspected?.packetAuthoring || inspectedLedger?.packetAuthoring),
+        ownerReady: true,
+        ownerState: gate.state,
+        ownerCapabilities: clone(gate.capabilities, {})
+      };
+    } catch (error) {
+      setHayakuOwnerGate('absent', false, error?.message || 'hayaku_owner_inspect_failed', null);
+      return {
+        available: false,
+        ownerReady: false,
+        ownerState: 'absent',
+        reason: 'hayaku_owner_inspect_failed',
+        error: text(error?.message || error),
+        records: [],
+        recordCount: 0,
+        scope
+      };
     }
-
-    const runtime = options?.skipOwnerInspect === true ? null : activeHayakuRuntime('inspect');
-    if (runtime) {
-      try {
-        const inspected = await runtime.ledger.inspect({ includeRecords });
-        const inspectedLedger = inspected?.ledger && typeof inspected.ledger === 'object'
-          ? inspected.ledger
-          : inspected;
-        const runtimeSnapshot = includeRecords && typeof runtime.runtime === 'function'
-          ? await Promise.resolve(runtime.runtime())
-          : null;
-        if (inspectedLedger && typeof inspectedLedger === 'object') {
-          const runtimeLedger = {
-            ...clone(inspectedLedger, {}),
-            version: text(
-              inspectedLedger.version
-              || inspected?.version
-              || runtimeSnapshot?.storage?.schema
-              || ''
-            ).trim(),
-            scopeKey: text(inspectedLedger.scopeKey || inspected?.scopeKey || '').trim(),
-            recordsIncluded: inspected?.recordsIncluded ?? inspectedLedger?.recordsIncluded ?? includeRecords,
-            recordCount: Number(inspected?.recordCount ?? inspectedLedger?.recordCount ?? 0) || 0,
-            archiveRef: clone(inspected?.archiveRef || inspectedLedger?.archiveRef || null, null),
-            archiveVerified: inspected?.archiveVerified ?? inspectedLedger?.archiveVerified,
-            packetAuthoring: inspected?.packetAuthoring
-              || inspectedLedger?.packetAuthoring
-              || runtimeSnapshot?.packetAuthoring
-              || (typeof runtime?.packet?.authoringProfile === 'function'
-                ? runtime.packet.authoringProfile()
-                : null),
-            storageLimits: clone(
-              inspected?.storageLimits
-              || inspectedLedger?.storageLimits
-              || runtimeSnapshot?.storageLimits
-              || runtimeSnapshot?.storage
-              || {},
-              {}
-            )
-          };
-          const result = hayakuSourceResult(runtimeLedger, scope, 'hayaku_runtime_api', runtimeLedger.packetAuthoring);
-          if (!['scope_mismatch', 'unsupported_schema'].includes(result.reason)) return result;
-          warn(`HAYAKU runtime ledger rejected: ${result.reason}`, result.schema || runtimeLedger.scopeKey);
-        }
-      } catch (error) {
-        warn('HAYAKU runtime ledger inspection failed', error);
-      }
-    }
-
-    const localLedger = parseJson(await storageGet(scope.storageKey), null);
-    if (!includeRecords || !localLedger?.archiveRef) {
-      const archiveState = localLedger?.archiveRef
-        ? await readHayakuArchiveLayerMetas(localLedger.archiveRef)
-        : { verified: true, reason: 'archive_ref_absent', records: 0, layers: [] };
-      const localEffective = effectiveHayakuRecords({ ...localLedger, archiveRef: null }).length;
-      const overlap = Math.min(localEffective, Math.max(0, Number(localLedger?.archiveRef?.localOverlapCount || 0) || 0));
-      const logicalCount = Math.max(0, Number(localLedger?.recordCount || 0) || 0)
-        || Math.max(0, Number(archiveState.records || 0) || 0) + localEffective - overlap;
-      const summaryLedger = localLedger && typeof localLedger === 'object'
-        ? {
-          ...localLedger,
-          recordsIncluded: includeRecords,
-          recordCount: logicalCount,
-          archiveVerified: archiveState.verified === true,
-          archiveReason: archiveState.reason,
-          archiveRecords: archiveState.records,
-          archiveLayers: archiveState.layers
-        }
-        : localLedger;
-      return hayakuSourceResult(summaryLedger, scope, 'plugin_storage_fallback');
-    }
-    const hydrated = await hydrateHayakuArchiveForRetrace(localLedger);
-    return hayakuSourceResult({
-      ...hydrated.ledger,
-      recordsIncluded: true,
-      recordCount: effectiveHayakuRecords(hydrated.ledger).length,
-      archiveVerified: hydrated.archiveVerified
-    }, scope, 'plugin_storage_fallback');
   };
-
   const readHayakuViewerSource = async (context, limit = HAYAKU_VIEWER_MAX_RENDERED_RECORDS) => {
-    const summary = await readHayakuSource(context, { includeRecords: false });
-    const scope = summary?.scope?.available ? summary.scope : hayakuScopeFor(context);
-    if (!scope?.available) return summary;
-    const rawLedger = parseJson(await storageGet(scope.storageKey), null);
-    if (!rawLedger || !HAYAKU_LEDGER_SCHEMAS.has(text(rawLedger.version || '')) || text(rawLedger.scopeKey || '') !== scope.scopeKey) return summary;
-    const archiveState = rawLedger.archiveRef
-      ? await readHayakuArchiveLayerMetas(rawLedger.archiveRef)
-      : { verified: true, reason: 'archive_ref_absent', records: 0, layers: [] };
+    const source = await readHayakuSource(context, { includeRecords: true });
+    if (source.ownerReady !== true) return source;
     const maxRecords = Math.max(1, Math.min(1000, Number(limit || HAYAKU_VIEWER_MAX_RENDERED_RECORDS) || HAYAKU_VIEWER_MAX_RENDERED_RECORDS));
-    const localRecordsAll = Array.isArray(rawLedger.records) ? rawLedger.records.filter(record => record && typeof record === 'object') : [];
-    const localRecords = localRecordsAll.slice().sort((a, b) => compareHayakuTimelineRecords(b, a));
-    const byId = new Map();
-    for (const record of localRecords) {
-      const identity = hayakuArchiveRecordIdentityForRetrace(record) || text(record?.recordId || record?.hash || '');
-      if (!identity || byId.has(identity)) continue;
-      byId.set(identity, record);
-      if (byId.size >= maxRecords) break;
-    }
-    let archiveLayersRead = 0;
-    let compressedLayersRead = 0;
-    let archiveDecodeFailures = 0;
-    for (const layer of archiveState.layers || []) {
-      if (byId.size >= maxRecords) break;
-      const storageKey = text(layer?.ref?.storageKey || layer?.meta?.storageKey || '').trim();
-      if (!storageKey) continue;
-      const decoded = await decodeHayakuArchivePayloadForRetrace(await storageGet(storageKey));
-      const archive = decoded.parsed;
-      archiveLayersRead += 1;
-      if (decoded.compressed) compressedLayersRead += 1;
-      if (!archive || archive.schema !== HAYAKU_ARCHIVE_SCHEMA || text(archive.archiveId || '') !== text(layer?.ref?.archiveId || '')) {
-        archiveDecodeFailures += 1;
-        continue;
-      }
-      const records = Array.isArray(archive.records) ? archive.records.filter(record => record && typeof record === 'object') : [];
-      for (const record of records.slice().sort((a, b) => compareHayakuTimelineRecords(b, a))) {
-        const identity = hayakuArchiveRecordIdentityForRetrace(record) || text(record?.recordId || record?.hash || '');
-        if (!identity || byId.has(identity)) continue;
-        byId.set(identity, record);
-        if (byId.size >= maxRecords) break;
-      }
-    }
-    const sampledRecords = Array.from(byId.values()).sort(compareHayakuTimelineRecords);
-    const localEffective = effectiveHayakuRecords({ ...rawLedger, archiveRef: null }).length;
-    const overlap = Math.min(localEffective, Math.max(0, Number(rawLedger?.archiveRef?.localOverlapCount || 0) || 0));
-    const logicalCount = Math.max(0, Number(summary?.recordCount || 0) || 0)
-      || Math.max(0, Number(archiveState.records || 0) || 0) + localEffective - overlap;
-    const viewerLedger = {
-      ...rawLedger,
-      records: sampledRecords,
-      recordsIncluded: true,
-      recordCount: logicalCount,
-      logicalRecordCount: logicalCount,
-      archiveVerified: archiveState.verified === true && archiveDecodeFailures === 0,
-      archiveReason: archiveDecodeFailures ? 'archive_viewer_decode_failed' : archiveState.reason,
-      archiveRecords: archiveState.records,
-      storageLimits: summary?.storageLimits || rawLedger.storageLimits || rawLedger.storage || {}
-    };
-    const result = hayakuSourceResult(viewerLedger, scope, 'retrace_paged_view', summary?.packetAuthoring);
+    const allRecords = Array.isArray(source.allRecords) && source.allRecords.length
+      ? source.allRecords
+      : (Array.isArray(source.ledger?.records) ? source.ledger.records : source.records || []);
+    const sampled = [...allRecords].filter(Boolean).sort(compareHayakuTimelineRecords).slice(-maxRecords);
     return {
-      ...result,
-      recordCount: logicalCount,
-      archiveRecordCount: Math.max(0, Number(archiveState.records || 0) || 0),
-      localRecordCount: Math.max(0, logicalCount - Math.max(0, Number(archiveState.records || 0) || 0)),
-      viewerLoadedRecords: sampledRecords.length,
-      viewerLimited: logicalCount > sampledRecords.length,
-      viewerReadMode: 'latest_archive_layers_only',
-      viewerArchiveLayersRead: archiveLayersRead,
-      viewerCompressedLayersRead: compressedLayersRead,
-      viewerArchiveDecodeFailures: archiveDecodeFailures,
-      summaryReadSource: summary?.readSource || ''
+      ...source,
+      records: sampled,
+      allRecords,
+      recordsIncluded: true,
+      viewerPaged: allRecords.length > sampled.length,
+      viewerTotalRecords: allRecords.length,
+      viewerRenderedRecords: sampled.length,
+      readSource: 'hayaku_plugin_ipc'
     };
   };
-
-  const readPendingColdStartCapsule = async context => {
+  const readPendingColdStartCapsule = async (context, options = {}) => {
+    const ownerGate = options?.ownerGate?.ready === true
+      ? options.ownerGate
+      : await ensureHayakuOwnerReady({ action: 'HAYAKU 콜드스타트 캡슐 조회', force: options?.forceOwnerProbe === true });
     const scope = hayakuScopeFor(context);
     if (!scope.available) return { available: false, reason: scope.reason, packets: [], scope };
     const storageKey = `${COLD_START_PREFIX}${scope.scopeKey}`;
@@ -4386,7 +8423,10 @@
     };
   };
 
-  const readColdStartRun = async context => {
+  const readColdStartRun = async (context, options = {}) => {
+    const ownerGate = options?.ownerGate?.ready === true
+      ? options.ownerGate
+      : await ensureHayakuOwnerReady({ action: 'HAYAKU 콜드스타트 실행 상태 조회', force: options?.forceOwnerProbe === true });
     const scope = hayakuScopeFor(context);
     if (!scope.available) return { available: false, reason: scope.reason, scope };
     const storageKey = `${COLD_START_RUN_PREFIX}${scope.scopeKey}`;
@@ -4404,7 +8444,10 @@
     };
   };
 
-  const readIncrementalRecoveryRun = async context => {
+  const readIncrementalRecoveryRun = async (context, options = {}) => {
+    const ownerGate = options?.ownerGate?.ready === true
+      ? options.ownerGate
+      : await ensureHayakuOwnerReady({ action: 'HAYAKU 증분 복구 실행 상태 조회', force: options?.forceOwnerProbe === true });
     const scope = hayakuScopeFor(context);
     if (!scope.available) return { available: false, reason: scope.reason, scope };
     const storageKey = `${INCREMENTAL_RECOVERY_RUN_PREFIX}${scope.scopeKey}`;
@@ -4422,7 +8465,10 @@
     };
   };
 
-  const readPendingIncrementalRecoveryCapsule = async context => {
+  const readPendingIncrementalRecoveryCapsule = async (context, options = {}) => {
+    const ownerGate = options?.ownerGate?.ready === true
+      ? options.ownerGate
+      : await ensureHayakuOwnerReady({ action: 'HAYAKU 증분 복구 캡슐 조회', force: options?.forceOwnerProbe === true });
     const scope = hayakuScopeFor(context);
     if (!scope.available) return { available: false, reason: scope.reason, packets: [], scope };
     const storageKey = `${INCREMENTAL_RECOVERY_PREFIX}${scope.scopeKey}`;
@@ -4480,7 +8526,8 @@
     const validation = validateBridgeCapsulePacketSet(capsule);
     return validation.valid ? validation.bodies : [];
   };
-  const verifyDurableHayakuColdStart = async capsule => {
+  const verifyDurableHayakuColdStart = async (capsule, options = {}) => {
+    await ensureHayakuOwnerReady({ action: 'HAYAKU 콜드스타트 영속 검증', force: options?.forceOwnerProbe === true });
     const scopeKey = text(capsule?.scopeKey || '').trim();
     const packetSet = validateBridgeCapsulePacketSet(capsule);
     const packetBodies = packetSet.bodies;
@@ -4516,7 +8563,8 @@
       sourceHash: text(capsule?.sourceHash || '')
     };
   };
-  const verifyDurableHayakuIncrementalRecovery = async capsule => {
+  const verifyDurableHayakuIncrementalRecovery = async (capsule, options = {}) => {
+    await ensureHayakuOwnerReady({ action: 'HAYAKU 증분 복구 영속 검증', force: options?.forceOwnerProbe === true });
     const scopeKey = text(capsule?.scopeKey || '').trim();
     const packetSet = validateBridgeCapsulePacketSet(capsule);
     const packetBodies = packetSet.bodies;
@@ -4903,6 +8951,7 @@
       transport: 'plugin_storage_readback'
     };
     try {
+      await ensureHayakuOwnerReady({ action: 'HAYAKU 세션 승계 검증', force: true });
       const context = await getCurrentContext();
       const currentIdentity = contextIdentity(context);
       if (!targetChatId || currentIdentity.chatId !== targetChatId) {
@@ -4978,6 +9027,16 @@
   };
 
   const adoptHayakuSessionHandoff = async (options = {}) => {
+    try {
+      await ensureHayakuOwnerReady({ action: 'HAYAKU 다음 세션 승계', force: true });
+    } catch (error) {
+      return {
+        ok: false, available: false, attempted: false, adopted: false, verified: false, durable: false,
+        reason: text(error?.code || 'HAYAKU_OWNER_ABSENT'), error: text(error?.message || error),
+        handoffContract: HAYAKU_REQUIRED_HANDOFF_CONTRACT, sourcePreserved: true,
+        sourceMutationAllowed: false, sourceCompactionAllowed: false, physicalCopies: 0, records: 0
+      };
+    }
     const targetChatId = text(options.targetChatId || '').trim();
     const transferId = text(options.transferId || '').trim();
     const sourceScopeKey = text(options.sourceScopeKey || '').trim();
@@ -5023,22 +9082,9 @@
         lastError = null;
       } catch (error) {
         lastError = error;
-        const code = text(error?.code || '').trim();
-        const runtime = ['HAYAKU_IPC_UNAVAILABLE', 'HAYAKU_IPC_TIMEOUT'].includes(code)
-          ? activeHayakuRuntime('adoptSessionHandoff')
-          : null;
-        if (runtime) {
-          try {
-            lastTransport = 'shared_runtime_fallback';
-            last = await runtime.ledger.adoptSessionHandoff(clone(request, request));
-            lastError = null;
-          } catch (runtimeError) {
-            lastError = runtimeError;
-            last = null;
-          }
-        } else {
-          last = null;
-        }
+        last = null;
+        // HAYAKU owner mutations are never attempted through cross-realm globals.
+        // An authenticated live plugin-channel owner is the only allowed authority.
       }
       const ownerReceipt = hayakuMutationReceiptMatches(
         last,
@@ -5050,7 +9096,8 @@
         && text(last?.sourceScopeKey || '') === sourceScopeKey;
       const recordsMatch = Math.max(0, Number(last?.records || 0) || 0) === expectedRecords;
       const preservationReceipt = text(last?.schema || '') === HAYAKU_HANDOFF_RECEIPT_SCHEMA
-        && sourcePreservationReceiptMatches(last, RETRACE_PEER_REQUIREMENTS.hayaku, { physicalField: 'physicalCopies' });
+        && sourcePreservationReceiptMatches(last, RETRACE_PEER_REQUIREMENTS.hayaku, { physicalField: 'physicalCopies' })
+        && memorySuiteStorageReceiptMatches(last, 'hayaku');
       if (last?.verified === true && last?.durable === true
         && ownerReceipt && identityMatches && recordsMatch && preservationReceipt) {
           return {
@@ -5101,32 +9148,20 @@
   };
 
   const dispatchHayakuAdoption = async (ipcAction, runtimeCapability, capsule) => {
-    let ipcError = null;
     try {
-      const result = await requestHayakuIpc(ipcAction, { capsule: clone(capsule, capsule) }, { timeoutMs: 7000 });
+      await ensureHayakuOwnerReady({ action: `HAYAKU ${ipcAction} 채택`, force: true });
+      const result = await requestHayakuIpc(
+        ipcAction,
+        { capsule: clone(capsule, capsule) },
+        { timeoutMs: 7000, ignoreCooldown: true, requireAuthenticatedSender: true }
+      );
       return { available: true, attempted: true, transport: 'hayaku_plugin_ipc', result, error: null };
     } catch (error) {
-      ipcError = error;
-      if (!['HAYAKU_IPC_UNAVAILABLE', 'HAYAKU_IPC_TIMEOUT'].includes(text(error?.code))) {
+      if (!['HAYAKU_OWNER_ABSENT', 'HAYAKU_OWNER_INCOMPATIBLE', 'HAYAKU_IPC_UNAVAILABLE', 'HAYAKU_IPC_TIMEOUT'].includes(text(error?.code))) {
         warn(`HAYAKU ${ipcAction} IPC failed`, error);
       }
+      return { available: false, attempted: false, transport: 'hayaku_owner_unavailable', result: null, error };
     }
-    const runtime = activeHayakuRuntime(runtimeCapability);
-    if (runtime) {
-      try {
-        const result = await runtime.ledger[runtimeCapability](clone(capsule, capsule));
-        return { available: true, attempted: true, transport: 'shared_runtime_fallback', result, error: null };
-      } catch (error) {
-        return { available: true, attempted: true, transport: 'shared_runtime_fallback', result: null, error };
-      }
-    }
-    return {
-      available: false,
-      attempted: false,
-      transport: 'plugin_storage_queue',
-      result: null,
-      error: ipcError
-    };
   };
 
   const requestImmediateHayakuColdStartAdoption = async capsule => {
@@ -5278,6 +9313,9 @@
           : (Array.isArray(result?.recoveredTurns) ? result.recoveredTurns : []),
         replacedRecords: Math.max(0, Number(persistent.replacedRecords || result?.replacedRecords || 0) || 0),
         diagnostics: persistent?.diagnostics || result?.diagnostics || null,
+        retryable: result?.retryable === true,
+        targetWorldlineStatus: text(result?.targetWorldlineStatus || ''),
+        staleRepairTarget: result?.staleRepairTarget ? clone(result.staleRepairTarget, {}) : null,
         mutation: text(result?.mutation || ''),
         ownerPluginId: text(result?.ownerPluginId || ''),
         authorizedRequester: text(result?.authorizedRequester || '')
@@ -5842,6 +9880,7 @@
   };
 
   const jumpToHayakuTurn = async requestedTurn => {
+    await ensureHayakuOwnerReady({ action: 'HAYAKU 턴 이동', force: true });
     const context = await getCurrentContext();
     const target = resolveTurnNavigationTarget(context.chat, requestedTurn);
     Runtime.hayakuMaxTurn = target.maxTurn;
@@ -6288,6 +10327,8 @@
         cold_start_source: 'CHAT_TRANSCRIPT_COLD_START',
         cold_start_executor: 'MEMORY_SESSION_BRIDGE_PROVIDER',
         generative_llm_calls: true,
+        automatic_repair: context?.automaticRepair === true,
+        repair_target: context?.repairTarget ? clone(context.repairTarget, {}) : undefined,
         scene_id: providerSceneId || `bridge-hayaku-scene-${stableHash64(
           text(world.location || world.scene || 'unspecified_scene').trim().toLowerCase()
         )}`,
@@ -6613,7 +10654,8 @@
     temperature,
     checkpoint,
     invalidJsonMessage,
-    onProgress
+    onProgress,
+    allowSourceFallback = true
   }) => {
     const attempts = [
       { mode: 'primary', prompt: primaryPrompt, temperature },
@@ -6693,7 +10735,7 @@
     // Match LIBRA's source-fallback principle only for malformed/truncated
     // model output. Transport, permission, and provider outages remain failed
     // checkpoints so a later resume cannot silently masquerade as analysis.
-    if (lastError && bridgeAnalysisErrorIsRepairable(lastError)) {
+    if (allowSourceFallback !== false && lastError && bridgeAnalysisErrorIsRepairable(lastError)) {
       try {
         state.body = normalizePacket({}, chunk, context);
         state.packetHash = stableHash64(state.body);
@@ -6878,12 +10920,13 @@
   };
 
   const inspectColdStart = async () => {
+    const ownerGate = await ensureHayakuOwnerReady({ action: 'HAYAKU 콜드스타트', force: true });
     const context = await getCurrentContext();
     const evidence = collectColdStartEvidence(context.chat);
     const [hayaku, pendingColdStart, stagedRun] = await Promise.all([
-      readHayakuSource(context),
-      readPendingColdStartCapsule(context),
-      readColdStartRun(context)
+      readHayakuSource(context, { ownerGate }),
+      readPendingColdStartCapsule(context, { ownerGate }),
+      readColdStartRun(context, { ownerGate })
     ]);
     const pendingAdoptionVerification = pendingColdStart.available
       ? await verifyDurableHayakuColdStart(pendingColdStart.capsule)
@@ -7241,13 +11284,14 @@
   };
 
   const inspectIncrementalRecovery = async (options = {}) => {
+    const ownerGate = await ensureHayakuOwnerReady({ action: 'HAYAKU 증분 재분석', force: true });
     const targetTurns = Array.isArray(options?.targetTurns) ? options.targetTurns : [];
     const targeted = targetTurns.length > 0;
     const context = await getCurrentContext();
     const [hayaku, stagedRun, pendingCapsule] = await Promise.all([
-      readHayakuSource(context),
-      readIncrementalRecoveryRun(context),
-      readPendingIncrementalRecoveryCapsule(context)
+      readHayakuSource(context, { ownerGate }),
+      readIncrementalRecoveryRun(context, { ownerGate }),
+      readPendingIncrementalRecoveryCapsule(context, { ownerGate })
     ]);
     const evidence = collectIncrementalRecoveryEvidence(context.chat, hayaku, { targetTurns });
     const allRecords = Array.isArray(hayaku?.allRecords) ? hayaku.allRecords : hayaku?.records;
@@ -7682,6 +11726,407 @@
     return result;
   };
 
+  const hayakuAutoRepairRunStorageKey = (scopeKey, debtId) => `${HAYAKU_AUTO_REPAIR_RUN_PREFIX}${stableHash64(`${scopeKey}\u0001${debtId}`)}`;
+  const hayakuAutoRepairCapsuleStorageKey = (scopeKey, debtId) => `${HAYAKU_AUTO_REPAIR_CAPSULE_PREFIX}${stableHash64(`${scopeKey}\u0001${debtId}`)}`;
+  const scheduleHayakuAutoRepairSweep = (reason = 'event', delayMs = 250) => {
+    const state = Runtime.hayakuAutoRepair;
+    state.queuedReason = compact(reason || 'event', 96);
+    if (state.timer != null || state.inFlight) return false;
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      void runHayakuAutoRepairSweep(state.queuedReason || reason).catch(error => {
+        state.lastError = compact(error?.message || error, 320);
+      });
+    }, Math.max(0, Number(delayMs || 0) || 0));
+    return true;
+  };
+  const automaticRepairChunkFromDebt = debt => {
+    const pairIndex = Math.max(1, Number(debt?.pairIndex || 1) || 1);
+    const user = text(debt?.evidence?.user || '').trim();
+    const assistant = text(debt?.evidence?.assistant || '').trim();
+    return {
+      startTurn: pairIndex,
+      endTurn: pairIndex,
+      targetPairIndex: pairIndex,
+      messageIndexes: [],
+      text: `[USER T${pairIndex}]\n${user}\n\n[ASSISTANT T${pairIndex}]\n${assistant}`,
+      includesPendingUser: false
+    };
+  };
+  const automaticRepairTargetMatches = (left = {}, right = {}) => [
+    'debtId', 'scopeKey', 'ownerTurnNodeId', 'logicalTurnId', 'variantId', 'parentTurnNodeId',
+    'pairIndex', 'userHash', 'userMessageIdHash', 'assistantVisibleHash', 'assistantMessageIdHash',
+    'sourceEvidenceHash'
+  ].every(key => {
+    if (key === 'pairIndex') return Number(left?.[key] || 0) === Number(right?.[key] || 0);
+    return text(left?.[key] || '') === text(right?.[key] || '');
+  });
+  const cachedAutomaticRepairCapsuleForTarget = async (storageKey, repairTarget) => {
+    const capsule = parseJson(await storageGet(storageKey), null);
+    const validation = validateBridgeCapsulePacketSet(capsule);
+    const entry = Array.isArray(capsule?.packets) ? capsule.packets[0] : null;
+    if (!validation.valid
+      || capsule?.automaticRepair !== true
+      || capsule?.repairMode !== 'retrace_auto'
+      || capsule?.packetCount !== 1
+      || !entry?.repairTarget
+      || !automaticRepairTargetMatches(entry.repairTarget, repairTarget)) return null;
+    return capsule;
+  };
+  const automaticRepairAdoptionDisposition = adoption => {
+    if (adoption?.verified === true && adoption?.durable === true) return 'adopted';
+    const reason = text(adoption?.reason || 'automatic_repair_adoption_failed');
+    if (reason === 'recovery_target_worldline_unstable'
+      || adoption?.retryable === true
+      || text(adoption?.targetWorldlineStatus || '') === 'quarantined') return 'suspended';
+    if (reason === 'stale_recovery_target_not_active'
+      || ['superseded', 'orphaned', 'detached_branch', 'detached', 'retired'].includes(text(adoption?.targetWorldlineStatus || ''))) return 'cancelled';
+    return 'failed';
+  };
+  const executeHayakuAutomaticRepairDebt = async (debtSummary, ownerGate, reason = 'event') => {
+    const settings = await loadSettings();
+    if (settings.hayakuAutoRepair !== true) return { ok: false, skipped: true, reason: 'auto_repair_disabled' };
+    const state = Runtime.hayakuAutoRepair;
+    const debtId = text(debtSummary?.debtId || '').trim();
+    const scopeKey = text(debtSummary?.scopeKey || '').trim();
+    if (!debtId || !scopeKey) return { ok: false, skipped: true, reason: 'debt_identity_missing' };
+    const runId = `retrace-auto-${stableHash64(`${scopeKey}|${debtId}|${Date.now()}`)}`;
+    const leaseResponse = await requestHayakuIpc('acquire_recovery_debt_lease', { debtId, runId }, {
+      timeoutMs: 15000,
+      ignoreCooldown: true,
+      suppressCooldown: true,
+      requireAuthenticatedSender: true
+    });
+    if (leaseResponse?.acquired !== true || !leaseResponse?.debt?.evidence) {
+      const leaseReason = leaseResponse?.reason || 'lease_not_acquired';
+      if (['hayaku_inband_recovery_pending', 'recovery_debt_already_leased', 'recovery_debt_backoff_active'].includes(leaseReason)) {
+        scheduleHayakuAutoRepairSweep(leaseReason, HAYAKU_AUTO_REPAIR_RETRY_MS);
+      }
+      return { ok: false, skipped: true, reason: leaseReason };
+    }
+    const lease = leaseResponse.lease || {};
+    const debt = leaseResponse.debt;
+    state.runId = runId;
+    state.debtId = debtId;
+    const chunk = automaticRepairChunkFromDebt(debt);
+    const repairTarget = {
+      contract: HAYAKU_RECOVERY_DEBT_CONTRACT,
+      debtId,
+      scopeKey,
+      ownerTurnNodeId: debt.ownerTurnNodeId || '',
+      logicalTurnId: debt.logicalTurnId || '',
+      variantId: debt.variantId || '',
+      parentTurnNodeId: debt.parentTurnNodeId || '',
+      pairIndex: debt.pairIndex,
+      userHash: debt.userHash || '',
+      userMessageIdHash: debt.userMessageIdHash || '',
+      assistantVisibleHash: debt.assistantVisibleHash || '',
+      assistantMessageIdHash: debt.assistantMessageIdHash || '',
+      sourceEvidenceHash: debt.sourceEvidenceHash || '',
+      observedWorldlineRevision: debt.observedWorldlineRevision || 0
+    };
+    const runStorageKey = hayakuAutoRepairRunStorageKey(scopeKey, debtId);
+    const capsuleKey = hayakuAutoRepairCapsuleStorageKey(scopeKey, debtId);
+    const releaseLease = async (outcome, error = '') => await requestHayakuIpc('release_recovery_debt_lease', {
+      debtId,
+      leaseId: lease.leaseId,
+      outcome,
+      error: compact(error || '', 240)
+    }, {
+      timeoutMs: 8000,
+      ignoreCooldown: true,
+      suppressCooldown: true,
+      requireAuthenticatedSender: true
+    }).catch(() => null);
+    const persistTerminalRun = async (run, nextState, adoption = null, error = '') => {
+      run.state = nextState;
+      run.error = compact(error || '', 320);
+      if (adoption) run.adoption = clone(adoption, {});
+      run.updatedAt = Date.now();
+      await storageSet(runStorageKey, JSON.stringify(run)).catch(() => false);
+    };
+    let run = {
+      schema: HAYAKU_AUTO_REPAIR_RUN_SCHEMA,
+      runId,
+      debtId,
+      scopeKey,
+      sourceHash: '',
+      repairTarget,
+      reason,
+      state: 'building',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      attempts: 0,
+      body: '',
+      packetHash: '',
+      error: ''
+    };
+    try {
+      // A valid candidate generated before a transient rollback is retained as a
+      // suspended checkpoint. Reactivation of the exact variant can adopt it with
+      // zero additional LLM calls.
+      const cachedCapsule = await cachedAutomaticRepairCapsuleForTarget(capsuleKey, repairTarget);
+      if (cachedCapsule) {
+        run = {
+          ...run,
+          sourceHash: text(cachedCapsule.sourceHash || ''),
+          state: 'cached_candidate',
+          body: text(cachedCapsule.packets?.[0]?.body || ''),
+          packetHash: text(cachedCapsule.packets?.[0]?.packetHash || '')
+        };
+        await storageSet(runStorageKey, JSON.stringify(run));
+        const cachedAdoption = await requestImmediateHayakuIncrementalRecoveryAdoption(cachedCapsule);
+        const disposition = automaticRepairAdoptionDisposition(cachedAdoption);
+        if (disposition === 'adopted') {
+          await persistTerminalRun(run, 'adopted', cachedAdoption);
+          await releaseLease('adopted');
+          return {
+            ok: true, debtId, runId,
+            recoveryId: text(cachedCapsule.recoveryId || ''),
+            adoption: cachedAdoption,
+            repairTarget,
+            cachedCandidate: true
+          };
+        }
+        if (disposition === 'suspended') {
+          await persistTerminalRun(run, 'suspended', cachedAdoption, cachedAdoption.reason);
+          await releaseLease('suspended', cachedAdoption.reason);
+          return {
+            ok: false, skipped: true, suspended: true,
+            reason: 'recovery_target_worldline_unstable', debtId, runId,
+            recoveryId: text(cachedCapsule.recoveryId || ''),
+            adoption: cachedAdoption, repairTarget, cachedCandidate: true
+          };
+        }
+        if (disposition === 'cancelled') {
+          await persistTerminalRun(run, 'cancelled', cachedAdoption, cachedAdoption.reason);
+          await releaseLease('cancelled', cachedAdoption.reason);
+          return {
+            ok: false, skipped: true, cancelled: true,
+            reason: cachedAdoption.reason || 'stale_recovery_target_not_active',
+            debtId, runId, adoption: cachedAdoption, repairTarget, cachedCandidate: true
+          };
+        }
+        const cachedError = new Error(cachedAdoption?.reason || 'automatic_repair_cached_adoption_failed');
+        cachedError.adoption = cachedAdoption;
+        throw cachedError;
+      }
+
+      const context = await getCurrentContext();
+      const hayaku = await readHayakuSource(context, { includeRecords: false, ownerGate });
+      const promptSet = bridgeHayakuPromptSet('incremental_recovery', hayaku?.packetAuthoring);
+      const maxPacketChars = effectiveHayakuPacketMaxChars(hayaku);
+      const sourceHash = stableHash64([
+        repairTarget.sourceEvidenceHash,
+        chunk.text,
+        promptSet.contractHash,
+        settings.primary.provider,
+        settings.primary.model
+      ].join('\u0001'));
+      run.sourceHash = sourceHash;
+      await storageSet(runStorageKey, JSON.stringify(run));
+      const packetState = {
+        ordinal: 1,
+        startTurn: chunk.startTurn,
+        endTurn: chunk.endTurn,
+        targetPairIndex: chunk.targetPairIndex,
+        chunkHash: coldStartChunkHash(chunk),
+        status: 'pending',
+        attempts: 0,
+        lastAttemptAt: 0,
+        recoveryMode: '',
+        fallbackReason: '',
+        body: '',
+        packetHash: '',
+        error: ''
+      };
+      const payload = [
+        `[Automatic HAYAKU recovery · T${chunk.startTurn}]`,
+        '[TARGET TURN — write one recovery packet only for this exact evidence]',
+        chunk.text
+      ].join('\n\n');
+      await analyzeBridgeEvidenceChunk({
+        state: packetState,
+        chunk,
+        context: {
+          sourceHash,
+          ordinal: 1,
+          authoringProfile: promptSet.profile,
+          maxPacketChars,
+          repairTarget,
+          automaticRepair: true
+        },
+        profile: 'primary',
+        primaryPrompt: promptSet.primary,
+        repairPrompt: promptSet.repair,
+        payload,
+        normalizePacket: normalizeIncrementalRecoveryPacket,
+        maxTokens: Math.min(
+          Math.max(64, Number(settings.primary.maxTokens || HAYAKU_ANALYSIS_MAX_OUTPUT_TOKENS) || HAYAKU_ANALYSIS_MAX_OUTPUT_TOKENS),
+          HAYAKU_ANALYSIS_MAX_OUTPUT_TOKENS
+        ),
+        temperature: 0.1,
+        checkpoint: async () => {
+          run.attempts = packetState.attempts;
+          run.state = packetState.status;
+          run.body = packetState.body;
+          run.packetHash = packetState.packetHash;
+          run.error = packetState.error;
+          run.updatedAt = Date.now();
+          await storageSet(runStorageKey, JSON.stringify(run));
+        },
+        invalidJsonMessage: 'Automatic HAYAKU recovery response did not contain a JSON object.',
+        onProgress: null,
+        allowSourceFallback: false
+      });
+      const completedAt = Date.now();
+      const recoveryId = `bridge-auto-recovery-${stableHash64(`${runId}|${sourceHash}|${completedAt}`)}`;
+      const capsule = {
+        schema: INCREMENTAL_RECOVERY_SCHEMA,
+        automaticRepair: true,
+        repairMode: 'retrace_auto',
+        recoveryId,
+        runId,
+        scopeKey,
+        sourceHash,
+        coverageHash: sourceHash,
+        packetAuthoring: clone(promptSet.profile, {}),
+        packetAuthoringContractHash: promptSet.contractHash,
+        createdAt: completedAt,
+        sourceMessageCount: 2,
+        completedTurnCount: debt.pairIndex,
+        coveredTurns: [],
+        missingTurns: [debt.pairIndex],
+        replacementRecordIds: [],
+        profile: 'primary',
+        packetCount: 1,
+        packets: [{
+          ordinal: 1,
+          startTurn: debt.pairIndex,
+          endTurn: debt.pairIndex,
+          targetPairIndex: debt.pairIndex,
+          chunkHash: coldStartChunkHash(chunk),
+          packetHash: packetState.packetHash,
+          repairTarget,
+          body: packetState.body
+        }]
+      };
+      if (!await storageSet(capsuleKey, JSON.stringify(capsule))) throw new Error('automatic_repair_capsule_write_failed');
+      const readback = parseJson(await storageGet(capsuleKey), null);
+      const validation = validateBridgeCapsulePacketSet(readback);
+      if (!validation.valid || readback?.recoveryId !== recoveryId) throw new Error('automatic_repair_capsule_readback_failed');
+      const adoption = await requestImmediateHayakuIncrementalRecoveryAdoption(readback);
+      const disposition = automaticRepairAdoptionDisposition(adoption);
+      if (disposition === 'adopted') {
+        run.recoveryId = recoveryId;
+        await persistTerminalRun(run, 'adopted', adoption);
+        await releaseLease('adopted');
+        return { ok: true, debtId, runId, recoveryId, adoption, repairTarget, cachedCandidate: false };
+      }
+      if (disposition === 'suspended') {
+        run.recoveryId = recoveryId;
+        await persistTerminalRun(run, 'suspended', adoption, adoption.reason);
+        await releaseLease('suspended', adoption.reason);
+        return {
+          ok: false, skipped: true, suspended: true,
+          reason: 'recovery_target_worldline_unstable', debtId, runId, recoveryId,
+          adoption, repairTarget, cachedCandidate: false
+        };
+      }
+      if (disposition === 'cancelled') {
+        run.recoveryId = recoveryId;
+        await persistTerminalRun(run, 'cancelled', adoption, adoption.reason);
+        await releaseLease('cancelled', adoption.reason);
+        return {
+          ok: false, skipped: true, cancelled: true,
+          reason: adoption.reason || 'stale_recovery_target_not_active', debtId, runId, recoveryId,
+          adoption, repairTarget, cachedCandidate: false
+        };
+      }
+      const error = new Error(adoption?.reason || 'automatic_repair_adoption_failed');
+      error.adoption = adoption;
+      throw error;
+    } catch (error) {
+      await persistTerminalRun(run, 'failed', error?.adoption || null, error?.message || error);
+      await releaseLease('failed', run.error);
+      throw error;
+    }
+  };
+
+  const runHayakuAutoRepairSweep = async (reason = 'event') => {
+    const state = Runtime.hayakuAutoRepair;
+    if (state.inFlight) return state.lastResult || { ok: false, skipped: true, reason: 'auto_repair_already_running' };
+    const settings = await loadSettings();
+    if (settings.hayakuAutoRepair !== true) return { ok: false, skipped: true, reason: 'auto_repair_disabled' };
+    if (analysisIsRunning()) {
+      scheduleHayakuAutoRepairSweep('manual_analysis_busy', HAYAKU_AUTO_REPAIR_RETRY_MS);
+      return { ok: false, skipped: true, reason: 'analysis_busy' };
+    }
+    state.inFlight = true;
+    state.runs += 1;
+    try {
+      const ownerGate = await ensureHayakuOwnerReady({
+        action: 'HAYAKU 자동 복구',
+        force: true,
+        requireRecoveryDebtContract: true
+      });
+      // The recovery event listener is part of the HAYAKU subsystem, so it is
+      // registered only after an authenticated live owner has passed the gate.
+      await registerHayakuRecoveryEventIpc().catch(error => warn('HAYAKU recovery event registration failed', error));
+      const inspection = await requestHayakuIpc('inspect_recovery_debts', { includeEvidence: false, limit: 1 }, {
+        timeoutMs: 8000,
+        ignoreCooldown: true,
+        suppressCooldown: true,
+        requireAuthenticatedSender: true
+      });
+      const debt = Array.isArray(inspection?.debts) ? inspection.debts[0] : null;
+      if (!debt) {
+        const result = { ok: true, repaired: false, reason: inspection?.reason || 'no_active_packet_debt' };
+        state.lastResult = result;
+        state.lastError = '';
+        return result;
+      }
+      const result = await executeHayakuAutomaticRepairDebt(debt, ownerGate, reason);
+      state.lastResult = result;
+      state.lastError = '';
+      if (result.ok === true) {
+        state.successes += 1;
+        scheduleHayakuAutoRepairSweep('next_debt', 250);
+      }
+      return result;
+    } catch (error) {
+      state.failures += 1;
+      state.lastError = compact(error?.message || error, 320);
+      state.lastResult = { ok: false, reason: text(error?.code || 'auto_repair_failed'), error: state.lastError };
+      if (!['HAYAKU_OWNER_ABSENT', 'HAYAKU_OWNER_INCOMPATIBLE', 'HAYAKU_RECOVERY_DEBT_CONTRACT_UNAVAILABLE'].includes(text(error?.code))) {
+        scheduleHayakuAutoRepairSweep('retry_after_failure', HAYAKU_AUTO_REPAIR_RETRY_MS);
+      }
+      return state.lastResult;
+    } finally {
+      state.inFlight = false;
+      state.runId = '';
+      state.debtId = '';
+    }
+  };
+  const registerHayakuRecoveryEventIpc = async () => {
+    if (Runtime.hayakuRecoveryEventRegistered) return true;
+    const api = liveApi(['addPluginChannelListener']);
+    if (typeof api?.addPluginChannelListener !== 'function') return false;
+    const handler = (message, metadata = {}) => {
+      const event = message && typeof message === 'object' && !Array.isArray(message) ? message : {};
+      if (event.schema !== HAYAKU_RECOVERY_DEBT_EVENT_SCHEMA || event.kind !== 'event') return;
+      if (text(metadata?.sender || '').trim() !== HAYAKU_PLUGIN_ID) return;
+      if (!/^packet_debt_(?:ready|reactivated|retry_scheduled)$/.test(text(event.event || ''))) return;
+      void loadSettings().then(settings => {
+        if (settings.hayakuAutoRepair === true) scheduleHayakuAutoRepairSweep(event.event, 150);
+      }).catch(() => {});
+    };
+    await api.addPluginChannelListener(HAYAKU_RECOVERY_DEBT_EVENT_CHANNEL, handler);
+    Runtime.hayakuRecoveryEventHandler = handler;
+    Runtime.hayakuRecoveryEventRegistered = true;
+    return true;
+  };
+
   const recordRegenerationTurns = (record, completedTurns = Number.MAX_SAFE_INTEGER) => {
     if (!record || isPermanentSessionHistory(record)) return [];
     const packet = parseJson(record.raw, {});
@@ -7756,6 +12201,7 @@
   };
 
   const deleteHayakuRecord = async target => {
+    await ensureHayakuOwnerReady({ action: 'HAYAKU 패킷 삭제', force: true });
     const context = await getCurrentContext();
     const hayaku = await readHayakuSource(context);
     const record = resolveHayakuRecordTarget(hayaku, target);
@@ -7774,28 +12220,12 @@
       reason: 'bridge_packet_viewer_delete',
       intent: 'user_suppressed'
     };
-    let result = null;
-    let transport = 'hayaku_plugin_ipc';
-    try {
-      result = await requestHayakuIpc(
-        'forget',
-        { target: clone(mutationTarget, mutationTarget) },
-        { timeoutMs: 7000 }
-      );
-    } catch (error) {
-      const code = text(error?.code || '').trim();
-      if (!['HAYAKU_IPC_UNAVAILABLE', 'HAYAKU_IPC_TIMEOUT'].includes(code)) throw error;
-      // Legacy/shared-realm hosts may expose HAYAKU directly. API v3 normally
-      // reaches the owner ledger through the authenticated IPC branch above.
-      const runtime = activeHayakuRuntime('forget');
-      if (!runtime) {
-        const unavailable = new Error(`HAYAKU owner-ledger deletion API is unavailable (${code || 'ipc_unavailable'}).`);
-        unavailable.code = code || 'HAYAKU_IPC_UNAVAILABLE';
-        throw unavailable;
-      }
-      transport = 'shared_runtime_fallback';
-      result = await runtime.ledger.forget(clone(mutationTarget, mutationTarget));
-    }
+    const transport = 'hayaku_plugin_ipc';
+    const result = await requestHayakuIpc(
+      'forget',
+      { target: clone(mutationTarget, mutationTarget) },
+      { timeoutMs: 7000, ignoreCooldown: true, requireAuthenticatedSender: true }
+    );
     if (transport === 'hayaku_plugin_ipc'
       && (
         result?.mutation !== 'forget'
@@ -7827,6 +12257,7 @@
   };
 
   const regenerateHayakuRecord = async target => {
+    await ensureHayakuOwnerReady({ action: 'HAYAKU 패킷 재생성', force: true });
     const context = await getCurrentContext();
     const hayaku = await readHayakuSource(context);
     const record = resolveHayakuRecordTarget(hayaku, target);
@@ -8132,6 +12563,57 @@
     const requirement = RETRACE_PEER_REQUIREMENTS[key];
     const timeoutMs = Math.max(700, Math.min(8000, Number(options.timeoutMs || 2400) || 2400));
     const required = options.required === true;
+    if (key === 'hayaku') {
+      const gate = await probeLiveHayakuOwner({
+        force: options.forceProbe === true,
+        timeoutMs
+      });
+      if (gate.ready !== true) {
+        if (gate.state === 'incompatible') {
+          const evaluated = evaluatePeerCompatibility(requirement, gate.capabilities, true, { required });
+          return {
+            ...evaluated,
+            installed: true,
+            ownerReachable: false,
+            transport: 'hayaku_plugin_ipc',
+            status: 'owner_incompatible',
+            blocking: required === true,
+            compatible: false,
+            reason: '활성 HAYAKU owner가 호환 계약을 충족하지 않아 HAYAKU 관련 기능을 실행하지 않습니다.',
+            error: gate.reason || 'hayaku_owner_incompatible'
+          };
+        }
+        return {
+          key: requirement?.key || 'hayaku',
+          label: requirement?.label || 'HAYAKU',
+          pluginId: HAYAKU_PLUGIN_ID,
+          installed: false,
+          required: false,
+          compatible: true,
+          blocking: false,
+          status: 'owner_absent_disabled',
+          pluginVersion: '',
+          protocolMajor: 0,
+          handoffContract: '',
+          errors: [],
+          warnings: [],
+          reason: '활성 HAYAKU owner가 없어 RE:TRACE의 HAYAKU 하위 시스템을 전부 실행하지 않습니다.',
+          sourceDetected: false,
+          ownerReachable: false,
+          transport: 'hayaku_owner_probe',
+          error: gate.reason || 'hayaku_owner_absent'
+        };
+      }
+      const evaluated = evaluatePeerCompatibility(requirement, gate.capabilities, true, { required });
+      return {
+        ...evaluated,
+        installed: true,
+        ownerReachable: true,
+        transport: 'hayaku_plugin_ipc',
+        sourceDetected: false,
+        error: ''
+      };
+    }
     let raw = null;
     let installed = false;
     let transport = 'none';
@@ -8505,6 +12987,7 @@
       && libraReceiptCountMatches(receipt, 'archiveRecordCount', expectedRecords)
       && libraArchiveReceiptMatches(receipt, options)
       && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.libra, { physicalField: 'physicalMemoryCopies' })
+      && memorySuiteStorageReceiptMatches(receipt, 'libra')
       && libraOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
   };
 
@@ -8522,6 +13005,7 @@
       && libraLegacyWorldAdditionalMatches(receipt, options)
       && libraArchiveReceiptMatches(receipt, options)
       && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.libra, { physicalField: 'physicalMemoryCopies' })
+      && memorySuiteStorageReceiptMatches(receipt, 'libra')
       && libraOwnerReceiptMatches(receipt, transport, 'adopt_session_handoff');
   };
 
@@ -8538,6 +13022,7 @@
       && libraLegacyWorldAdditionalMatches(receipt, options)
       && libraArchiveReceiptMatches(receipt, options)
       && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.libra, { physicalField: 'physicalMemoryCopies' })
+      && memorySuiteStorageReceiptMatches(receipt, 'libra')
       && libraOwnerReceiptMatches(receipt, transport, 'verify_session_handoff');
   };
 
@@ -8666,38 +13151,41 @@
   const inspectTransition = async () => {
     const context = await getCurrentContext();
     const pendingHandoff = await inspectPendingNextSessionHandoff({ context });
-    const [flashback, hayaku, pendingColdStart, pendingIncrementalRecovery, libra, gradia] = await Promise.all([
+    const hayakuOwnerGate = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
+    const hayakuDisabled = { available: false, ownerReady: false, reason: 'hayaku_owner_absent', records: [], recordCount: 0, scope: hayakuScopeFor(context) };
+    const noCapsule = { available: false, reason: 'hayaku_owner_absent', packets: [] };
+    const [flashback, hayaku, pendingColdStart, pendingIncrementalRecovery, libra, gradia, memorySuiteServer] = await Promise.all([
       readFlashbackSource(context, { includeRecords: false }),
-      readHayakuSource(context, { includeRecords: false, skipOwnerInspect: true }),
-      readPendingColdStartCapsule(context),
-      readPendingIncrementalRecoveryCapsule(context),
+      hayakuOwnerGate.ready === true ? readHayakuSource(context, { includeRecords: false, ownerGate: hayakuOwnerGate }) : Promise.resolve(hayakuDisabled),
+      hayakuOwnerGate.ready === true ? readPendingColdStartCapsule(context, { ownerGate: hayakuOwnerGate }) : Promise.resolve(noCapsule),
+      hayakuOwnerGate.ready === true ? readPendingIncrementalRecoveryCapsule(context, { ownerGate: hayakuOwnerGate }) : Promise.resolve(noCapsule),
       readLibraSource(context, { includeRecords: false }),
-      readGradiaSource(context, { includePayload: false })
+      readGradiaSource(context, { includePayload: false }),
+      inspectMemorySuitePeerServerData({ hayakuOwnerReady: hayakuOwnerGate.ready === true })
     ]);
-    const baseHayakuRecordCount = hayaku.available
+    const baseHayakuRecordCount = hayakuOwnerGate.ready === true && hayaku.available
       ? Math.max(0, Number(hayaku.recordCount ?? hayaku.records?.length ?? 0) || 0)
-      : Math.max(0, Number(pendingColdStart?.packets?.length || 0) || 0);
-    // Transition inspection is source-read-only. If a verified RE:TRACE recovery
-    // capsule has not yet been materialized into the HAYAKU ledger, account for
-    // its missing recovery entries logically; HAYAKU owner handoff imports the
-    // same capsule into an in-memory source ledger before building the immutable archive.
-    const hayakuRecoveryAccounting = await hayakuIncrementalRecoveryAccounting(
-      hayaku,
-      pendingIncrementalRecovery,
-      { baseRecordCount: baseHayakuRecordCount }
-    );
+      : 0;
+    const hayakuRecoveryAccounting = hayakuOwnerGate.ready === true
+      ? await hayakuIncrementalRecoveryAccounting(hayaku, pendingIncrementalRecovery, { baseRecordCount: baseHayakuRecordCount })
+      : {
+          available: false, logicalRecordCount: 0, localRecordCount: 0, archiveRecordCount: 0,
+          currentSnapshotRecordCount: 0, recoveryRecordCount: 0, missingRecoveryCount: 0,
+          durableVerified: false, reason: 'hayaku_owner_absent'
+        };
     const preview = {
       context,
       identity: contextIdentity(context),
       flashback,
       hayaku,
+      hayakuOwnerGate,
       libra,
       gradia,
       pendingColdStart,
       pendingIncrementalRecovery,
       hayakuRecoveryAccounting,
       pendingHandoff,
-      includeHayaku: hayaku.available === true || pendingColdStart.available === true || pendingIncrementalRecovery.available === true,
+      includeHayaku: hayakuOwnerGate.ready === true && (hayaku.available === true || pendingColdStart.available === true || pendingIncrementalRecovery.available === true),
       includeLibra: libra.available === true,
       includeGradia: gradia.available === true,
       hayakuRecordCount: hayakuRecoveryAccounting.logicalRecordCount,
@@ -8710,14 +13198,21 @@
       gradiaStoryArcCount: gradia.storyArcCount,
       gradiaWriterDesignCount: gradia.writerDesignCount,
       gradiaNarrativeArchiveCount: gradia.narrativeArchiveCount,
+      memorySuiteServer,
+      serverDataDetected: Object.fromEntries(Object.entries(memorySuiteServer?.namespaces || {}).map(([key, value]) => [
+        key,
+        key === 'hayaku' && hayakuOwnerGate.ready !== true
+          ? false
+          : value?.available === true && Number(value?.liveRecords || 0) > 0
+      ])),
       inspectedAt: Date.now()
     };
     Runtime.lastPreview = preview;
     return preview;
   };
-
   const hayakuBackupCatalogKey = scopeKey => `${HAYAKU_BACKUP_CATALOG_PREFIX}${scopeKey}`;
   const listHayakuLedgerBackups = async () => {
+    await ensureHayakuOwnerReady({ action: 'HAYAKU 백업 목록 조회', force: true });
     const context = await getCurrentContext();
     const scope = hayakuScopeFor(context);
     if (!scope.available) return { available: false, reason: scope.reason, scopeKey: '', entries: [] };
@@ -8736,6 +13231,7 @@
   };
 
   const backupHayakuLedger = async () => {
+    await ensureHayakuOwnerReady({ action: 'HAYAKU 원장 백업', force: true });
     const context = await getCurrentContext();
     const hayaku = await readHayakuSource(context, { includeRecords: true });
     const scope = hayaku.scope || hayakuScopeFor(context);
@@ -9907,6 +14403,1159 @@
     confirmLabel: options.confirmLabel || '확인'
   });
 
+  const MEMORY_SUITE_SCOPE_NAMESPACES = Object.freeze(['flashback', 'hayaku', 'libra', 'gradia', 'lia', 'retrace']);
+  const MEMORY_SUITE_SCOPE_READ_MAX_BYTES = 20 * 1024 * 1024;
+  const MEMORY_SUITE_SCOPE_PLAN_TTL_MS = 90 * 1000;
+  const MEMORY_SUITE_SCOPE_STATUS_ORDER = Object.freeze(['active', 'referenced_ancestor', 'orphan_candidate', 'unverified']);
+  const MEMORY_SUITE_SCOPE_STATUS_LABELS = Object.freeze({
+    active: '활성 스코프',
+    referenced_ancestor: '승계 조상',
+    orphan_candidate: '고아 메모리 후보',
+    unverified: '확인 불가'
+  });
+  const MEMORY_SUITE_NAMESPACE_LABELS = Object.freeze({
+    flashback: 'Flashback', hayaku: 'HAYAKU', libra: 'LIBRA', gradia: 'GRADIA', lia: 'LIA', retrace: 'RE:TRACE'
+  });
+  const MEMORY_SUITE_GRADIA_STORE_SPECS = Object.freeze([
+    Object.freeze({ key: 'serial_gradation_agents_for_rp:story_arcs:v2', field: 'arcs', kind: 'Story Arc' }),
+    Object.freeze({ key: 'serial_gradation_agents_for_rp:writer_designs:v1', field: 'designs', kind: 'Writer/OOC' }),
+    Object.freeze({ key: 'serial_gradation_agents_for_rp:arc_cold_start_jobs:v1', field: 'jobs', kind: 'Arc 복구 작업' }),
+    Object.freeze({ key: 'serial_gradation_agents_for_rp:narrative_archives:v1', field: 'scopes', kind: 'Narrative Archive' }),
+    Object.freeze({ key: 'serial_gradation_agents_for_rp:native_chat_copy_registry:v1', field: 'entries', kind: '채팅 복사 기록' }),
+    Object.freeze({ key: 'serial_gradation_agents_for_rp:draft_checkpoints:v1', field: 'checkpoints', kind: '초안 체크포인트' })
+  ]);
+
+  const MEMORY_SUITE_SCOPED_REMOTE_KEY_MARKER = '::memory-suite-scope:v1:';
+  const scopeManagerScopedRemoteKeyInfo = keyValue => {
+    const key = text(keyValue || '');
+    const index = key.lastIndexOf(MEMORY_SUITE_SCOPED_REMOTE_KEY_MARKER);
+    if (index < 0) return { key, logicalKey: key, scopeId: '', scoped: false };
+    let scopeId = '';
+    try { scopeId = decodeURIComponent(key.slice(index + MEMORY_SUITE_SCOPED_REMOTE_KEY_MARKER.length)); } catch (_) {}
+    return { key, logicalKey: key.slice(0, index), scopeId, scoped: !!scopeId };
+  };
+  const scopeManagerRecordsForLogicalKey = (snapshot, space, logicalKey) => snapshot.records.filter(record => {
+    if (record.space !== space) return false;
+    const info = scopeManagerScopedRemoteKeyInfo(record.key);
+    return info.logicalKey === logicalKey;
+  });
+  const MEMORY_SUITE_RETRACE_SCOPE_PREFIXES = Object.freeze([
+    COLD_START_PREFIX,
+    COLD_START_RUN_PREFIX,
+    INCREMENTAL_RECOVERY_PREFIX,
+    INCREMENTAL_RECOVERY_RUN_PREFIX,
+    HAYAKU_BACKUP_PREFIX,
+    HAYAKU_BACKUP_CATALOG_PREFIX
+  ]);
+
+  const scopeManagerObject = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const scopeManagerArray = value => Array.isArray(value) ? value : [];
+  const scopeManagerFirst = (...values) => values.map(value => text(value || '').trim()).find(Boolean) || '';
+  const scopeManagerStoredValue = remote => {
+    const value = remote?.value;
+    if (typeof value !== 'string') return { parsed: value, original: value, stringEncoded: false, ok: value !== undefined };
+    const trimmed = value.trim();
+    if (!trimmed) return { parsed: value, original: value, stringEncoded: false, ok: true };
+    try { return { parsed: JSON.parse(trimmed), original: value, stringEncoded: true, ok: true }; }
+    catch (_) { return { parsed: value, original: value, stringEncoded: false, ok: true }; }
+  };
+  const scopeManagerEncodeLike = (original, value) => typeof original === 'string' ? JSON.stringify(value) : value;
+  const scopeManagerRecordId = (space, key) => `${text(space || 'plugin')}\n${text(key || '')}`;
+  const scopeManagerRecordMap = records => new Map(scopeManagerArray(records).map(record => [scopeManagerRecordId(record.space, record.key), record]));
+  const scopeManagerMember = (record, sharedRecord = false) => ({
+    space: text(record?.space || 'plugin'),
+    key: text(record?.key || ''),
+    sharedRecord: sharedRecord === true,
+    exists: record?.tombstone !== true,
+    tombstone: record?.tombstone === true,
+    revision: Math.max(0, Number(record?.revision || 0) || 0),
+    digest: text(record?.digest || ''),
+    updatedAt: Math.max(0, Number(record?.updatedAt || 0) || 0),
+    valueBytes: Math.max(0, Number(record?.valueBytes || 0) || 0)
+  });
+  const scopeManagerMutationFor = (member, kind = 'remove', value = undefined) => ({
+    kind,
+    space: member.space,
+    key: member.key,
+    expectedRevision: Math.max(0, Number(member.revision || 0) || 0),
+    expectedDigest: text(member.digest || ''),
+    expectedExists: member.exists === true,
+    expectedTombstone: member.tombstone === true,
+    ...(kind === 'set' ? { value } : {})
+  });
+  const scopeManagerUniqueMembers = members => {
+    const out = [];
+    const seen = new Set();
+    for (const member of scopeManagerArray(members)) {
+      const id = scopeManagerRecordId(member?.space, member?.key);
+      if (!member?.key || seen.has(id)) continue;
+      seen.add(id);
+      out.push(member);
+    }
+    return out;
+  };
+  const scopeManagerUniqueLinks = links => {
+    const out = [];
+    const seen = new Set();
+    for (const link of scopeManagerArray(links)) {
+      const targetRef = text(link?.targetRef || '').trim();
+      const kind = text(link?.kind || 'reference').trim() || 'reference';
+      const id = `${targetRef}\n${kind}`;
+      if (!targetRef || seen.has(id)) continue;
+      seen.add(id);
+      out.push({ targetRef, kind });
+    }
+    return out;
+  };
+  const scopeManagerCollectLinks = (value, options = {}) => {
+    const out = [];
+    const seenObjects = new Set();
+    const visit = (node, depth = 0) => {
+      if (depth > 7 || node == null) return;
+      if (typeof node === 'string') return;
+      if (Array.isArray(node)) {
+        for (const item of node.slice(0, 512)) visit(item, depth + 1);
+        return;
+      }
+      if (typeof node !== 'object' || seenObjects.has(node)) return;
+      seenObjects.add(node);
+      for (const [key, raw] of Object.entries(node).slice(0, 600)) {
+        const lower = key.toLowerCase();
+        if (typeof raw === 'string' && raw.trim()) {
+          if (/(?:source|forkedfrom|copiedfrom|predecessor|inheritedfrom).*scope(?:key|id)$/.test(lower)
+            || /^(?:sourcescopekey|forkedfromscopekey|copiedfromscopekey|predecessorscopekey|inheritedfromscopekey)$/.test(lower)) {
+            out.push({ targetRef: raw.trim(), kind: lower.includes('fork') ? 'forked_from' : lower.includes('copy') ? 'copied_from' : lower.includes('inherit') ? 'inherited_from' : 'session_predecessor' });
+          }
+        }
+        visit(raw, depth + 1);
+      }
+    };
+    visit(value, 0);
+    if (options.archiveId) out.push({ targetRef: `archive:${text(options.archiveId).trim()}`, kind: 'archive_reference' });
+    return scopeManagerUniqueLinks(out);
+  };
+  const scopeManagerCollectLocalKeys = (value, prefixes = []) => {
+    const out = new Set();
+    const seenObjects = new Set();
+    const visit = (node, depth = 0) => {
+      if (depth > 8 || node == null) return;
+      if (typeof node === 'string') {
+        for (const prefix of prefixes) if (node.startsWith(prefix)) out.add(node);
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (const item of node.slice(0, 2048)) visit(item, depth + 1);
+        return;
+      }
+      if (typeof node !== 'object' || seenObjects.has(node)) return;
+      seenObjects.add(node);
+      for (const raw of Object.values(node).slice(0, 1200)) visit(raw, depth + 1);
+    };
+    visit(value, 0);
+    return Array.from(out);
+  };
+  const scopeManagerDescriptorFrom = (value, fallback = {}) => {
+    const source = scopeManagerObject(value);
+    const scope = scopeManagerObject(source.scope);
+    const identity = scopeManagerObject(source.identity);
+    const context = scopeManagerObject(source.context);
+    const character = scopeManagerObject(source.character);
+    const chat = scopeManagerObject(source.chat);
+    const characterId = scopeManagerFirst(
+      source.characterId, source.chaId, scope.characterId, identity.characterId, context.characterId,
+      character.id, character._id, character.chaId, fallback.characterId
+    );
+    const chatId = scopeManagerFirst(
+      source.chatId, source.targetChatId, scope.chatId, identity.chatId, context.chatId,
+      chat.id, chat._id, chat.chatId, fallback.chatId
+    );
+    const canonicalCharacterId = scopeManagerFirst(
+      source.canonicalCharacterId, source.chaId, character.chaId,
+      source.characterId, scope.characterId, identity.characterId, context.characterId,
+      character.id, character._id, fallback.characterId
+    );
+    const canonicalChatId = scopeManagerFirst(
+      source.canonicalChatId, chat.id, source.chatId, source.targetChatId,
+      scope.chatId, identity.chatId, context.chatId, chat.chatId, chat._id, fallback.chatId
+    );
+    const canonicalScopeId = scopeManagerFirst(
+      source.canonicalScopeId,
+      canonicalCharacterId && canonicalChatId ? `canonical:char:${canonicalCharacterId}|chat:${canonicalChatId}` : ""
+    );
+    const personaId = scopeManagerFirst(
+      source.personaId, source.livePersonaId, scope.personaId, identity.personaId, context.personaId,
+      fallback.personaId
+    );
+    const scopeKey = scopeManagerFirst(source.scopeKey, scope.scopeKey, identity.scopeKey, fallback.scopeKey);
+    const displayName = scopeManagerFirst(
+      source.displayName, source.chatTitle, source.title, scope.displayName, scope.chatTitle,
+      chat.name, chat.title, fallback.displayName
+    );
+    return { characterId, chatId, canonicalCharacterId, canonicalChatId, canonicalScopeId, personaId, scopeKey, displayName };
+  };
+  const scopeManagerCharacterAliases = character => new Set([
+    character?.chaId, character?.id, character?._id, character?.uid, character?.uuid,
+    character?.key, character?.name
+  ].map(value => text(value || '').trim()).filter(Boolean));
+  const scopeManagerChatAliases = chat => new Set([
+    chat?.id, chat?._id, chat?.uid, chat?.uuid, chat?.key, chat?.chatId,
+    chat?.fileName, chat?.filename
+  ].map(value => text(value || '').trim()).filter(Boolean));
+  const scopeManagerHostInventoryOnce = async () => {
+    const context = await getCurrentContext();
+    let character = context.character;
+    if ((!Array.isArray(character?.chats) || !character.chats.length) && Number.isInteger(Number(context.characterIndex)) && Number(context.characterIndex) >= 0) {
+      const api = liveApi(['getCharacterFromIndex']);
+      if (typeof api?.getCharacterFromIndex === 'function') {
+        try { character = await api.getCharacterFromIndex(Number(context.characterIndex)) || character; } catch (_) {}
+      }
+    }
+    const chats = Array.isArray(character?.chats) ? character.chats : [];
+    const characterAliases = scopeManagerCharacterAliases(character);
+    const chatRows = chats.map((chat, index) => ({
+      index,
+      aliases: Array.from(scopeManagerChatAliases(chat)),
+      chatId: Array.from(scopeManagerChatAliases(chat))[0] || '',
+      title: scopeManagerFirst(chat?.name, chat?.title, chat?.chatName, chat?.filename, `Chat ${index + 1}`)
+    })).filter(row => row.aliases.length);
+    const currentIdentity = contextIdentity({ ...context, character });
+    const fingerprint = stableHash64(JSON.stringify({
+      character: Array.from(characterAliases).sort(),
+      chats: chatRows.map(row => row.aliases.slice().sort()).sort((a, b) => text(a[0]).localeCompare(text(b[0])))
+    }));
+    const currentChatPresent = !!currentIdentity.chatId
+      && chatRows.some(row => scopeManagerArray(row.aliases).includes(currentIdentity.chatId));
+    return {
+      context: { ...context, character },
+      // An empty or partial chat list must never prove that old scopes are orphans.
+      // Require a non-empty authoritative list that also contains the currently
+      // selected chat, then repeat the same inventory once more before classifying.
+      complete: Array.isArray(character?.chats)
+        && chats.length > 0
+        && characterAliases.size > 0
+        && currentChatPresent,
+      observedAt: Date.now(),
+      characterAliases,
+      characterId: currentIdentity.characterId,
+      currentChatId: currentIdentity.chatId,
+      currentPersonaId: currentIdentity.personaId,
+      chatRows,
+      fingerprint
+    };
+  };
+  const scopeManagerStableHostInventory = async () => {
+    try {
+      const first = await scopeManagerHostInventoryOnce();
+      await delay(120);
+      const second = await scopeManagerHostInventoryOnce();
+      const stable = first.complete === true && second.complete === true && first.fingerprint === second.fingerprint;
+      return { ...second, stable, firstObservedAt: first.observedAt, reason: stable ? 'stable_current_character_chat_inventory' : 'host_inventory_changed_or_incomplete' };
+    } catch (error) {
+      return {
+        context: null, complete: false, stable: false, observedAt: Date.now(), firstObservedAt: 0,
+        characterAliases: new Set(), characterId: '', currentChatId: '', currentPersonaId: '', chatRows: [], fingerprint: '',
+        reason: compact(error?.message || error, 240)
+      };
+    }
+  };
+  const scopeManagerClassification = (descriptor, inventory, forced = '') => {
+    if (forced === 'active') return 'active';
+    const characterId = text(descriptor?.characterId || '').trim();
+    const chatId = text(descriptor?.chatId || '').trim();
+    if (!characterId || !chatId || inventory?.stable !== true) return 'unverified';
+    if (!inventory.characterAliases?.has(characterId)) return 'unverified';
+    const chatFound = scopeManagerArray(inventory.chatRows).some(row => scopeManagerArray(row.aliases).includes(chatId));
+    return chatFound ? 'active' : 'orphan_candidate';
+  };
+  const scopeManagerDisplayName = (namespace, descriptor, scopeId) => {
+    const title = text(descriptor?.displayName || '').trim();
+    if (title) return title;
+    const chatId = text(descriptor?.chatId || '').trim();
+    return `${MEMORY_SUITE_NAMESPACE_LABELS[namespace] || namespace} · ${chatId ? compact(chatId, 48) : compact(scopeId, 64)}`;
+  };
+  const scopeManagerPriorMap = catalog => new Map(scopeManagerArray(catalog?.scopes).map(scope => [`${scope.namespace}:${scope.scopeId}`, scope]));
+  const scopeManagerPreviousFor = (priorMap, namespace, scopeId) => priorMap.get(`${namespace}:${scopeId}`) || null;
+  const scopeManagerFinalize = (namespace, raw, inventory, priorMap) => {
+    const prior = scopeManagerPreviousFor(priorMap, namespace, raw.scopeId);
+    const priorDescriptor = scopeManagerObject(prior?.descriptor);
+    const descriptor = {
+      ...priorDescriptor,
+      ...scopeManagerObject(raw.descriptor),
+      characterId: scopeManagerFirst(raw.characterId, raw.descriptor?.characterId, prior?.characterId, priorDescriptor.characterId),
+      chatId: scopeManagerFirst(raw.chatId, raw.descriptor?.chatId, prior?.chatId, priorDescriptor.chatId),
+      personaId: scopeManagerFirst(raw.personaId, raw.descriptor?.personaId, prior?.personaId, priorDescriptor.personaId),
+      scopeKey: scopeManagerFirst(raw.scopeKey, raw.descriptor?.scopeKey, prior?.scopeKey, priorDescriptor.scopeKey),
+      displayName: scopeManagerFirst(raw.displayName, raw.descriptor?.displayName, prior?.displayName, priorDescriptor.displayName),
+      inventoryFingerprint: inventory?.fingerprint || '',
+      inventoryStable: inventory?.stable === true,
+      classificationReason: raw.classificationReason || ''
+    };
+    const members = scopeManagerUniqueMembers(raw.members);
+    const priorLinks = raw.keepPriorLinks === true && raw.coverageComplete !== true
+      ? scopeManagerArray(prior?.links)
+      : [];
+    const links = scopeManagerUniqueLinks([...(raw.links || []), ...priorLinks])
+      .filter(link => link.targetRef !== raw.scopeId && link.targetRef !== descriptor.scopeKey);
+    const baseClassification = scopeManagerClassification(descriptor, inventory, raw.forceClassification || '');
+    return {
+      namespace,
+      scopeId: text(raw.scopeId || '').trim(),
+      scopeKey: descriptor.scopeKey || text(raw.scopeId || '').trim(),
+      kind: text(raw.kind || 'unknown'),
+      characterId: descriptor.characterId,
+      chatId: descriptor.chatId,
+      personaId: descriptor.personaId,
+      displayName: scopeManagerDisplayName(namespace, descriptor, raw.scopeId),
+      baseClassification,
+      coverageComplete: raw.coverageComplete === true,
+      inventoryObservedAt: inventory?.observedAt || Date.now(),
+      descriptor,
+      members,
+      links,
+      _mutations: scopeManagerArray(raw.mutations)
+    };
+  };
+  const scopeManagerNamespaceSnapshot = async namespace => {
+    const [integrity, pluginListing, localListing] = await Promise.all([
+      MemorySuiteStorageBridge.managerServerIntegrity(namespace),
+      MemorySuiteStorageBridge.managerServerKeys(namespace, 'plugin', ''),
+      MemorySuiteStorageBridge.managerServerKeys(namespace, 'local', '')
+    ]);
+    const records = [
+      ...scopeManagerArray(pluginListing?.records),
+      ...scopeManagerArray(localListing?.records)
+    ];
+    const recordMap = scopeManagerRecordMap(records);
+    const cache = new Map();
+    const read = async (space, key) => {
+      const id = scopeManagerRecordId(space, key);
+      if (cache.has(id)) return cache.get(id);
+      const record = recordMap.get(id);
+      if (!record || record.tombstone === true) {
+        const result = { record, remote: null, parsed: null, original: null, ok: false, reason: record?.tombstone ? 'tombstone' : 'record_missing' };
+        cache.set(id, result);
+        return result;
+      }
+      if (Number(record.valueBytes || 0) > MEMORY_SUITE_SCOPE_READ_MAX_BYTES) {
+        const result = { record, remote: null, parsed: null, original: null, ok: false, reason: 'record_too_large_for_safe_scope_index' };
+        cache.set(id, result);
+        return result;
+      }
+      try {
+        const remote = await MemorySuiteStorageBridge.managerServerGet(namespace, space, key);
+        const decoded = scopeManagerStoredValue(remote);
+        const result = { record, remote, ...decoded, reason: decoded.ok ? '' : 'decode_failed' };
+        cache.set(id, result);
+        return result;
+      } catch (error) {
+        const result = { record, remote: null, parsed: null, original: null, ok: false, reason: compact(error?.message || error, 240) };
+        cache.set(id, result);
+        return result;
+      }
+    };
+    return { namespace, integrity, pluginListing, localListing, records, recordMap, read };
+  };
+  const scopeManagerRecordsWithPrefix = (snapshot, space, prefix) => snapshot.records.filter(record => record.space === space && text(record.key).startsWith(prefix));
+  const scopeManagerRecord = (snapshot, space, key) => snapshot.recordMap.get(scopeManagerRecordId(space, key)) || null;
+  // Logical scope deletion keeps server tombstones so a later mirror migration cannot silently resurrect deleted data from stale pluginStorage.
+  const scopeManagerPurgeMutations = members => scopeManagerUniqueMembers(members).filter(member => member.sharedRecord !== true && member.exists === true).map(member => scopeManagerMutationFor(member, 'remove'));
+
+  const scopeManagerScanFlashback = async (snapshot, inventory, priorMap) => {
+    const registryKey = 'vector_rag_memory:scope_registry:v2';
+    const registryRecord = scopeManagerRecord(snapshot, 'plugin', registryKey);
+    const registryLoaded = registryRecord ? await snapshot.read('plugin', registryKey) : null;
+    const registry = scopeManagerObject(registryLoaded?.parsed);
+    const entries = scopeManagerArray(registry.scopes);
+    const scopes = [];
+    const knownHashes = new Set();
+    for (const meta of entries) {
+      const scopeKey = text(meta?.scopeKey || '').trim();
+      if (!scopeKey) continue;
+      const storageHash = text(meta?.storageHash || '').trim();
+      if (storageHash) knownHashes.add(storageHash);
+      const pluginPrefix = storageHash ? `vector_rag_memory:scope:${storageHash}:` : '';
+      const localPrefix = storageHash ? `vector_rag_memory:local-vector-shard:v1:${storageHash}:` : '';
+      const uniqueMembers = [
+        ...(pluginPrefix ? scopeManagerRecordsWithPrefix(snapshot, 'plugin', pluginPrefix).map(record => scopeManagerMember(record, false)) : []),
+        ...(localPrefix ? scopeManagerRecordsWithPrefix(snapshot, 'local', localPrefix).map(record => scopeManagerMember(record, false)) : [])
+      ];
+      const members = [...uniqueMembers];
+      const mutations = scopeManagerPurgeMutations(uniqueMembers);
+      if (registryRecord && registryLoaded?.ok) {
+        const shared = scopeManagerMember(registryRecord, true);
+        members.push(shared);
+        const next = { ...registry, scopes: entries.filter(item => text(item?.scopeKey || '').trim() !== scopeKey), updatedAt: Date.now() };
+        mutations.push(scopeManagerMutationFor(shared, 'set', scopeManagerEncodeLike(registryLoaded.original, next)));
+      }
+      let manifest = null;
+      if (pluginPrefix) {
+        const manifestRecord = snapshot.records.find(record => record.space === 'plugin' && record.key.startsWith(pluginPrefix) && /:manifest:v\d+$/.test(record.key));
+        if (manifestRecord) manifest = (await snapshot.read('plugin', manifestRecord.key)).parsed;
+      }
+      const descriptor = scopeManagerDescriptorFrom(meta, scopeManagerObject(scopeManagerPreviousFor(priorMap, 'flashback', scopeKey)?.descriptor));
+      const links = scopeManagerCollectLinks({ meta, manifest });
+      scopes.push(scopeManagerFinalize('flashback', {
+        scopeId: scopeKey, scopeKey, kind: 'chat_memory', descriptor,
+        displayName: scopeManagerFirst(meta.chatTitle, meta.characterName && meta.chatTitle ? `${meta.characterName} · ${meta.chatTitle}` : '', descriptor.displayName),
+        members, links, mutations,
+        coverageComplete: !!storageHash && (!registryRecord || registryLoaded?.ok === true),
+        keepPriorLinks: true
+      }, inventory, priorMap));
+    }
+    const unknown = new Map();
+    for (const record of snapshot.records) {
+      let match = record.space === 'plugin' ? /^vector_rag_memory:scope:([^:]+):/.exec(record.key) : /^vector_rag_memory:local-vector-shard:v1:([^:]+):/.exec(record.key);
+      if (!match || knownHashes.has(match[1])) continue;
+      const list = unknown.get(match[1]) || [];
+      list.push(scopeManagerMember(record, false));
+      unknown.set(match[1], list);
+    }
+    for (const [storageHash, members] of unknown.entries()) {
+      if (!members.some(member => member.exists === true)) continue;
+      scopes.push(scopeManagerFinalize('flashback', {
+        scopeId: `unregistered:${storageHash}`, scopeKey: '', kind: 'unregistered_storage',
+        descriptor: { displayName: `등록되지 않은 Flashback 저장소 · ${storageHash}` },
+        members, links: [], mutations: scopeManagerPurgeMutations(members), coverageComplete: true
+      }, inventory, priorMap));
+    }
+    return scopes;
+  };
+
+  const scopeManagerScanHayaku = async (snapshot, inventory, priorMap) => {
+    const ledgerRecords = snapshot.records.filter(record => record.space === 'plugin' && record.tombstone !== true && record.key.startsWith(HAYAKU_LEDGER_PREFIX));
+    const scopes = [];
+    let graphComplete = true;
+    for (const record of ledgerRecords) {
+      const scopeKey = record.key.slice(HAYAKU_LEDGER_PREFIX.length);
+      const loaded = await snapshot.read('plugin', record.key);
+      if (!loaded.ok || !scopeManagerObject(loaded.parsed).scopeKey) graphComplete = false;
+      const ledger = scopeManagerObject(loaded.parsed);
+      const prior = scopeManagerPreviousFor(priorMap, 'hayaku', scopeKey);
+      const hayakuCharacterId = scopeManagerText(inventory?.context?.character?.chaId || inventory.characterId || '');
+      const matchedChat = inventory?.stable && hayakuCharacterId
+        ? scopeManagerArray(inventory.chatRows).find(row => scopeManagerArray(row?.aliases).some(chatAlias => (
+            `chat_${stableHash64(`${hayakuCharacterId}\n${scopeManagerText(chatAlias)}`)}` === scopeKey
+          ))) || null
+        : null;
+      const forcedCurrent = !!matchedChat;
+      const descriptor = forcedCurrent
+        ? {
+          characterId: hayakuCharacterId,
+          chatId: scopeManagerText(matchedChat.chatId || ''),
+          personaId: scopeManagerText(matchedChat.personaId || ''),
+          scopeKey,
+          displayName: scopeManagerFirst(matchedChat.title, matchedChat.chatId, prior?.displayName)
+        }
+        : scopeManagerDescriptorFrom(ledger, scopeManagerObject(prior?.descriptor));
+      const archiveId = scopeManagerFirst(ledger?.archiveRef?.archiveId, ledger?.archiveId);
+      const links = scopeManagerCollectLinks(ledger, { archiveId });
+      const member = scopeManagerMember(record, false);
+      scopes.push(scopeManagerFinalize('hayaku', {
+        scopeId: scopeKey, scopeKey, kind: 'packet_ledger', descriptor,
+        members: [member], links, mutations: [scopeManagerMutationFor(member, 'remove')],
+        coverageComplete: loaded.ok === true,
+        forceClassification: forcedCurrent ? 'active' : '', keepPriorLinks: true,
+        classificationReason: forcedCurrent ? 'stable_host_chat_scope_match' : ''
+      }, inventory, priorMap));
+    }
+    if (!graphComplete) for (const scope of scopes) scope.coverageComplete = false;
+    const archives = new Map();
+    for (const record of snapshot.records.filter(item => item.space === 'plugin' && item.tombstone !== true)) {
+      const meta = /^hayaku\.v2\.shared_archive_meta\.(.+)$/.exec(record.key);
+      const body = /^hayaku\.v2\.shared_archive\.(.+)$/.exec(record.key);
+      const match = meta || body;
+      if (!match) continue;
+      const id = match[1];
+      const row = archives.get(id) || [];
+      row.push(scopeManagerMember(record, false));
+      archives.set(id, row);
+    }
+    for (const [archiveId, members] of archives.entries()) {
+      scopes.push(scopeManagerFinalize('hayaku', {
+        scopeId: `archive:${archiveId}`, scopeKey: `archive:${archiveId}`, kind: 'shared_archive',
+        descriptor: { displayName: `HAYAKU 승계 아카이브 · ${archiveId}` },
+        members, links: [], mutations: scopeManagerPurgeMutations(members), coverageComplete: false
+      }, inventory, priorMap));
+    }
+    return scopes;
+  };
+
+  const scopeManagerScanLibra = async (snapshot, inventory, priorMap) => {
+    const registryKey = 'libra:v1:scope-registry:v1';
+    const registryRecord = scopeManagerRecord(snapshot, 'plugin', registryKey);
+    const registryLoaded = registryRecord ? await snapshot.read('plugin', registryKey) : null;
+    const registry = scopeManagerObject(registryLoaded?.parsed);
+    const manifestRecords = snapshot.records.filter(record => record.space === 'plugin' && record.tombstone !== true && /^libra:v1:scope:.+:manifest$/.test(record.key));
+    const scopes = [];
+    const knownScopeKeys = new Set();
+    const associatedLocal = new Set();
+    for (const manifestRecord of manifestRecords) {
+      const match = /^libra:v1:scope:(.+):manifest$/.exec(manifestRecord.key);
+      if (!match) continue;
+      const scopeKey = match[1];
+      knownScopeKeys.add(scopeKey);
+      const prefix = `libra:v1:scope:${scopeKey}:`;
+      const pluginRecords = scopeManagerRecordsWithPrefix(snapshot, 'plugin', prefix);
+      const manifestLoaded = await snapshot.read('plugin', manifestRecord.key);
+      const manifest = scopeManagerObject(manifestLoaded.parsed);
+      const localKeys = new Set();
+      for (const vectorRecord of pluginRecords.filter(record => /(?:^|:)(?:vector|predecessor-vector):/.test(record.key))) {
+        const loaded = await snapshot.read('plugin', vectorRecord.key);
+        if (!loaded.ok) continue;
+        for (const key of scopeManagerCollectLocalKeys(loaded.parsed, ['libra:v1:local-vector:'])) localKeys.add(key);
+      }
+      const localMembers = [];
+      for (const key of localKeys) {
+        const record = scopeManagerRecord(snapshot, 'local', key);
+        if (!record) continue;
+        associatedLocal.add(key);
+        localMembers.push(scopeManagerMember(record, false));
+      }
+      const uniqueMembers = [...pluginRecords.map(record => scopeManagerMember(record, false)), ...localMembers];
+      const members = [...uniqueMembers];
+      const mutations = scopeManagerPurgeMutations(uniqueMembers);
+      if (registryRecord && registryLoaded?.ok) {
+        const shared = scopeManagerMember(registryRecord, true);
+        members.push(shared);
+        const next = { ...registry };
+        for (const [id, entry] of Object.entries(registry)) if (text(entry?.scopeKey || '').trim() === scopeKey) delete next[id];
+        mutations.push(scopeManagerMutationFor(shared, 'set', scopeManagerEncodeLike(registryLoaded.original, next)));
+      }
+      const descriptor = scopeManagerDescriptorFrom(manifest, scopeManagerObject(scopeManagerPreviousFor(priorMap, 'libra', scopeKey)?.descriptor));
+      const links = scopeManagerCollectLinks(manifest, { archiveId: manifest?.archiveRef?.archiveId });
+      scopes.push(scopeManagerFinalize('libra', {
+        scopeId: scopeKey, scopeKey, kind: 'canonical_memory', descriptor,
+        displayName: scopeManagerFirst(manifest.chatTitle, descriptor.displayName),
+        members, links, mutations, coverageComplete: manifestLoaded.ok === true && (!registryRecord || registryLoaded?.ok === true),
+        keepPriorLinks: true
+      }, inventory, priorMap));
+    }
+    const unknownByScope = new Map();
+    for (const record of snapshot.records.filter(item => item.space === 'plugin')) {
+      const match = /^libra:v1:scope:(.+?):(?:manifest|memory:|vector:|work:|run:|predecessor:|predecessor-vector:|recall-catalog:)/.exec(record.key);
+      if (!match || knownScopeKeys.has(match[1])) continue;
+      const members = unknownByScope.get(match[1]) || [];
+      members.push(scopeManagerMember(record, false));
+      unknownByScope.set(match[1], members);
+    }
+    for (const [scopeKey, members] of unknownByScope.entries()) {
+      if (!members.some(member => member.exists === true)) continue;
+      scopes.push(scopeManagerFinalize('libra', {
+        scopeId: scopeKey, scopeKey, kind: 'manifest_missing', descriptor: { displayName: `LIBRA manifest 누락 스코프 · ${scopeKey}` },
+        members, links: [], mutations: scopeManagerPurgeMutations(members), coverageComplete: false
+      }, inventory, priorMap));
+    }
+    const unassignedLocal = snapshot.records.filter(record => record.space === 'local' && record.tombstone !== true && record.key.startsWith('libra:v1:local-vector:') && !associatedLocal.has(record.key));
+    if (unassignedLocal.length) {
+      const members = unassignedLocal.map(record => scopeManagerMember(record, false));
+      scopes.push(scopeManagerFinalize('libra', {
+        scopeId: 'unassigned-local-vectors', kind: 'unassigned_local_vectors', descriptor: { displayName: 'LIBRA 연결 미확인 로컬 벡터' },
+        members, mutations: scopeManagerPurgeMutations(members), links: [], coverageComplete: false
+      }, inventory, priorMap));
+    }
+    const archives = new Map();
+    for (const record of snapshot.records.filter(item => item.space === 'plugin')) {
+      const match = /^libra:v1:shared-archive:([^:]+):/.exec(record.key);
+      if (!match) continue;
+      const rows = archives.get(match[1]) || [];
+      rows.push(scopeManagerMember(record, false));
+      archives.set(match[1], rows);
+    }
+    for (const [archiveId, members] of archives.entries()) {
+      scopes.push(scopeManagerFinalize('libra', {
+        scopeId: `archive:${archiveId}`, kind: 'shared_archive', descriptor: { displayName: `LIBRA 승계 아카이브 · ${archiveId}` },
+        members, mutations: scopeManagerPurgeMutations(members), links: [], coverageComplete: false
+      }, inventory, priorMap));
+    }
+    return scopes;
+  };
+
+  const scopeManagerContainer = (parsed, field) => {
+    const root = scopeManagerObject(parsed);
+    const explicit = root[field];
+    if (explicit && typeof explicit === 'object' && !Array.isArray(explicit)) return explicit;
+    const copy = { ...root };
+    for (const key of ['version', 'savedAt', 'updatedAt', 'schema']) delete copy[key];
+    return copy;
+  };
+  const scopeManagerScanGradia = async (snapshot, inventory, priorMap) => {
+    const aggregates = new Map();
+    let allParsed = true;
+    const ensureAggregate = scopeKey => {
+      const key = text(scopeKey || '').trim();
+      if (!key) return null;
+      const existing = aggregates.get(key);
+      if (existing) return existing;
+      const created = { scopeKey: key, values: [], stores: [], localKeys: new Set(), kinds: new Set(), links: [], parsed: true };
+      aggregates.set(key, created);
+      return created;
+    };
+    for (const spec of MEMORY_SUITE_GRADIA_STORE_SPECS) {
+      const records = scopeManagerRecordsForLogicalKey(snapshot, 'plugin', spec.key)
+        .filter(record => record.tombstone !== true);
+      for (const record of records) {
+        const keyInfo = scopeManagerScopedRemoteKeyInfo(record.key);
+        const loaded = await snapshot.read('plugin', record.key);
+        if (!loaded.ok || typeof loaded.parsed !== 'object') {
+          allParsed = false;
+          if (keyInfo.scopeId) ensureAggregate(keyInfo.scopeId).parsed = false;
+          continue;
+        }
+        const root = scopeManagerObject(loaded.parsed);
+        const container = scopeManagerContainer(root, spec.field);
+        const scopedEntries = keyInfo.scopeId
+          ? [[keyInfo.scopeId, container[keyInfo.scopeId] || Object.values(container)[0]]]
+          : Object.entries(container);
+        for (const [scopeKey, value] of scopedEntries) {
+          if (!scopeKey || !value || typeof value !== 'object') continue;
+          const aggregate = ensureAggregate(scopeKey);
+          aggregate.values.push(value);
+          aggregate.stores.push({ spec, record, loaded, root, container, scopedRecord: keyInfo.scoped });
+          aggregate.kinds.add(spec.kind);
+          aggregate.links.push(...scopeManagerCollectLinks(value, { archiveId: value?.archiveRef?.archiveId }));
+          for (const key of scopeManagerCollectLocalKeys(value, ['gradia.narrative.local_vector.'])) aggregate.localKeys.add(key);
+        }
+      }
+    }
+    const localReferenceCounts = new Map();
+    for (const aggregate of aggregates.values()) {
+      for (const localKey of aggregate.localKeys) localReferenceCounts.set(localKey, Number(localReferenceCounts.get(localKey) || 0) + 1);
+    }
+    const scopes = [];
+    const assignedLocal = new Set();
+    for (const aggregate of aggregates.values()) {
+      const mutations = [];
+      const members = [];
+      const byKey = new Map();
+      for (const store of aggregate.stores) {
+        if (byKey.has(store.record.key)) continue;
+        byKey.set(store.record.key, true);
+        if (store.scopedRecord) {
+          const owned = scopeManagerMember(store.record, false);
+          members.push(owned);
+          mutations.push(scopeManagerMutationFor(owned, 'remove'));
+        } else {
+          const shared = scopeManagerMember(store.record, true);
+          members.push(shared);
+          const nextRoot = clone(store.root, {});
+          const nextContainer = { ...scopeManagerContainer(nextRoot, store.spec.field) };
+          delete nextContainer[aggregate.scopeKey];
+          if (Object.prototype.hasOwnProperty.call(nextRoot, store.spec.field)) nextRoot[store.spec.field] = nextContainer;
+          else {
+            for (const key of Object.keys(nextRoot)) if (!['version', 'savedAt', 'updatedAt', 'schema'].includes(key)) delete nextRoot[key];
+            Object.assign(nextRoot, nextContainer);
+          }
+          nextRoot.savedAt = new Date().toISOString();
+          mutations.push(scopeManagerMutationFor(shared, 'set', scopeManagerEncodeLike(store.loaded.original, nextRoot)));
+        }
+      }
+      for (const localKey of aggregate.localKeys) {
+        const record = scopeManagerRecord(snapshot, 'local', localKey);
+        if (!record) continue;
+        assignedLocal.add(localKey);
+        const sharedVector = Number(localReferenceCounts.get(localKey) || 0) > 1;
+        members.push(scopeManagerMember(record, sharedVector));
+        if (!sharedVector) mutations.push(scopeManagerMutationFor(scopeManagerMember(record, false), 'remove'));
+      }
+      const descriptor = aggregate.values.reduce((current, value) => {
+        const next = scopeManagerDescriptorFrom(value, current);
+        return { ...current, ...Object.fromEntries(Object.entries(next).filter(([, item]) => item)) };
+      }, scopeManagerObject(scopeManagerPreviousFor(priorMap, 'gradia', aggregate.scopeKey)?.descriptor));
+      scopes.push(scopeManagerFinalize('gradia', {
+        scopeId: aggregate.scopeKey, scopeKey: aggregate.scopeKey, kind: Array.from(aggregate.kinds).join(' + ') || 'scope_data', descriptor,
+        members, links: aggregate.links, mutations,
+        coverageComplete: allParsed && aggregate.parsed !== false && aggregate.stores.length > 0,
+        keepPriorLinks: true
+      }, inventory, priorMap));
+    }
+    const unassignedLocal = snapshot.records.filter(record => record.space === 'local' && record.tombstone !== true && record.key.startsWith('gradia.narrative.local_vector.') && !assignedLocal.has(record.key));
+    if (unassignedLocal.length) {
+      const members = unassignedLocal.map(record => scopeManagerMember(record, false));
+      scopes.push(scopeManagerFinalize('gradia', {
+        scopeId: 'unassigned-local-vectors', kind: 'unassigned_local_vectors', descriptor: { displayName: 'GRADIA 연결 미확인 Narrative 벡터' },
+        members, mutations: scopeManagerPurgeMutations(members), links: [], coverageComplete: false
+      }, inventory, priorMap));
+    }
+    const archiveGroups = new Map();
+    for (const record of snapshot.records.filter(item => item.space === 'plugin' && item.tombstone !== true)) {
+      const match = /^serial_gradation_agents_for_rp:narrative_shared_archive:v1:(.+)$/.exec(record.key);
+      if (!match) continue;
+      const rows = archiveGroups.get(match[1]) || [];
+      rows.push(scopeManagerMember(record, false));
+      archiveGroups.set(match[1], rows);
+    }
+    for (const [archiveId, members] of archiveGroups.entries()) {
+      scopes.push(scopeManagerFinalize('gradia', {
+        scopeId: `archive:${archiveId}`, kind: 'shared_archive', descriptor: { displayName: `GRADIA Narrative 승계 아카이브 · ${archiveId}` },
+        members, mutations: scopeManagerPurgeMutations(members), links: [], coverageComplete: false
+      }, inventory, priorMap));
+    }
+    return scopes;
+  };
+
+  const scopeManagerScanLia = async (snapshot, inventory, priorMap) => {
+    const indexKey = 'liaPersonaLinkerLivePersonaIndexV2';
+    const proofKey = 'liaPersonaRequestProofV1';
+    const legacyKey = 'liaPersonaLinkerLivePersonaSyncV1';
+    const indexSources = [];
+    const proofSources = [];
+    const assigned = new Set();
+    const readSources = async (logicalKey, field, target) => {
+      for (const record of scopeManagerRecordsForLogicalKey(snapshot, 'plugin', logicalKey).filter(item => item.tombstone !== true)) {
+        assigned.add(record.key);
+        const loaded = await snapshot.read('plugin', record.key);
+        const info = scopeManagerScopedRemoteKeyInfo(record.key);
+        const parsed = scopeManagerObject(loaded?.parsed);
+        const rows = scopeManagerObject(parsed[field]);
+        target.push({ logicalKey, field, record, loaded, parsed, rows, info });
+      }
+    };
+    await readSources(indexKey, 'entries', indexSources);
+    await readSources(proofKey, 'proofs', proofSources);
+    const legacyRecord = scopeManagerRecord(snapshot, 'plugin', legacyKey);
+    const legacyLoaded = legacyRecord ? await snapshot.read('plugin', legacyKey) : null;
+    const legacyStore = scopeManagerObject(legacyLoaded?.parsed);
+    if (legacyRecord) assigned.add(legacyRecord.key);
+
+    const scopeIds = new Set();
+    for (const source of [...indexSources, ...proofSources]) {
+      if (source.info.scopeId) scopeIds.add(source.info.scopeId);
+      for (const scopeId of Object.keys(source.rows)) if (scopeId) scopeIds.add(scopeId);
+    }
+    const shardRecords = snapshot.records.filter(record => record.space === 'plugin' && record.tombstone !== true && record.key.startsWith('liaPersonaLinkerLivePersonaScopeV2::'));
+    const shardByScope = new Map();
+    for (const record of shardRecords) {
+      const loaded = await snapshot.read('plugin', record.key);
+      const binding = scopeManagerObject(loaded?.parsed);
+      const scopeId = scopeManagerFirst(binding.scopeKey, binding.scopeId);
+      if (!scopeId) continue;
+      assigned.add(record.key);
+      scopeIds.add(scopeId);
+      shardByScope.set(scopeId, { record, loaded, binding });
+    }
+
+    const sourceContainsScope = (source, scopeId) => source.info.scopeId === scopeId || Object.prototype.hasOwnProperty.call(source.rows, scopeId);
+    const scopedRow = (sources, scopeId) => {
+      const candidates = sources.filter(source => sourceContainsScope(source, scopeId));
+      candidates.sort((a, b) => Number(b.record?.updatedAt || 0) - Number(a.record?.updatedAt || 0));
+      const source = candidates[0] || null;
+      return { source, row: source ? (source.rows[scopeId] || Object.values(source.rows)[0] || null) : null, candidates };
+    };
+    const mutationsForSources = (sources, scopeId) => {
+      const out = [];
+      const members = [];
+      for (const source of sources.filter(item => sourceContainsScope(item, scopeId))) {
+        if (!source.loaded?.ok) continue;
+        if (source.info.scoped) {
+          const owned = scopeManagerMember(source.record, false);
+          members.push(owned); out.push(scopeManagerMutationFor(owned, 'remove'));
+        } else {
+          const shared = scopeManagerMember(source.record, true);
+          members.push(shared);
+          const next = clone(source.parsed, {});
+          next[source.field] = { ...scopeManagerObject(next[source.field]) };
+          delete next[source.field][scopeId];
+          next.updatedAt = new Date().toISOString();
+          out.push(scopeManagerMutationFor(shared, 'set', scopeManagerEncodeLike(source.loaded.original, next)));
+        }
+      }
+      return { members, mutations: out };
+    };
+
+    const scopes = [];
+    for (const scopeKey of scopeIds) {
+      const indexMatch = scopedRow(indexSources, scopeKey);
+      const proofMatch = scopedRow(proofSources, scopeKey);
+      const meta = scopeManagerObject(indexMatch.row);
+      let shard = shardByScope.get(scopeKey) || null;
+      const storageKey = scopeManagerFirst(meta.storageKey, shard?.record?.key);
+      if (!shard && storageKey) {
+        const shardRecord = scopeManagerRecord(snapshot, 'plugin', storageKey);
+        if (shardRecord) {
+          const shardLoaded = await snapshot.read('plugin', storageKey);
+          shard = { record: shardRecord, loaded: shardLoaded, binding: scopeManagerObject(shardLoaded?.parsed) };
+          assigned.add(storageKey);
+        }
+      }
+      const binding = scopeManagerObject(shard?.binding);
+      const members = [];
+      const mutations = [];
+      if (shard?.record) {
+        const owned = scopeManagerMember(shard.record, false);
+        members.push(owned); mutations.push(scopeManagerMutationFor(owned, 'remove'));
+      }
+      for (const collection of [mutationsForSources(indexSources, scopeKey), mutationsForSources(proofSources, scopeKey)]) {
+        members.push(...collection.members); mutations.push(...collection.mutations);
+      }
+      if (legacyRecord && legacyLoaded?.ok && scopeManagerObject(legacyStore.bindings)[scopeKey]) {
+        const shared = scopeManagerMember(legacyRecord, true);
+        const next = clone(legacyStore, {});
+        next.bindings = { ...scopeManagerObject(next.bindings) };
+        delete next.bindings[scopeKey];
+        next.updatedAt = new Date().toISOString();
+        members.push(shared);
+        mutations.push(scopeManagerMutationFor(shared, 'set', scopeManagerEncodeLike(legacyLoaded.original, next)));
+      }
+      const descriptor = scopeManagerDescriptorFrom(binding, scopeManagerObject(scopeManagerPreviousFor(priorMap, 'lia', scopeKey)?.descriptor));
+      const links = scopeManagerCollectLinks(binding);
+      const indexParsed = indexMatch.candidates.every(source => source.loaded?.ok === true);
+      const proofParsed = proofMatch.candidates.every(source => source.loaded?.ok === true);
+      scopes.push(scopeManagerFinalize('lia', {
+        scopeId: scopeKey, scopeKey, kind: 'live_persona', descriptor,
+        displayName: scopeManagerFirst(binding.livePersonaName, binding.sourcePersonaName, descriptor.displayName),
+        members, links, mutations,
+        coverageComplete: !!shard?.record && shard?.loaded?.ok === true && indexParsed && proofParsed,
+        keepPriorLinks: true
+      }, inventory, priorMap));
+    }
+    const globalRecords = snapshot.records.filter(record => record.space === 'plugin' && record.tombstone !== true
+      && !assigned.has(record.key) && !record.key.startsWith('__memory_suite_'));
+    if (globalRecords.length) {
+      const members = globalRecords.map(record => scopeManagerMember(record, false));
+      scopes.push(scopeManagerFinalize('lia', {
+        scopeId: 'global-data', kind: 'global_vault_and_assets', descriptor: { displayName: 'LIA 전역 보관함·블루프린트·에셋' },
+        members, mutations: scopeManagerPurgeMutations(members), links: [], coverageComplete: false
+      }, inventory, priorMap));
+    }
+    return scopes;
+  };
+
+  const scopeManagerScanRetrace = async (snapshot, inventory, priorMap) => {
+    const groups = new Map();
+    for (const record of snapshot.records.filter(item => item.space === 'plugin' && item.tombstone !== true)) {
+      const prefix = MEMORY_SUITE_RETRACE_SCOPE_PREFIXES.find(item => record.key.startsWith(item));
+      if (!prefix) continue;
+      const scopeKey = record.key.slice(prefix.length);
+      if (!scopeKey) continue;
+      const group = groups.get(scopeKey) || { members: [], values: [], links: [], parsed: true };
+      const member = scopeManagerMember(record, false);
+      group.members.push(member);
+      const loaded = await snapshot.read('plugin', record.key);
+      if (loaded.ok) {
+        group.values.push(loaded.parsed);
+        group.links.push(...scopeManagerCollectLinks(loaded.parsed));
+      } else group.parsed = false;
+      groups.set(scopeKey, group);
+    }
+    const scopes = [];
+    const retraceCharacterId = scopeManagerText(inventory?.context?.character?.chaId || inventory.characterId || '');
+    for (const [scopeKey, group] of groups.entries()) {
+      const matchedChat = inventory?.stable && retraceCharacterId
+        ? scopeManagerArray(inventory.chatRows).find(row => scopeManagerArray(row?.aliases).some(chatAlias => (
+            `chat_${stableHash64(`${retraceCharacterId}\n${scopeManagerText(chatAlias)}`)}` === scopeKey
+          ))) || null
+        : null;
+      const forcedCurrent = !!matchedChat;
+      const descriptor = forcedCurrent
+        ? {
+          characterId: retraceCharacterId,
+          chatId: scopeManagerText(matchedChat.chatId || ''),
+          personaId: scopeManagerText(matchedChat.personaId || ''),
+          scopeKey,
+          displayName: scopeManagerFirst(matchedChat.title, matchedChat.chatId)
+        }
+        : group.values.reduce((current, value) => {
+          const next = scopeManagerDescriptorFrom(value, current);
+          return { ...current, ...Object.fromEntries(Object.entries(next).filter(([, item]) => item)) };
+        }, scopeManagerObject(scopeManagerPreviousFor(priorMap, 'retrace', scopeKey)?.descriptor));
+      scopes.push(scopeManagerFinalize('retrace', {
+        scopeId: scopeKey, scopeKey, kind: 'analysis_recovery', descriptor,
+        members: group.members, links: group.links, mutations: scopeManagerPurgeMutations(group.members),
+        coverageComplete: group.parsed, forceClassification: forcedCurrent ? 'active' : '', keepPriorLinks: true,
+        classificationReason: forcedCurrent ? 'stable_host_chat_scope_match' : ''
+      }, inventory, priorMap));
+    }
+    return scopes;
+  };
+
+  const scopeManagerScanNamespace = async (namespace, snapshot, inventory, priorMap) => {
+    if (namespace === 'flashback') return await scopeManagerScanFlashback(snapshot, inventory, priorMap);
+    if (namespace === 'hayaku') return await scopeManagerScanHayaku(snapshot, inventory, priorMap);
+    if (namespace === 'libra') return await scopeManagerScanLibra(snapshot, inventory, priorMap);
+    if (namespace === 'gradia') return await scopeManagerScanGradia(snapshot, inventory, priorMap);
+    if (namespace === 'lia') return await scopeManagerScanLia(snapshot, inventory, priorMap);
+    if (namespace === 'retrace') return await scopeManagerScanRetrace(snapshot, inventory, priorMap);
+    return [];
+  };
+
+  const scopeManagerRecipeKey = (namespace, scopeId) => `${namespace}\n${scopeId}`;
+  const refreshServerScopeManagement = async () => {
+    if (Runtime.serverScopeManagerLoading) return Runtime.serverScopeCatalog;
+    Runtime.serverScopeManagerLoading = true;
+    Runtime.serverScopeManagerError = '';
+    const body = Runtime.root?.querySelector?.('#serverDataBody');
+    if (body) body.innerHTML = '<div class="empty"><strong>서버 스코프 검사 중</strong><span>6개 namespace와 현재 RisuAI 채팅 목록을 비교하고 있습니다.</span></div>';
+    try {
+      const inventory = await scopeManagerStableHostInventory();
+      const priorCatalog = await MemorySuiteStorageBridge.managerListScopes().catch(() => ({ scopes: [] }));
+      const priorMap = scopeManagerPriorMap(priorCatalog);
+      const recipes = new Map();
+      const scanErrors = {};
+      const hayakuOwnerGate = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
+      for (const namespace of MEMORY_SUITE_SCOPE_NAMESPACES) {
+        try {
+          if (namespace === 'hayaku' && hayakuOwnerGate.ready !== true) {
+            scanErrors.hayaku = '활성 HAYAKU owner 없음 · namespace 검사 생략';
+            continue;
+          }
+          const snapshot = await scopeManagerNamespaceSnapshot(namespace);
+          const scopes = await scopeManagerScanNamespace(namespace, snapshot, inventory, priorMap);
+          for (const scope of scopes) recipes.set(scopeManagerRecipeKey(namespace, scope.scopeId), scope._mutations || []);
+          await MemorySuiteStorageBridge.managerReplaceScopeIndex(namespace, scopes.map(({ _mutations, ...scope }) => scope));
+        } catch (error) {
+          scanErrors[namespace] = compact(error?.message || error, 360);
+          warn(`서버 스코프 색인 실패: ${namespace}`, error);
+        }
+      }
+      const catalog = await MemorySuiteStorageBridge.managerListScopes();
+      Runtime.serverScopeCatalog = {
+        ...catalog,
+        at: Date.now(),
+        hostInventory: {
+          stable: inventory.stable === true,
+          complete: inventory.complete === true,
+          fingerprint: inventory.fingerprint,
+          observedAt: inventory.observedAt,
+          reason: inventory.reason,
+          characterId: inventory.characterId,
+          currentChatId: inventory.currentChatId,
+          chatCount: inventory.chatRows.length
+        },
+        scanErrors
+      };
+      Runtime.serverScopeRecipes = recipes;
+      Runtime.serverScopePlans = new Map();
+      renderServerScopeManagement();
+      return Runtime.serverScopeCatalog;
+    } catch (error) {
+      Runtime.serverScopeManagerError = compact(error?.message || error, 500);
+      renderServerScopeManagement();
+      throw error;
+    } finally {
+      Runtime.serverScopeManagerLoading = false;
+    }
+  };
+
+  const scopeManagerFormatBytes = bytes => {
+    const value = Math.max(0, Number(bytes || 0) || 0);
+    if (value < 1024) return `${formatNumber(value)} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+    if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  };
+  const scopeManagerFormatTime = value => {
+    const number = Number(value || 0) || 0;
+    if (!number) return '-';
+    try { return new Date(number).toLocaleString('ko-KR'); } catch (_) { return String(number); }
+  };
+  const scopeManagerDeleteBlockedReason = scope => {
+    if (scope?.pinned === true) return '사용자가 보존 상태로 고정한 스코프입니다.';
+    if (Number(scope?.referenceCount || 0) > 0 || scope.classification === 'referenced_ancestor') {
+      return `다른 스코프 ${formatNumber(scope.referenceCount || 0)}개가 참조 중입니다.`;
+    }
+    if (scope.classification === 'unverified') return 'RisuAI 채팅 존재 여부를 안전하게 확정할 수 없습니다.';
+    if (scope.coverageComplete !== true) return '스코프의 전체 키·참조 관계를 완전히 확인하지 못했습니다.';
+    if (!Runtime.serverScopeRecipes?.has(scopeManagerRecipeKey(scope.namespace, scope.scopeId))) return '현재 새로고침에서 안전한 삭제 계획을 만들지 못했습니다.';
+    return '';
+  };
+  const renderServerScopeManagement = () => {
+    const body = Runtime.root?.querySelector?.('#serverDataBody');
+    if (!body) return;
+    if (Runtime.serverScopeManagerLoading) {
+      body.innerHTML = '<div class="empty"><strong>서버 스코프 검사 중</strong><span>데이터를 변경하지 않고 읽기 전용 검사 중입니다.</span></div>';
+      return;
+    }
+    if (Runtime.serverScopeManagerError) {
+      body.innerHTML = `<div class="empty error"><strong>서버 데이터 관리 실패</strong><span>${escapeHtml(Runtime.serverScopeManagerError)}</span></div>`;
+      return;
+    }
+    const catalog = Runtime.serverScopeCatalog;
+    if (!catalog) {
+      body.innerHTML = '<div class="empty"><strong>서버 데이터 조회 대기</strong><span>새로고침을 누르면 스코프별 서버 데이터를 검사합니다.</span></div>';
+      return;
+    }
+    const inventory = catalog.hostInventory || {};
+    const errors = Object.entries(catalog.scanErrors || {});
+    const scopes = scopeManagerArray(catalog.scopes);
+    const groups = MEMORY_SUITE_SCOPE_STATUS_ORDER.map(status => ({ status, rows: scopes.filter(scope => scope.classification === status) }));
+    const inventoryHtml = `<div class="server-data-summary ${inventory.stable ? 'ok' : 'warn'}"><div><strong>${inventory.stable ? '채팅 목록 안정 확인' : '채팅 목록 확인 불완전'}</strong><span>${inventory.stable ? `현재 캐릭터의 채팅 ${formatNumber(inventory.chatCount || 0)}개와 비교했습니다.` : '고아 판정과 삭제가 보수적으로 차단됩니다.'}</span></div><em>${scopeManagerFormatTime(catalog.at)}</em></div>`;
+    const errorHtml = errors.length ? `<div class="server-data-scan-errors"><strong>색인 보류</strong>${errors.map(([namespace, reason]) => `<span>${escapeHtml(MEMORY_SUITE_NAMESPACE_LABELS[namespace] || namespace)}: ${escapeHtml(reason)}</span>`).join('')}</div>` : '';
+    const groupHtml = groups.map(group => {
+      if (!group.rows.length) return '';
+      return `<section class="server-scope-group" data-scope-status="${group.status}"><div class="server-scope-group-head"><div><h3>${escapeHtml(MEMORY_SUITE_SCOPE_STATUS_LABELS[group.status])}</h3><p>${group.status === 'orphan_candidate' ? '원본 채팅은 발견되지 않았지만 서버 데이터는 보존되어 있습니다.' : group.status === 'referenced_ancestor' ? '다른 세션이 이 스코프를 승계 조상으로 참조합니다.' : group.status === 'unverified' ? '자동 판단에 필요한 안정적인 채팅·참조 정보가 부족합니다.' : 'RisuAI에 원본 채팅이 존재합니다.'}</p></div><em>${formatNumber(group.rows.length)}</em></div>${group.rows.map((scope, index) => {
+        const blocked = scopeManagerDeleteBlockedReason(scope);
+        const plan = Runtime.serverScopePlans?.get(scopeManagerRecipeKey(scope.namespace, scope.scopeId));
+        const refs = scopeManagerArray(scope.inboundReferences);
+        const statusClass = scope.classification.replace(/_/g, '-');
+        return `<article class="server-scope-card ${statusClass}"><div class="server-scope-main"><div class="server-scope-title"><span class="server-plugin-badge ${escapeHtml(scope.namespace)}">${escapeHtml(MEMORY_SUITE_NAMESPACE_LABELS[scope.namespace] || scope.namespace)}</span><div><strong>${escapeHtml(scope.displayName || scope.scopeId)}</strong><small>${escapeHtml(scope.kind || 'unknown')} · ${escapeHtml(compact(scope.scopeKey || scope.scopeId, 110))}</small></div></div><div class="server-scope-stats"><span>레코드 <b>${formatNumber(scope.liveRecords || 0)}</b></span><span>tombstone <b>${formatNumber(scope.tombstones || 0)}</b></span><span>크기 <b>${scopeManagerFormatBytes(scope.bytes || 0)}</b></span><span>마지막 저장 <b>${scopeManagerFormatTime(scope.latestStoredAt)}</b></span></div>${refs.length ? `<div class="server-scope-refs"><strong>참조 중</strong>${refs.slice(0, 8).map(ref => `<span>${escapeHtml(ref.sourceDisplayName || ref.sourceScopeId)} · ${escapeHtml(ref.kind || 'reference')}</span>`).join('')}</div>` : ''}${blocked ? `<div class="server-scope-blocked">${escapeHtml(blocked)}</div>` : plan ? `<div class="server-scope-ready">서버 백업과 삭제 조건 검증 완료 · 다시 눌러 실제 삭제</div>` : ''}</div><div class="server-scope-actions"><button class="btn" data-server-scope-detail="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}">내용 확인</button><button class="btn" data-server-scope-pin="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}">${scope.pinned === true ? '보존 해제' : '보존'}</button><button class="btn danger" data-server-scope-delete="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}" ${blocked ? 'disabled' : ''}>${plan ? '검증 완료 · 삭제 실행' : '서버 스코프 삭제'}</button></div></article>`;
+      }).join('')}</section>`;
+    }).join('');
+    body.innerHTML = `${inventoryHtml}${errorHtml}${groupHtml || '<div class="empty"><strong>서버 스코프 없음</strong><span>서버에 관리할 스코프별 데이터가 없습니다.</span></div>'}`;
+  };
+
+  const scopeManagerFindCatalogScope = (namespace, scopeId) => scopeManagerArray(Runtime.serverScopeCatalog?.scopes)
+    .find(scope => scope.namespace === namespace && scope.scopeId === scopeId) || null;
+  const scopeManagerTogglePinned = async scope => {
+    const result = await MemorySuiteStorageBridge.managerSetScopePinned(scope.namespace, scope.scopeId, scope.pinned !== true);
+    Runtime.serverScopePlans?.delete(scopeManagerRecipeKey(scope.namespace, scope.scopeId));
+    const catalog = await MemorySuiteStorageBridge.managerListScopes();
+    Runtime.serverScopeCatalog = { ...(Runtime.serverScopeCatalog || {}), ...catalog, at: Date.now() };
+    renderServerScopeManagement();
+    return result;
+  };
+  const scopeManagerOwnerProof = async scope => {
+    const pluginKeys = scopeManagerArray(scope.members).filter(member => member.space === 'plugin').map(member => member.key);
+    const localKeys = scopeManagerArray(scope.members).filter(member => member.space === 'local').map(member => member.key);
+    const payload = { scopeId: scope.scopeId, scopeKey: scope.scopeKey, pluginKeys, localKeys };
+    const options = { timeoutMs: 120000 };
+    let receipt;
+    if (scope.namespace === 'flashback') receipt = await requestFlashbackIpc('memory_suite_prepare_server_scope_delete', payload, options);
+    else if (scope.namespace === 'hayaku') {
+      await ensureHayakuOwnerReady({ action: 'HAYAKU 서버 스코프 삭제 증명', force: true });
+      receipt = await requestHayakuIpc('memory_suite_prepare_server_scope_delete', payload, { ...options, requireAuthenticatedSender: true });
+    }
+    else if (scope.namespace === 'libra') receipt = await requestLibraIpc('memory_suite_prepare_server_scope_delete', payload, options);
+    else if (scope.namespace === 'gradia') receipt = await requestGradiaIpc('memory_suite_prepare_server_scope_delete', payload, options);
+    else if (scope.namespace === 'lia') receipt = await requestLiaIpc('memory_suite_prepare_server_scope_delete', payload, options);
+    else if (scope.namespace === 'retrace') receipt = await MemorySuiteStorageBridge.prepareServerScopeDeletion(payload);
+    else throw new Error(`지원하지 않는 owner namespace입니다: ${scope.namespace}`);
+    if (receipt?.schema !== 'memory-suite.server-scope-delete-owner-receipt.v1'
+      || receipt?.verified !== true
+      || text(receipt.modeAfter || '') !== 'plugin_only'
+      || text(receipt.namespace || '') !== scope.namespace) {
+      const error = new Error(`owner pluginStorage 보존 증명이 유효하지 않습니다: ${scope.namespace}`);
+      error.receipt = receipt;
+      throw error;
+    }
+    return receipt;
+  };
+  const scopeManagerCreatePlan = async scope => {
+    const namespace = scope.namespace;
+    const scopeId = scope.scopeId;
+    const recipeKey = scopeManagerRecipeKey(namespace, scopeId);
+    // Owner proof may repair mirror drift or restore server-only records, which can
+    // legitimately advance server revisions. Re-index after that proof so the
+    // conditional deletion plan is built from the exact post-proof revision/digest set.
+    const modeProof = await scopeManagerOwnerProof(scope);
+    await refreshServerScopeManagement();
+    const refreshedScope = scopeManagerFindCatalogScope(namespace, scopeId);
+    if (!refreshedScope) throw new Error('owner 보존 검증 후 서버 스코프를 다시 찾을 수 없습니다.');
+    const blocked = scopeManagerDeleteBlockedReason(refreshedScope);
+    if (blocked) throw new Error(`owner 보존 검증 후 삭제 조건이 바뀌었습니다: ${blocked}`);
+    const mutations = Runtime.serverScopeRecipes?.get(recipeKey);
+    if (!Array.isArray(mutations) || !mutations.length) throw new Error('owner 보존 검증 후 삭제 mutation을 다시 만들 수 없습니다.');
+    const inventory = Runtime.serverScopeCatalog?.hostInventory || {};
+    const inventoryProof = {
+      hostInventoryStable: inventory.stable === true,
+      complete: inventory.complete === true,
+      fingerprint: text(inventory.fingerprint || ''),
+      observedAt: Number(inventory.observedAt || 0),
+      characterId: text(inventory.characterId || ''),
+      currentChatId: text(inventory.currentChatId || '')
+    };
+    const plan = await MemorySuiteStorageBridge.managerPlanScopeDeletion({
+      namespace,
+      scopeId,
+      modeProof,
+      inventoryProof,
+      mutations,
+      metadata: { requestedBy: PLUGIN_NAME, requestedAt: Date.now(), classification: refreshedScope.classification }
+    });
+    if (!plan?.planId || !plan?.mutationFingerprint || plan?.conditionsVerified !== true) throw new Error('서버가 유효한 삭제 계획을 반환하지 않았습니다.');
+    Runtime.serverScopePlans.set(recipeKey, { ...plan, scopeSnapshot: clone(refreshedScope, {}), preparedAt: Date.now() });
+    renderServerScopeManagement();
+    return plan;
+  };
+  const scopeManagerExecutePlan = async scope => {
+    const recipeKey = scopeManagerRecipeKey(scope.namespace, scope.scopeId);
+    const plan = Runtime.serverScopePlans?.get(recipeKey);
+    if (!plan || Date.now() - Number(plan.preparedAt || 0) > MEMORY_SUITE_SCOPE_PLAN_TTL_MS) {
+      Runtime.serverScopePlans?.delete(recipeKey);
+      renderServerScopeManagement();
+      throw new Error('삭제 계획이 만료되었습니다. 다시 검증하세요.');
+    }
+    // Verify the owner is still in plugin_only immediately before the destructive
+    // commit. If the user changed modes after plan creation, this re-proof either
+    // restores safety or advances revisions, in which case the server's conditional
+    // batch rejects the now-stale plan instead of deleting against old state.
+    await scopeManagerOwnerProof(plan.scopeSnapshot || scope);
+    const receipt = await MemorySuiteStorageBridge.managerExecuteScopeDeletion(plan.planId, plan.mutationFingerprint);
+    Runtime.serverScopePlans.delete(recipeKey);
+    return receipt;
+  };
+  const scopeManagerShowDetail = async scope => {
+    const members = scopeManagerArray(scope.members).map(member => `${member.space} · ${member.tombstone ? '[tombstone] ' : ''}${member.key} · rev ${member.revision}`).join('\n');
+    const refs = scopeManagerArray(scope.inboundReferences).map(ref => `${ref.sourceNamespace}/${ref.sourceDisplayName || ref.sourceScopeId} → ${ref.kind}`).join('\n');
+    await retraceAlert([
+      `${MEMORY_SUITE_NAMESPACE_LABELS[scope.namespace] || scope.namespace} · ${scope.displayName || scope.scopeId}`,
+      `상태: ${MEMORY_SUITE_SCOPE_STATUS_LABELS[scope.classification] || scope.classification}`,
+      `scope: ${scope.scopeKey || scope.scopeId}`,
+      `characterId: ${scope.characterId || '(확인 불가)'}`,
+      `chatId: ${scope.chatId || '(확인 불가)'}`,
+      `레코드: ${scope.liveRecords || 0} / tombstone: ${scope.tombstones || 0}`,
+      '',
+      refs ? `[이 스코프를 참조하는 자료]\n${refs}\n` : '',
+      `[서버 키]\n${members || '(없음)'}`
+    ].filter(Boolean).join('\n'));
+  };
+  const handleServerScopeManagementClick = async event => {
+    const detail = event.target?.closest?.('[data-server-scope-detail]');
+    const pin = event.target?.closest?.('[data-server-scope-pin]');
+    const deletion = event.target?.closest?.('[data-server-scope-delete]');
+    const target = detail || pin || deletion;
+    if (!target || target.disabled || Runtime.busy) return;
+    const attribute = detail ? 'data-server-scope-detail' : pin ? 'data-server-scope-pin' : 'data-server-scope-delete';
+    const raw = text(target.getAttribute(attribute) || '');
+    const separator = raw.indexOf('|');
+    if (separator < 1) return;
+    const namespace = raw.slice(0, separator);
+    const scopeId = raw.slice(separator + 1);
+    const scope = scopeManagerFindCatalogScope(namespace, scopeId);
+    if (!scope) return;
+    if (detail) return await scopeManagerShowDetail(scope);
+    if (pin) {
+      setBusy(true);
+      try {
+        const result = await scopeManagerTogglePinned(scope);
+        await retraceAlert(result?.pinned === true ? '이 서버 스코프를 보존 상태로 고정했습니다.' : '서버 스코프의 보존 상태를 해제했습니다.');
+      } finally { setBusy(false); }
+      return;
+    }
+    const blocked = scopeManagerDeleteBlockedReason(scope);
+    if (blocked) return await retraceAlert(`서버 스코프를 삭제할 수 없습니다.\n${blocked}`);
+    const recipeKey = scopeManagerRecipeKey(namespace, scopeId);
+    const existingPlan = Runtime.serverScopePlans?.get(recipeKey);
+    if (!existingPlan) {
+      const message = scope.classification === 'orphan_candidate'
+        ? `원본 RisuAI 채팅을 찾을 수 없는 고아 메모리 후보입니다.\n\n${MEMORY_SUITE_NAMESPACE_LABELS[namespace] || namespace} owner가 서버 자료를 pluginStorage/로컬 저장소에 복원·검증하고 플러그인 단독 모드로 전환합니다. 그 뒤 서버는 참조 관계를 다시 검사하고 삭제 직전 namespace DB 백업을 만듭니다. 아직 실제 삭제는 하지 않습니다. 검증을 시작할까요?`
+        : `활성 채팅의 서버 데이터를 삭제하려면 ${MEMORY_SUITE_NAMESPACE_LABELS[namespace] || namespace} owner가 해당 데이터를 pluginStorage/로컬 저장소에 복원하고 검증한 뒤 플러그인 단독 모드로 전환해야 합니다.\n\n검증을 시작할까요?`;
+      if (!(await retraceConfirm(message, { title: '서버 스코프 삭제 검증', confirmLabel: '검증 시작', danger: true }))) return;
+      setBusy(true);
+      try {
+        const plan = await scopeManagerCreatePlan(scope);
+        await retraceAlert(`삭제 전 검증을 완료했습니다.\n백업 ID: ${plan.backupId || '(unknown)'}\n\n실제 삭제하려면 같은 버튼을 다시 누르세요.`);
+      } catch (error) {
+        await retraceAlert(`서버 스코프 삭제 검증 실패\n${error?.message || error}`);
+      } finally { setBusy(false); }
+      return;
+    }
+    if (!(await retraceConfirm(
+      `검증과 서버 백업이 완료된 스코프를 실제 삭제합니다.\n\n${scope.displayName || scope.scopeId}\n레코드 ${scope.liveRecords || 0}개 · ${scopeManagerFormatBytes(scope.bytes || 0)}\n\n삭제 후에는 자동으로 되살리지 않습니다. 계속할까요?`,
+      { title: '서버 스코프 영구 삭제', confirmLabel: '삭제 실행', danger: true }
+    ))) return;
+    setBusy(true);
+    try {
+      const receipt = await scopeManagerExecutePlan(scope);
+      await retraceAlert(`서버 스코프를 삭제했습니다.\n백업 ID: ${receipt.backupId || '(unknown)'}\n삭제 mutation: ${receipt.counts?.total || 0}개`);
+      await refreshServerScopeManagement();
+    } catch (error) {
+      Runtime.serverScopePlans?.delete(recipeKey);
+      await retraceAlert(`서버 스코프 삭제 실패\n${error?.message || error}\n\n데이터가 바뀌었을 수 있으므로 새로고침 후 다시 검증하세요.`);
+      await refreshServerScopeManagement().catch(() => {});
+    } finally { setBusy(false); }
+  };
+
+
   const renderShell = () => {
     const root = Runtime.root;
     if (!root) return;
@@ -10014,6 +15663,9 @@
       .retrace-dialog-layer[hidden]{display:none!important}.retrace-dialog-layer{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(5,8,14,.72);backdrop-filter:blur(5px)}.retrace-dialog{width:min(560px,calc(100vw - 32px));max-height:min(78vh,680px);overflow:auto;border:1px solid var(--lra-line);border-radius:18px;background:var(--lra-surface);box-shadow:0 24px 80px rgba(0,0,0,.45);padding:20px}.retrace-dialog h3{margin:0 0 12px;font-size:17px;color:var(--lra-text)}.retrace-dialog-message{white-space:pre-wrap;word-break:break-word;color:var(--lra-text-2);font-size:13px;line-height:1.65}.retrace-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.retrace-dialog .btn.danger{border-color:rgba(239,68,68,.6);background:rgba(127,29,29,.45);color:#fecaca}.retrace-dialog .btn.danger:hover{background:rgba(153,27,27,.58)}
       @media(max-width:820px){.session-handoff-flow{grid-template-columns:1fr 1fr}.bridge{grid-template-columns:78px minmax(0,1fr)}.side{padding:10px 7px}.nav-group-label,.nav>span:not(.ic),.scope-card,.version{display:none}.nav{justify-content:center;padding:6px}.panel{padding:18px 14px 70px}.flow,.metrics{grid-template-columns:1fr 1fr}}
       @media(max-width:560px){.session-handoff-flow{grid-template-columns:1fr}.bridge{height:100dvh;max-height:100dvh;border-radius:0;grid-template-columns:64px minmax(0,1fr);grid-template-rows:62px minmax(0,1fr)}.top{padding:0 10px}.brand span,.global-status{display:none}.flow,.metrics,.settings-feature-grid,.packet-sections,.analysis-console-metrics{grid-template-columns:1fr}.ledger-key small{display:none}.field-wide,.profile-actions{grid-column:1}}
+      .server-scope-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.server-scope-filters{display:flex;gap:6px;flex-wrap:wrap}.server-scope-filters .btn.active{border-color:var(--lra-primary);background:var(--lra-primary-soft);color:var(--lra-primary)}.server-scope-list{display:grid;gap:10px}.server-scope-card{padding:14px;border:1px solid var(--lra-line);border-radius:15px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.server-scope-card.orphan{border-color:color-mix(in srgb,var(--lra-red) 38%,var(--lra-line))}.server-scope-card.ancestor{border-color:color-mix(in srgb,var(--lra-primary) 38%,var(--lra-line))}.server-scope-card.pinned{border-color:color-mix(in srgb,var(--lra-green) 45%,var(--lra-line))}.server-scope-head{display:flex;justify-content:space-between;gap:12px}.server-scope-head>div{min-width:0;display:grid;gap:2px}.server-scope-head strong{font-size:14px;overflow-wrap:anywhere}.server-scope-head small{color:var(--lra-text-3);overflow-wrap:anywhere}.server-scope-namespace{width:max-content;padding:2px 6px;border-radius:999px;background:var(--lra-surface-2);color:var(--lra-text-2);font-size:9px;font-weight:800}.server-scope-badge{height:max-content;padding:3px 8px;border-radius:999px;font-style:normal;font-size:9px;font-weight:800}.server-scope-badge.active{background:var(--lra-green-soft);color:var(--lra-green)}.server-scope-badge.ancestor{background:var(--lra-primary-soft);color:var(--lra-primary)}.server-scope-badge.orphan{background:color-mix(in srgb,var(--lra-red) 12%,var(--lra-surface));color:var(--lra-red)}.server-scope-badge.unverified{background:var(--lra-surface-2);color:var(--lra-text-2)}.server-scope-badge.pinned{background:var(--lra-green-soft);color:var(--lra-green)}.server-scope-card>p{margin:9px 0;color:var(--lra-text-2)}.server-scope-meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--lra-text-3);font-size:10px}.server-scope-meta span{padding:2px 6px;border-radius:999px;background:var(--lra-surface-2)}.server-scope-references{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}.server-scope-references b{width:100%;font-size:10px}.server-scope-references span{padding:2px 6px;border-radius:7px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px}.server-scope-blocked,.server-scope-safe{margin:10px 0;padding:8px 10px;border-radius:9px;font-size:10px}.server-scope-blocked{background:var(--lra-surface-2);color:var(--lra-text-2)}.server-scope-safe{background:color-mix(in srgb,var(--lra-red) 7%,var(--lra-surface));color:var(--lra-red)}.btn.danger{border-color:color-mix(in srgb,var(--lra-red) 45%,var(--lra-line));color:var(--lra-red)}.btn.danger:hover{background:color-mix(in srgb,var(--lra-red) 8%,var(--lra-surface))}
+
+      .server-data-summary{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 14px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.server-data-summary>div{display:grid;gap:3px}.server-data-summary span,.server-data-summary em{color:var(--lra-text-3);font-style:normal;font-size:10px}.server-data-summary.ok{border-color:color-mix(in srgb,var(--lra-green) 35%,var(--lra-line));background:color-mix(in srgb,var(--lra-green) 5%,var(--lra-surface))}.server-data-summary.warn{border-color:color-mix(in srgb,var(--lra-red) 28%,var(--lra-line));background:color-mix(in srgb,var(--lra-red) 4%,var(--lra-surface))}.server-data-scan-errors{display:grid;gap:5px;padding:12px 14px;border:1px solid color-mix(in srgb,var(--lra-red) 28%,var(--lra-line));border-radius:13px;background:color-mix(in srgb,var(--lra-red) 5%,var(--lra-surface));color:var(--lra-red)}.server-data-scan-errors span{font-size:10px;overflow-wrap:anywhere}.server-scope-group{display:grid;gap:9px}.server-scope-group-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;padding:4px 2px}.server-scope-group-head h3{margin:0;font-size:15px}.server-scope-group-head p{margin:2px 0 0;color:var(--lra-text-3);font-size:10px}.server-scope-group-head em{padding:3px 8px;border-radius:999px;background:var(--lra-surface-2);color:var(--lra-text-2);font-style:normal;font-weight:800}.server-scope-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:start}.server-scope-card.active{border-color:color-mix(in srgb,var(--lra-green) 34%,var(--lra-line))}.server-scope-card.referenced-ancestor{border-color:color-mix(in srgb,var(--lra-primary) 42%,var(--lra-line))}.server-scope-card.orphan-candidate{border-color:color-mix(in srgb,var(--lra-red) 38%,var(--lra-line))}.server-scope-card.unverified{border-style:dashed}.server-scope-main{min-width:0;display:grid;gap:10px}.server-scope-title{display:flex;align-items:flex-start;gap:9px;min-width:0}.server-scope-title>div{min-width:0;display:grid;gap:2px}.server-scope-title strong,.server-scope-title small{overflow-wrap:anywhere}.server-scope-title small{color:var(--lra-text-3);font-size:9px}.server-plugin-badge{flex:0 0 auto;padding:3px 7px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px;font-weight:850}.server-plugin-badge.hayaku{background:color-mix(in srgb,#e29a2b 13%,var(--lra-surface));color:#a96706}.server-plugin-badge.libra{background:color-mix(in srgb,#815bd9 13%,var(--lra-surface));color:#6840bf}.server-plugin-badge.flashback{background:color-mix(in srgb,#3d79d8 13%,var(--lra-surface));color:#2b62b7}.server-plugin-badge.gradia{background:color-mix(in srgb,#b4559a 13%,var(--lra-surface));color:#8c3978}.server-plugin-badge.lia{background:color-mix(in srgb,#24977d 13%,var(--lra-surface));color:#18755f}.server-plugin-badge.retrace{background:color-mix(in srgb,#4f5b6d 13%,var(--lra-surface));color:#354052}.server-scope-stats{display:flex;gap:7px;flex-wrap:wrap}.server-scope-stats span{padding:3px 7px;border-radius:8px;background:var(--lra-surface-2);color:var(--lra-text-3);font-size:9px}.server-scope-stats b{color:var(--lra-text)}.server-scope-refs{display:flex;gap:6px;flex-wrap:wrap}.server-scope-refs strong{width:100%;font-size:10px}.server-scope-refs span{padding:3px 7px;border-radius:8px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px}.server-scope-blocked,.server-scope-ready{padding:8px 10px;border-radius:9px;font-size:10px}.server-scope-blocked{background:var(--lra-surface-2);color:var(--lra-text-2)}.server-scope-ready{background:var(--lra-green-soft);color:var(--lra-green);font-weight:750}.server-scope-actions{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.server-scope-actions .btn{white-space:nowrap}@media(max-width:760px){.server-scope-card{grid-template-columns:1fr}.server-scope-actions{justify-content:flex-start}.server-data-summary{align-items:flex-start;flex-direction:column}}
     </style>
     <div class="bridge${Runtime.busy ? ' busy' : ''}">
       <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>FLASHBACK · HAYAKU · LIBRA · GRADIA · LIA Compatibility Hub</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="exportRetraceDebug" class="btn">디버그 로그 내보내기</button><button id="closeBridge" class="btn">닫기</button></div></header>
@@ -10025,7 +15677,9 @@
         <button class="nav ${Runtime.activeTab === 'libra' ? 'active' : ''}" data-tab="libra"><span class="ic">L</span><span>LIBRA 뷰어</span></button>
         <button class="nav ${Runtime.activeTab === 'flashback' ? 'active' : ''}" data-tab="flashback"><span class="ic">F</span><span>Flashback 뷰어</span></button>
         <button class="nav ${Runtime.activeTab === 'hayaku' ? 'active' : ''}" data-tab="hayaku"><span class="ic">H</span><span>HAYAKU 뷰어</span></button>
+        <button class="nav ${Runtime.activeTab === 'serverdata' ? 'active' : ''}" data-tab="serverdata"><span class="ic">DB</span><span>서버 데이터 관리</span></button>
         <div class="nav-group-label">Settings</div>
+        <button class="nav ${Runtime.activeTab === 'serverconnection' ? 'active' : ''}" data-tab="serverconnection"><span class="ic">⇄</span><span>서버 연결</span></button>
         <button class="nav ${Runtime.activeTab === 'provider' ? 'active' : ''}" data-tab="provider"><span class="ic">⚙</span><span>프로바이더</span></button>
         <div class="scope-card"><b>현재 스코프</b><span id="sidebarScope">확인 중</span></div><div class="version">v${PLUGIN_VERSION}</div>
       </aside>
@@ -10041,6 +15695,10 @@
         </section>
         <section class="panel ${Runtime.activeTab === 'coldstart' ? 'active' : ''}" data-panel="coldstart">
           <div class="panel-heading"><div><h2>HAYAKU 분석 복구</h2><p>최초 구축인 콜드스타트와 누락 턴 복구인 증분 재분석을 분리합니다.</p></div></div>
+          <div class="card"><div class="heading"><div><strong>옵션형 자동 LLM 복구</strong><span>HAYAKU Recovery Vault에 확정된 packet debt만 자동으로 고품질 recovery_snapshot으로 승격합니다.</span></div><em class="badge">Owner gated</em></div>
+            <div class="settings-feature-grid"><label class="fld field-wide"><span>자동 복구</span><select id="hayakuAutoRepairEnabled"><option value="false" ${settings.hayakuAutoRepair ? '' : 'selected'}>끄기</option><option value="true" ${settings.hayakuAutoRepair ? 'selected' : ''}>켜기</option></select><small>활성 HAYAKU owner가 없으면 HAYAKU 관련 검사·LLM 호출·패킷 생성이 모두 중지됩니다. 자동 모드에서는 원문 source-fallback 패킷을 만들지 않습니다.</small></label></div>
+            <div id="hayakuAutoRepairStatus" class="status">자동 복구 상태를 확인하는 중입니다.</div>
+          </div>
           <div class="card"><div class="heading"><div><strong>콜드스타트 · 최초 1회</strong><span>HAYAKU를 한 번도 사용하지 않은 세션만 최초 원장을 구축합니다.</span></div><em class="badge">First use only</em></div>
             <div class="flow"><div><b>증거 수집</b><small>완료된 U+A 턴과 미결 user 입력을 구분</small></div><div><b>생성 분석</b><small>Primary 프로필 · 최대 3개 동시 처리</small></div><div><b>원장 채택</b><small>다음 HAYAKU 요청 전에 canonical storage로 가져오기</small></div></div>
             <div id="coldStartStatus" class="status">실행 가능 여부를 확인하는 중입니다.</div><p class="note">기존 HAYAKU 기록이 감지되면 실행을 차단합니다. 실패 청크 이어서와 검증된 캡슐 다시 채택만 예외로 허용합니다.</p>
@@ -10074,6 +15732,12 @@
           <div class="turn-jump"><strong>빠른 턴 이동</strong><span id="hayakuTurnMax">최대 턴 확인 중</span><div><input id="hayakuTurnInput" type="number" min="1" step="1" inputmode="numeric" aria-label="이동할 턴 번호" placeholder="턴 번호"><button id="jumpHayakuTurn" type="button" class="btn primary">턴 이동</button></div></div>
           <div id="hayakuBody" style="display:flex;flex-direction:column;gap:10px;min-height:0"><div class="empty"><strong>조회 대기</strong><span>현재 채팅의 HAYAKU 원장을 읽습니다.</span></div></div>
         </section>
+        <section class="panel ${Runtime.activeTab === 'serverdata' ? 'active' : ''}" data-panel="serverdata">
+          <div class="panel-heading"><div><h2>서버 데이터 관리</h2><p>Memory Suite 서버의 스코프를 현재 RisuAI 채팅 목록과 대조합니다. 채팅이 보이지 않아도 자동 삭제하지 않으며 승계 조상과 확인 불가 데이터는 보호합니다.</p></div><div class="actions"><button id="refreshServerData" class="btn primary">새로고침</button></div></div>
+          <div class="settings-callout">상태는 활성 · 승계 조상 · 고아 메모리 후보 · 확인 불가로 구분됩니다. 활성 스코프는 owner 플러그인이 서버 데이터를 pluginStorage/로컬 저장소에 복원하고 플러그인 단독 모드 전환을 증명한 뒤에만 서버에서 삭제됩니다. 고아 후보는 안정적인 채팅 목록 확인, 참조 관계 재검사, 삭제 직전 서버 백업과 두 단계 확인을 모두 통과해야 합니다.</div>
+          <div id="serverDataBody"><div class="empty"><strong>서버 스코프 조회 대기</strong><span>새로고침을 누르면 6개 namespace의 서버 데이터와 현재 캐릭터의 채팅 목록을 대조합니다.</span></div></div>
+        </section>
+        <section class="panel ${Runtime.activeTab === 'serverconnection' ? 'active' : ''}" data-panel="serverconnection"><div id="retraceMemorySuiteServerConnectionPanel"></div></section>
         <section class="panel ${Runtime.activeTab === 'provider' ? 'active' : ''}" data-panel="provider">
           <div class="panel-heading"><div><h2>LLM 프로바이더</h2><p>GRADIA v0.24.3 계열의 provider·reasoning 계층을 Primary 단일 프로필로 사용합니다.</p></div></div>
           <div class="settings-callout">콜드스타트와 증분 재분석은 아래 Primary 프로필을 사용합니다. 이전 버전의 Aux 설정만 구성되어 있었다면 최초 로드 시 Primary로 자동 이전됩니다.</div>
@@ -10086,6 +15750,14 @@
     <div id="retraceDialogLayer" class="retrace-dialog-layer" hidden aria-hidden="true"><div class="retrace-dialog" role="dialog" aria-modal="true" aria-labelledby="retraceDialogTitle"><h3 id="retraceDialogTitle">확인</h3><div id="retraceDialogMessage" class="retrace-dialog-message"></div><div class="retrace-dialog-actions"><button id="retraceDialogCancel" type="button" class="btn">취소</button><button id="retraceDialogConfirm" type="button" class="btn primary">계속</button></div></div></div>`;
     bindUi();
     renderAnalysisConsole();
+    if (Runtime.activeTab === 'serverconnection') {
+      const host = root.querySelector('#retraceMemorySuiteServerConnectionPanel');
+      if (host) void MemorySuiteStorageBridge.mountConnectionPanel(host, {
+        title: 'RE:TRACE · 서버 연결',
+        description: 'RE:TRACE 복구 자료의 저장 방식과 Memory Suite 서버 연결을 관리합니다. 전체 스코프 조회·삭제는 별도의 서버 데이터 관리 화면에서 수행합니다.'
+      }).catch(error => warn('RE:TRACE server connection panel failed', error));
+    }
+    if (Runtime.activeTab === 'serverdata') renderServerScopeManagement();
   };
 
   const formatElapsed = milliseconds => {
@@ -10227,7 +15899,14 @@
             ? `GRADIA 연결됨 · Story Arc 조회 실패 (${preview.gradia.reason})`
             : `GRADIA 연결됨 · 승계할 Story Arc/Writer/Narrative Archive 상태 없음 (${preview.gradia.reason})`
           : 'GRADIA IPC 연결 없음 · GRADIA v0.25.25+ 필요';
-      node.textContent = `${libraLine}\n${gradiaLine}\n${flashbackLine}\n${hayakuLine}`;
+      const serverNamespaces = preview.memorySuiteServer?.namespaces || {};
+      const serverDetected = Object.entries(serverNamespaces)
+        .filter(([, row]) => row?.available === true && Number(row?.liveRecords || 0) > 0)
+        .map(([name, row]) => `${name.toUpperCase()} ${formatNumber(row.liveRecords)}`);
+      const memorySuiteLine = Object.values(serverNamespaces).some(row => row?.available === true)
+        ? `Memory Suite 서버 인식 · ${serverDetected.length ? serverDetected.join(' · ') : '저장 데이터 없음'}`
+        : 'Memory Suite 서버 미연결 · pluginStorage/owner IPC 경로 사용';
+      node.textContent = `${memorySuiteLine}\n${libraLine}\n${gradiaLine}\n${flashbackLine}\n${hayakuLine}`;
       await refreshCompatibility(preview).catch(error => warn('compatibility refresh failed', error));
       return preview;
     } catch (error) {
@@ -10396,6 +16075,11 @@
     if (!body) return null;
     body.innerHTML = '<div class="empty"><strong>원장 조회 중</strong><span>HAYAKU 메타데이터를 확인하고 최신 Archive layer만 지연 해제하고 있습니다.</span></div>';
     try {
+      const ownerGate = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
+      if (ownerGate.ready !== true) {
+        body.innerHTML = '<div class="empty"><strong>HAYAKU 연결되지 않음</strong><span>활성 HAYAKU owner가 없어 원장·캡슐·누락 복구·채택 로직을 실행하지 않습니다.</span></div>';
+        return { available: false, ownerReady: false, reason: 'hayaku_owner_absent' };
+      }
       const context = await getCurrentContext();
       const navigation = resolveTurnNavigationTarget(context.chat, Number.MAX_SAFE_INTEGER);
       Runtime.hayakuMaxTurn = navigation.maxTurn;
@@ -10412,8 +16096,8 @@
         : '완료된 턴 없음';
       let [result, pending, pendingIncremental] = await Promise.all([
         readHayakuViewerSource(context),
-        readPendingColdStartCapsule(context),
-        readPendingIncrementalRecoveryCapsule(context)
+        readPendingColdStartCapsule(context, { ownerGate }),
+        readPendingIncrementalRecoveryCapsule(context, { ownerGate })
       ]);
       const coldStartNeedsAdoption = pending.available
         && text(result?.ledger?.coldStart?.transferId || '') !== text(pending?.capsule?.transferId || '');
@@ -10454,6 +16138,8 @@
 
   const readProviderSettingsFromUi = () => {
     const current = clone(Runtime.settings || normalizeSettings({}), {});
+    const autoRepairNode = Runtime.root?.querySelector?.('#hayakuAutoRepairEnabled');
+    if (autoRepairNode) current.hayakuAutoRepair = autoRepairNode.value === 'true';
     for (const node of Runtime.root?.querySelectorAll?.('[data-provider-field]') || []) {
       const [profileName, field] = text(node.getAttribute('data-provider-field')).split('.');
       if (!current[profileName] || !field) continue;
@@ -10466,6 +16152,27 @@
       }
     }
     return normalizeSettings(current);
+  };
+
+  const refreshHayakuAutoRepairStatus = async () => {
+    const node = Runtime.root?.querySelector?.('#hayakuAutoRepairStatus');
+    if (!node) return null;
+    const settings = await loadSettings();
+    if (settings.hayakuAutoRepair !== true) {
+      node.textContent = '자동 복구 꺼짐 · HAYAKU Recovery Vault의 raw fallback은 그대로 유지됩니다.';
+      return { enabled: false };
+    }
+    const gate = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
+    if (gate.ready !== true) {
+      node.textContent = '활성 HAYAKU owner 없음 · HAYAKU 관련 자동 검사와 LLM 호출을 전부 실행하지 않습니다.';
+      return { enabled: true, ownerReady: false };
+    }
+    const ipc = gate.capabilities?.ipcCapabilities || {};
+    const compatible = ipc.recoveryDebtWorldlineV1 === true && ipc.repairTargetAdoptionV1 === true;
+    node.textContent = compatible
+      ? `자동 복구 대기 · 실행 ${Runtime.hayakuAutoRepair.runs} · 성공 ${Runtime.hayakuAutoRepair.successes} · 실패 ${Runtime.hayakuAutoRepair.failures}${Runtime.hayakuAutoRepair.lastError ? `\n최근 오류: ${Runtime.hayakuAutoRepair.lastError}` : ''}`
+      : 'HAYAKU는 연결됐지만 Recovery Debt Worldline v1 계약을 지원하지 않아 자동 복구를 실행하지 않습니다.';
+    return { enabled: true, ownerReady: true, compatible };
   };
 
   const setProviderStatus = (message, kind = '') => {
@@ -10545,21 +16252,46 @@
     let flashbackSummary = null;
     let libraSummary = null;
     let gradiaSummary = null;
+    let hayakuOwnerGate = null;
     if (context) {
       try { pending = await inspectPendingNextSessionHandoff({ context }); } catch (error) { pending = { available: false, error: text(error?.message || error) }; }
       if (pending?.available) {
         try { durableStatus = await inspectPendingHandoffDurableStatus(pending); } catch (error) { durableStatus = { error: text(error?.message || error) }; }
       }
       try { transition = await inspectTransition(); } catch (error) { transition = { error: text(error?.message || error) }; }
-      try { pendingColdStart = await readPendingColdStartCapsule(context); } catch (error) { pendingColdStart = { available: false, error: text(error?.message || error) }; }
-      try { pendingIncremental = await readPendingIncrementalRecoveryCapsule(context); } catch (error) { pendingIncremental = { available: false, error: text(error?.message || error) }; }
-      try { hayakuSummary = await readHayakuSource(context, { includeRecords: false, skipOwnerInspect: true }); } catch (error) { hayakuSummary = { available: false, error: text(error?.message || error) }; }
+      hayakuOwnerGate = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
+      if (hayakuOwnerGate.ready === true) {
+        try { pendingColdStart = await readPendingColdStartCapsule(context, { ownerGate: hayakuOwnerGate }); } catch (error) { pendingColdStart = { available: false, error: text(error?.message || error) }; }
+        try { pendingIncremental = await readPendingIncrementalRecoveryCapsule(context, { ownerGate: hayakuOwnerGate }); } catch (error) { pendingIncremental = { available: false, error: text(error?.message || error) }; }
+        try { hayakuSummary = await readHayakuSource(context, { includeRecords: false, ownerGate: hayakuOwnerGate }); } catch (error) { hayakuSummary = { available: false, error: text(error?.message || error) }; }
+      } else {
+        const disabled = { available: false, ownerReady: false, reason: 'hayaku_owner_absent', ownerState: hayakuOwnerGate.state };
+        pendingColdStart = { ...disabled, packets: [] };
+        pendingIncremental = { ...disabled, packets: [] };
+        hayakuSummary = { ...disabled, records: [], recordCount: 0 };
+      }
       try { flashbackSummary = await readFlashbackSource(context, { includeRecords: false, skipRuntime: true, skipIpc: true }); } catch (error) { flashbackSummary = { available: false, error: text(error?.message || error) }; }
       try { libraSummary = await readLibraSource(context, { includeRecords: false }); } catch (error) { libraSummary = { available: false, error: text(error?.message || error) }; }
       try { gradiaSummary = await readGradiaSource(context, { includePayload: false }); } catch (error) { gradiaSummary = { available: false, error: text(error?.message || error) }; }
     }
     let settings = null;
     try { settings = await loadSettings(); } catch (_) {}
+    let memorySuite = null;
+    try {
+      // A missing live HAYAKU owner disables every HAYAKU-related code path,
+      // including the manager-wide server diagnostics sweep. Use RE:TRACE's own
+      // namespace diagnostics only so a stale HAYAKU server namespace is neither
+      // probed nor interpreted as an installed owner.
+      memorySuite = hayakuOwnerGate?.ready === true
+        ? await MemorySuiteStorageBridge.managerGetDiagnostics({ limit: 1000 })
+        : await MemorySuiteStorageBridge.getDiagnostics({ force: true, limit: 500 });
+    } catch (managerError) {
+      memorySuite = await MemorySuiteStorageBridge.getDiagnostics({ force: true, limit: 500 }).catch(error => ({
+        schema: 'memory-suite.plugin-server-diagnostics.v1', reachable: false,
+        error: text(error?.message || error || managerError?.message || managerError),
+        managerError: text(managerError?.message || managerError), status: MemorySuiteStorageBridge.status()
+      }));
+    }
     const payload = {
       schema: 'retrace_debug_export_v1',
       schemaVersion: 1,
@@ -10588,6 +16320,7 @@
         source: text(context?.source || '')
       },
       provider: retraceDebugProviderSummary(settings),
+      memorySuite,
       runtime: {
         visible: Runtime.visible === true,
         mounted: Runtime.mounted === true,
@@ -10803,6 +16536,7 @@
         if (Runtime.activeTab === 'libra') refreshLibra();
         if (Runtime.activeTab === 'flashback') refreshFlashback();
         if (Runtime.activeTab === 'hayaku') refreshHayaku();
+        if (Runtime.activeTab === 'serverdata') refreshServerScopeManagement().catch(error => warn('server scope manager refresh failed', error));
       });
     }
     root.querySelector('#refreshTransition')?.addEventListener('click', () => refreshTransition());
@@ -10812,6 +16546,18 @@
     root.querySelector('#refreshLibra')?.addEventListener('click', () => refreshLibra());
     root.querySelector('#refreshFlashback')?.addEventListener('click', () => refreshFlashback());
     root.querySelector('#refreshHayaku')?.addEventListener('click', () => refreshHayaku());
+    root.querySelector('#refreshServerData')?.addEventListener('click', () => refreshServerScopeManagement().catch(async error => {
+      warn('server scope manager refresh failed', error);
+      await retraceAlert(`서버 데이터 관리 새로고침 실패
+${error?.message || error}`);
+    }));
+    root.querySelector('#serverDataBody')?.addEventListener('click', event => {
+      void handleServerScopeManagementClick(event).catch(async error => {
+        warn('server scope management action failed', error);
+        await retraceAlert(`서버 데이터 관리 작업 실패
+${error?.message || error}`);
+      });
+    });
     const runHayakuTurnJump = async () => {
       const input = root.querySelector('#hayakuTurnInput');
       if (!input || Runtime.busy) return;
@@ -10954,11 +16700,34 @@
       });
       syncReasoningPresetEditor(profileName);
     }
+    root.querySelector('#hayakuAutoRepairEnabled')?.addEventListener('change', async event => {
+      try {
+        const settings = await saveSettings(readProviderSettingsFromUi());
+        await refreshHayakuAutoRepairStatus();
+        if (settings.hayakuAutoRepair === true) {
+          const gate = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
+          if (gate.ready === true) {
+            await registerHayakuRecoveryEventIpc().catch(error => warn('HAYAKU recovery event registration failed', error));
+            scheduleHayakuAutoRepairSweep('setting_enabled', 100);
+          }
+        }
+      } catch (error) {
+        await retraceAlert(`자동 복구 설정 저장 실패\n${error?.message || error}`);
+      }
+    });
     root.querySelector('#saveProvider')?.addEventListener('click', async () => {
       setBusy(true);
       try {
         const settings = await saveSettings(readProviderSettingsFromUi());
-        setProviderStatus(`저장 완료 · Primary 프로필 · ${providerLabel(settings.primary.provider)}`, 'ok');
+        setProviderStatus(`저장 완료 · Primary 프로필 · ${providerLabel(settings.primary.provider)} · HAYAKU 자동 복구 ${settings.hayakuAutoRepair ? 'ON' : 'OFF'}`, 'ok');
+        await refreshHayakuAutoRepairStatus();
+        if (settings.hayakuAutoRepair === true) {
+          const gate = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
+          if (gate.ready === true) {
+            await registerHayakuRecoveryEventIpc().catch(error => warn('HAYAKU recovery event registration failed', error));
+            scheduleHayakuAutoRepairSweep('provider_saved', 100);
+          }
+        }
       } catch (error) {
         setProviderStatus(`저장 실패: ${error?.message || error}`, 'error');
       } finally {
@@ -11280,7 +17049,7 @@
     if (Runtime.activeTab === 'flashback') await refreshFlashback();
     else if (Runtime.activeTab === 'hayaku') await refreshHayaku();
     else if (Runtime.activeTab === 'coldstart') {
-      await Promise.all([refreshColdStart(), refreshIncrementalRecovery()]);
+      await Promise.all([refreshColdStart(), refreshIncrementalRecovery(), refreshHayakuAutoRepairStatus()]);
     }
     else await refreshTransition();
   };
@@ -11338,6 +17107,8 @@
     inspectIncrementalRecovery,
     executeIncrementalRecovery,
     reAdoptIncrementalRecovery,
+    runHayakuAutoRepairSweep,
+    probeLiveHayakuOwner,
     deleteHayakuRecord,
     regenerateHayakuRecord,
     jumpToHayakuTurn,
@@ -11367,7 +17138,8 @@
       inspectFlashbackNonDestructiveHandoffCapability,
       flashbackSourceStorageIntegritySnapshotForRetrace, compareFlashbackSourceStorageIntegrityForRetrace,
       verifyFlashbackSessionHandoffFromStorage,
-      requestHayakuIpc,
+      requestHayakuIpc, probeLiveHayakuOwner, ensureHayakuOwnerReady,
+      scheduleHayakuAutoRepairSweep, runHayakuAutoRepairSweep, executeHayakuAutomaticRepairDebt,
       normalizeHayakuPacketAuthoringProfile, fallbackHayakuPacketAuthoringProfile,
       buildBridgeHayakuAuthoringPrompt, bridgeHayakuPromptSet,
       packetItemText, packetRows, packetInfo,
@@ -11413,7 +17185,18 @@
   globalThis.__MemorySessionBridge = RetraceApi;
 
   await registerFlashbackIpc().catch(error => warn('Flashback IPC registration failed', error));
+  // Register only the response channel needed for the minimal live-owner probe.
+  // Every other HAYAKU subsystem listener and worker remains absent until that
+  // authenticated probe succeeds.
   await registerHayakuIpc().catch(error => warn('HAYAKU IPC registration failed', error));
+  await loadSettings().catch(() => normalizeSettings({}));
+  if (Runtime.settings?.hayakuAutoRepair === true) {
+    const startupOwner = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
+    if (startupOwner.ready === true) {
+      await registerHayakuRecoveryEventIpc().catch(error => warn('HAYAKU recovery event registration failed', error));
+      scheduleHayakuAutoRepairSweep('startup', 1200);
+    }
+  }
   await registerLibraIpc().catch(error => warn('LIBRA IPC registration failed', error));
   await registerGradiaIpc().catch(error => warn('GRADIA IPC registration failed', error));
   await registerLiaIpc().catch(error => warn('LIA IPC registration failed', error));
@@ -11434,6 +17217,8 @@
         pending.reject(new Error('RE:TRACE unloaded before HAYAKU IPC completed.'));
       }
       Runtime.hayakuIpcPending.clear();
+      if (Runtime.hayakuAutoRepair.timer != null) clearTimeout(Runtime.hayakuAutoRepair.timer);
+      Runtime.hayakuAutoRepair.timer = null;
       for (const pending of Runtime.libraIpcPending.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error('RE:TRACE unloaded before LIBRA IPC completed.'));

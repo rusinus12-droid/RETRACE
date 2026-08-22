@@ -1,10 +1,12 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.43
+//@version 1.9.48
+/* v1.9.48 bounds RisuAI current-context calls, defers optional HAYAKU auto-repair discovery until after UI registration, renders transition data before the secondary compatibility sweep finishes, and uses manifest-local owner summaries with Storage SDK v1.8.5 route pre-resolution. */
+/* v1.9.45 removes retired GRADIA compatibility completely. RE:TRACE now negotiates, inspects, hands off, verifies, diagnoses, and manages Memory Suite scopes only for FLASHBACK, HAYAKU, LIBRA, and LIA peers; GRADIA IPC/channels, handoff receipts, transition-journal fields, server-scope scanners, UI/debug surfaces, and owner-delete routes are removed. Existing GRADIA server files are never deleted or migrated. */
 /* v1.9.43 adds an owner-gated optional automatic HAYAKU repair worker. It reacts to durable Recovery Vault debt events, leases exact worldline variants, disables source-fallback packets in automatic mode, suspends and reuses a verified candidate across first-observation rollback quarantine, and requires HAYAKU owner-side target/adoption readback before completion. HAYAKU-related analysis, viewing, handoff, backup, compatibility fallback, and server-scope scans remain completely inactive when a live authenticated HAYAKU owner is absent. */
 /* v1.9.42 adds a non-destructive canonical identity layer to Memory Suite scope discovery: RisuAI chaId/chat.id aliases are retained alongside legacy physical scope IDs so owner scope matching and diagnostics can converge without rewriting peer storage keys. */
-/* v1.9.41 adds suite-wide Memory Suite server diagnostics to the RE:TRACE debug export. RE:TRACE retrieves the privacy-scrubbed event journal and integrity state for all six namespaces through the manager-only endpoint, while falling back to its own namespace/offline snapshot if the manager endpoint is unavailable. */
+/* v1.9.41 adds suite-wide Memory Suite server diagnostics to the RE:TRACE debug export. RE:TRACE retrieves the privacy-scrubbed event journal and integrity state for all five active namespaces through the manager-only endpoint, while falling back to its own namespace/offline snapshot if the manager endpoint is unavailable. */
 /* v1.9.40 makes RE:TRACE's own recovery/cold-start storage mode independent per chat scope and updates owner deletion/handoff proof to change only the target scope. Peer server inspection remains read-only and can never overwrite another plugin's routing policy. */
 /* v1.9.39 adds shared Memory Suite background synchronization telemetry to RE:TRACE server connection. Initial seeding, mirror sync, and restore expose live phase/count/bytes/timing/retry diagnostics and continue after the panel closes without changing server-scope management, next-session handoff, or source-immutability rules. */
 /* v1.9.38 adds a dedicated 서버 연결 side-panel page separate from Server Data Management. It exposes RE:TRACE storage mode, loopback URL editing, connection testing, server/protocol status, synchronization, recovery, and guarded pluginStorage deletion while preserving next-session handoff and scope-management behavior. */
@@ -13,15 +15,14 @@
 //@allowed-ipc flashback_memory
 //@allowed-ipc hayaku_locator_continuity
 //@allowed-ipc lia_persona_linker
-//@allowed-ipc serial_gradation_agents_for_rp
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/RETRACE/refs/heads/main/RETRACE.js
 //@arg memory_suite_server_mode string Legacy 0.2.6 migration only; current scope modes are stored in the routing registry
 //@arg memory_suite_server_url string Memory Suite server URL; blank uses http://127.0.0.1:47630
 //@arg retrace_hayaku_auto_repair string true|false; optional automatic LLM repair for HAYAKU Recovery Vault debt; blank uses false
-//@description LIBRA, GRADIA, HAYAKU, Flashback, and LIA Live Persona continuity analysis and next-session handoff bridge
+//@description LIBRA, HAYAKU, Flashback, and LIA Live Persona continuity analysis and next-session handoff bridge
 //@author Hayaku
 
-/* v1.9.37 adds Memory Suite serverization to RE:TRACE itself and makes next-session handoff server-aware. RE:TRACE durable recovery/cold-start/backup records can use plugin-only, mirror, or server-only storage; server-side Flashback/HAYAKU data is available to read-only fallback inspection when pluginStorage was intentionally cleared; LIBRA/GRADIA/LIA server presence is surfaced even when owner IPC is unavailable; and patched owner handoff receipts prove Memory Suite mirror/server synchronization before and after prepare/adopt/verify without weakening immutable-source safeguards. */
+/* v1.9.37 adds Memory Suite serverization to RE:TRACE itself and makes next-session handoff server-aware. RE:TRACE durable recovery/cold-start/backup records can use plugin-only, mirror, or server-only storage; server-side Flashback/HAYAKU data is available to read-only fallback inspection when pluginStorage was intentionally cleared; LIBRA/LIA server presence is surfaced even when owner IPC is unavailable; and patched owner handoff receipts prove Memory Suite mirror/server synchronization before and after prepare/adopt/verify without weakening immutable-source safeguards. */
 /* v1.9.35 fixes RE:TRACE runtime version reporting and hardens current-chat resolution against RisuAI's transient chat selection race. getCurrentChatIndex() may briefly throw while the host's character/chat page is switching; RE:TRACE now treats that as a soft host-context miss, falls back to the already-read character.chatPage when valid, retries the indexed resolver with short bounded delays, and only fails after both indexed and direct context paths are unavailable. This prevents the compatibility/transition panel from showing Cannot read properties of undefined (reading 'chatPage') while preserving exact character/chat identity checks before handoff writes. */
 /* v1.9.34 gives GRADIA next-session owner handoff storage-safe IPC budgets instead of the old 6s prepare/verify ceiling: prepare/adopt now allow up to 90s and verify up to 60s, the GRADIA IPC transport cap is raised to 120s, and owner-side rejected receipts are no longer redundantly retried through the shared-runtime fallback. This prevents a healthy but storage-busy GRADIA prepare_session_handoff from aborting before target chat creation while preserving fail-closed receipt validation. */
 /* v1.9.33 hardens LIBRA handoff error handling: remote owner rejections such as SOURCE_MUTATION_DETECTED are no longer retried through the same runtime API, while genuine IPC transport failures may still fall back. LIBRA IPC remote error codes are preserved when available so diagnostics distinguish transport failure from owner-side fail-closed safety checks. */
@@ -47,8 +48,8 @@
 (async () => {
   'use strict';
 
-/* MEMORY SUITE STORAGE SDK v1.8.1
- * Scope-routed durable storage client shared by Flashback, HAYAKU, LIBRA, GRADIA, LIA and RE:TRACE.
+/* MEMORY SUITE STORAGE SDK v1.8.5
+ * Scope-routed durable storage client shared by Flashback, HAYAKU, LIBRA, LIA and RE:TRACE.
  * The server stores opaque values. Each plugin keeps ownership of its own data schema.
  */
 const createMemorySuiteStorageBridge = (rawOptions = {}) => {
@@ -74,8 +75,25 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
   const displayName = String(options.displayName || pluginId || namespace || 'Plugin').trim();
   const managementButtonEnabled = options.managementButton !== false;
   const requestTimeoutMs = Math.max(5000, Math.min(120000, Number(options.requestTimeoutMs || 30000) || 30000));
+  // Bootstrap is only a reachability/contract probe.  Keeping its deadline
+  // separate prevents an offline loopback endpoint (or an HTML error page from
+  // a browser interceptor) from blocking each plugin's local pluginStorage
+  // startup for the full data-request timeout.
+  const bootstrapRequestTimeoutMs = Math.max(750, Math.min(5000, Number(options.bootstrapRequestTimeoutMs || 1800) || 1800));
+  const bootstrapFailureCacheMs = Math.max(1000, Math.min(60000, Number(options.bootstrapFailureCacheMs || 10000) || 10000));
   const configCacheMs = 30000;
   const bootstrapCacheMs = 30000;
+  const sharedBootstrapFailures = (() => {
+    const existing = createMemorySuiteStorageBridge.__memorySuiteBootstrapFailures;
+    if (existing instanceof Map) return existing;
+    const created = new Map();
+    try {
+      Object.defineProperty(createMemorySuiteStorageBridge, '__memorySuiteBootstrapFailures', {
+        value: created, configurable: false, enumerable: false, writable: false
+      });
+    } catch (_) {}
+    return created;
+  })();
   const proxyCache = new WeakMap();
   const localProxyCache = new WeakMap();
   const migrationStateByLegacy = new WeakMap();
@@ -86,6 +104,9 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
   const migrationRetryMs = Math.max(5000, Math.min(10 * 60 * 1000, Number(options.migrationRetryMs || 30000) || 30000));
   const currentScopeProvider = typeof options.currentScopeProvider === 'function' ? options.currentScopeProvider : null;
   const resolveKeyScopeProvider = typeof options.resolveKeyScope === 'function' ? options.resolveKeyScope : null;
+  // Opt-in only: the plugin's resolver must be able to classify global/shared
+  // keys and explicit scope-key records correctly when currentScope is null.
+  const preResolveKeyScope = options.preResolveKeyScope === true;
   const scopeRoutingEnabled = options.scopeRouting !== false;
   const scopeCacheMs = Math.max(0, Math.min(10000, Number(options.scopeCacheMs || 0) || 0));
   const sharedRouteModeRaw = String(options.sharedRouteMode || MODE_MIRROR);
@@ -289,6 +310,33 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       || /fetch|network|timeout|timed out|econn|connection|server_unavailable|bootstrap|http_50[0234]|503|socket|temporar/.test(message);
   };
 
+  const normalizeServerAvailabilityError = error => {
+    const rawMessage = compact(error?.message || error || 'memory_suite_server_unavailable', 700);
+    const rawCode = String(error?.code || '').toUpperCase();
+    const nativeJsonEnvelopeFailure = /expected double-quoted property name in json|unexpected token.*json|json(?:\.parse)?[^\n]*position\s+\d+/i.test(rawMessage);
+    const unavailable = nativeJsonEnvelopeFailure || retryableSyncError(error)
+      || ['MEMORY_SUITE_TIMEOUT', 'MEMORY_SUITE_SERVER_UNAVAILABLE'].includes(rawCode);
+    if (!unavailable) return error instanceof Error ? error : new Error(rawMessage);
+    const normalized = new Error('memory_suite_server_unavailable');
+    normalized.code = 'MEMORY_SUITE_SERVER_UNAVAILABLE';
+    normalized.retryable = true;
+    return normalized;
+  };
+
+  const cachedBootstrapFailure = url => {
+    const cached = sharedBootstrapFailures.get(String(url || ''));
+    if (!cached) return null;
+    if (Date.now() - Number(cached.at || 0) >= bootstrapFailureCacheMs) {
+      sharedBootstrapFailures.delete(String(url || ''));
+      return null;
+    }
+    const error = new Error(cached.message || 'memory_suite_server_unavailable');
+    error.code = cached.code || 'MEMORY_SUITE_SERVER_UNAVAILABLE';
+    error.retryable = true;
+    error.cached = true;
+    return error;
+  };
+
   const apiCandidates = () => {
     const out = [];
     const add = value => {
@@ -448,17 +496,18 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     throw new Error('memory_suite_server_fetch_unavailable');
   };
 
-  const withTimeout = async (promise, label) => {
+  const withTimeout = async (promise, label, timeoutMs = requestTimeoutMs) => {
+    const effectiveTimeoutMs = Math.max(250, Number(timeoutMs || requestTimeoutMs) || requestTimeoutMs);
     let timer = null;
     try {
       return await Promise.race([
         Promise.resolve(promise),
         new Promise((_, reject) => {
           timer = setTimeout(() => {
-            const error = new Error(`${label || 'Memory Suite request'} timed out after ${requestTimeoutMs}ms`);
+            const error = new Error(`${label || 'Memory Suite request'} timed out after ${effectiveTimeoutMs}ms`);
             error.code = 'MEMORY_SUITE_TIMEOUT';
             reject(error);
-          }, requestTimeoutMs);
+          }, effectiveTimeoutMs);
         })
       ]);
     } finally {
@@ -466,9 +515,9 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     }
   };
 
-  const responseText = async (response, label) => {
-    if (typeof response?.text === 'function') return await withTimeout(response.text(), `${label} response`);
-    if (typeof response?.json === 'function') return JSON.stringify(await withTimeout(response.json(), `${label} response`));
+  const responseText = async (response, label, timeoutMs = requestTimeoutMs) => {
+    if (typeof response?.text === 'function') return await withTimeout(response.text(), `${label} response`, timeoutMs);
+    if (typeof response?.json === 'function') return JSON.stringify(await withTimeout(response.json(), `${label} response`, timeoutMs));
     if (typeof response === 'string') return response;
     if (response && typeof response === 'object' && Object.prototype.hasOwnProperty.call(response, 'data')) {
       return typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
@@ -476,9 +525,9 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     return JSON.stringify(response || {});
   };
 
-  const fetchJson = async (url, init = {}, label = 'Memory Suite request') => {
-    const response = await withTimeout(fetchApi(url, init), label);
-    const raw = await responseText(response, label);
+  const fetchJson = async (url, init = {}, label = 'Memory Suite request', timeoutMs = requestTimeoutMs) => {
+    const response = await withTimeout(fetchApi(url, init), label, timeoutMs);
+    const raw = await responseText(response, label, timeoutMs);
     let payload = null;
     try { payload = raw ? JSON.parse(raw) : {}; }
     catch (_) { throw new Error('memory_suite_server_invalid_json'); }
@@ -523,7 +572,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
         'X-Memory-Suite-Plugin': pluginId,
         'X-Memory-Suite-Plugin-Version': pluginVersion
       }
-    }, 'Memory Suite connection test');
+    }, 'Memory Suite connection test', bootstrapRequestTimeoutMs);
     return validateBootstrapPayload(payload, url);
   };
 
@@ -563,7 +612,8 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       }
       return result;
     } catch (error) {
-      const result = { ok: false, url, error: compact(error?.message || error, 700), durationMs: Date.now() - startedAt };
+      const normalized = normalizeServerAvailabilityError(error);
+      const result = { ok: false, url, error: compact(normalized?.message || normalized, 700), durationMs: Date.now() - startedAt };
       if (url === config.url) setStatus('unavailable', result.error, { url });
       return result;
     }
@@ -575,6 +625,10 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     const cached = state.bootstrap;
     if (!force && cached.value && cached.baseUrl === config.url && Date.now() - Number(cached.at || 0) < bootstrapCacheMs) return cached.value;
     if (!force && cached.pending && cached.baseUrl === config.url) return await cached.pending;
+    if (!force) {
+      const offline = cachedBootstrapFailure(config.url);
+      if (offline) throw offline;
+    }
     const pending = (async () => {
       const payload = await fetchJson(`${config.url}/bootstrap`, {
         method: 'GET',
@@ -582,8 +636,9 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
           'X-Memory-Suite-Plugin': pluginId,
           'X-Memory-Suite-Plugin-Version': pluginVersion
         }
-      }, 'Memory Suite bootstrap');
+      }, 'Memory Suite bootstrap', bootstrapRequestTimeoutMs);
       const value = validateBootstrapPayload(payload, config.url);
+      sharedBootstrapFailures.delete(config.url);
       state.bootstrap = { at: Date.now(), baseUrl: config.url, value, pending: null };
       setStatus('connected', '', { serverVersion: value.version, url: value.url });
       return value;
@@ -592,10 +647,19 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     try {
       return await pending;
     } catch (error) {
+      const normalized = normalizeServerAvailabilityError(error);
       state.bootstrap = { at: 0, baseUrl: config.url, value: null, pending: null };
-      setStatus('unavailable', error?.message || error, { url: config.url });
-      warnOnce(`server_unavailable_${compact(error?.message || error, 120)}`, error);
-      throw error;
+      if (normalized?.code === 'MEMORY_SUITE_SERVER_UNAVAILABLE') {
+        sharedBootstrapFailures.set(config.url, { at: Date.now(), message: normalized.message, code: normalized.code });
+      }
+      setStatus('unavailable', normalized?.message || normalized, { url: config.url });
+      // Offline is an expected state: pluginStorage remains authoritative and
+      // the status object exposes the condition without noisy console warnings.
+      // Contract/configuration failures still surface once for diagnosis.
+      if (normalized?.code !== 'MEMORY_SUITE_SERVER_UNAVAILABLE') {
+        warnOnce('server_bootstrap_failed', normalized);
+      }
+      throw normalized;
     }
   };
 
@@ -1838,6 +1902,10 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     if (config.mode === MODE_PLUGIN_ONLY) return typeof legacyGet === 'function' ? await legacyGet() : null;
     if (config.mode === MODE_MIRROR) {
       const localValue = typeof legacyGet === 'function' ? await legacyGet() : null;
+      if (cachedBootstrapFailure(config.url)) {
+        setStatus('server_unavailable_local_only', 'memory_suite_server_unavailable', { mode: MODE_MIRROR, key: compact(key, 160), space });
+        return localValue;
+      }
       if (!isNullishStorageValue(localValue)) {
         try {
           const remote = await remoteGet(space, key);
@@ -2042,7 +2110,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
           #${instanceId} .mscx-state{display:inline-flex;align-items:center;gap:7px;padding:6px 9px;border:1px solid var(--mscx-line);border-radius:999px;background:var(--mscx-soft);white-space:nowrap;font-size:11px;font-weight:800;color:var(--mscx-muted)} #${instanceId} .mscx-dot{width:8px;height:8px;border-radius:50%;background:var(--mscx-muted)} #${instanceId} .mscx-state.good .mscx-dot{background:var(--mscx-good);box-shadow:0 0 0 4px rgba(86,212,155,.12)} #${instanceId} .mscx-state.warn .mscx-dot{background:var(--mscx-warn)} #${instanceId} .mscx-state.error .mscx-dot{background:var(--mscx-danger)}
           #${instanceId} .mscx-card{padding:14px;border:1px solid var(--mscx-line);border-radius:15px;background:var(--mscx-card);min-width:0} #${instanceId} .mscx-card-title{display:block;margin-bottom:9px;font-size:12px;font-weight:850;color:var(--mscx-text)}
           #${instanceId} .mscx-modes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px} #${instanceId} .mscx-mode{position:relative;display:grid;gap:4px;padding:12px;border:1px solid var(--mscx-line);border-radius:12px;background:var(--mscx-soft);cursor:pointer;min-width:0} #${instanceId} .mscx-mode.selected,#${instanceId} .mscx-mode:has(input:checked){border-color:var(--mscx-accent);box-shadow:0 0 0 1px var(--mscx-accent) inset;background:rgba(81,116,200,.13)} #${instanceId} .mscx-mode input{position:absolute;right:10px;top:10px;accent-color:var(--mscx-accent)} #${instanceId} .mscx-mode strong{padding-right:22px;font-size:12px;color:var(--mscx-text)} #${instanceId} .mscx-mode small{color:var(--mscx-muted);font-size:10px;line-height:1.45}
-          #${instanceId} .mscx-url-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px} #${instanceId} input[type="url"]{width:100%;min-width:0;padding:10px 11px;border:1px solid var(--mscx-line);border-radius:10px;background:var(--mscx-soft);color:var(--mscx-text);font:500 12px ui-monospace,SFMono-Regular,Consolas,monospace;outline:none} #${instanceId} input[type="url"]:focus{border-color:var(--mscx-accent);box-shadow:0 0 0 3px rgba(122,162,255,.12)}
+          #${instanceId} .mscx-url-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px} #${instanceId} input[type="url"],#${instanceId} input[type="password"]{width:100%;min-width:0;padding:10px 11px;border:1px solid var(--mscx-line);border-radius:10px;background:var(--mscx-soft);color:var(--mscx-text);font:500 12px ui-monospace,SFMono-Regular,Consolas,monospace;outline:none} #${instanceId} input[type="url"]:focus,#${instanceId} input[type="password"]:focus{border-color:var(--mscx-accent);box-shadow:0 0 0 3px rgba(122,162,255,.12)}
           #${instanceId} .mscx-actions{display:flex;flex-wrap:wrap;gap:8px} #${instanceId} button{min-height:38px;padding:8px 12px;border:1px solid var(--mscx-line);border-radius:10px;background:var(--mscx-soft);color:var(--mscx-text);font:750 11px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:pointer} #${instanceId} button:hover{border-color:rgba(122,162,255,.65);background:rgba(70,94,150,.22)} #${instanceId} button.primary{background:rgba(55,97,181,.72);border-color:rgba(122,162,255,.75)} #${instanceId} button.danger{color:#ffe4e8;background:rgba(126,34,52,.55);border-color:rgba(251,113,133,.55)} #${instanceId} button:disabled{opacity:.45;cursor:not-allowed}
           #${instanceId} .mscx-info{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px} #${instanceId} .mscx-info div{padding:9px 10px;border:1px solid var(--mscx-line);border-radius:10px;background:var(--mscx-soft);min-width:0} #${instanceId} .mscx-info span{display:block;color:var(--mscx-muted);font-size:9px;font-weight:800} #${instanceId} .mscx-info strong{display:block;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--mscx-text)}
           #${instanceId} .mscx-job{display:grid;gap:10px;border-color:rgba(122,162,255,.34);background:linear-gradient(180deg,rgba(35,55,97,.45),rgba(15,23,42,.58))} #${instanceId} .mscx-job[hidden]{display:none} #${instanceId} .mscx-job-head{display:flex;justify-content:space-between;gap:10px;align-items:center} #${instanceId} .mscx-job-head strong{font-size:13px} #${instanceId} .mscx-job-badge{font-size:10px;font-weight:850;color:var(--mscx-muted)}
@@ -2058,7 +2126,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
             <label class="mscx-mode"><input type="radio" name="${instanceId}-mode" value="mirror"><strong>플러그인 + 서버 병존</strong><small>pluginStorage와 DATA 서버를 계속 동기화합니다.</small></label>
             <label class="mscx-mode"><input type="radio" name="${instanceId}-mode" value="server_only"><strong>서버 단독</strong><small>Memory Suite DATA를 영구 정본으로 사용합니다.</small></label>
           </div></div>
-          <div class="mscx-card"><span class="mscx-card-title">서버 주소</span><div class="mscx-url-row"><input data-mscx-url type="url" spellcheck="false" value="${htmlEscape(config.url || defaultUrl)}"><button data-mscx-test type="button">연결 테스트</button></div><div class="mscx-note" style="margin-top:8px">보안을 위해 localhost·127.0.0.1·::1의 HTTP 주소만 허용합니다. 기본 주소는 http://127.0.0.1:47630 입니다.</div></div>
+          <div class="mscx-card"><span class="mscx-card-title">서버 주소</span><div class="mscx-url-row"><input data-mscx-url type="url" spellcheck="false" value="${htmlEscape(config.url || defaultUrl)}"><button data-mscx-test type="button">연결 테스트</button></div><div class="mscx-note" style="margin-top:8px">별도 key 입력 없이 localhost·127.0.0.1·::1의 로컬 서버에 연결합니다. 기본 주소는 http://127.0.0.1:47630 입니다.</div></div>
           <div class="mscx-info"><div><span>현재 모드</span><strong data-mscx-mode-label>${htmlEscape(modeLabel(config.mode || MODE_PLUGIN_ONLY))}</strong></div><div><span>서버 버전</span><strong data-mscx-version>-</strong></div><div><span>프로토콜</span><strong data-mscx-protocol>-</strong></div><div><span>서버 데이터</span><strong data-mscx-records>-</strong></div><div><span>namespace</span><strong>${htmlEscape(namespace)}</strong></div></div>
           <div class="mscx-actions"><button data-mscx-apply class="primary" type="button">설정 적용</button><button data-mscx-sync type="button">지금 동기화</button><button data-mscx-restore type="button">서버 → pluginStorage 복구</button><button data-mscx-delete class="danger" type="button">플러그인 스토리지 삭제</button></div>
           <div class="mscx-card mscx-job" data-mscx-job hidden><div class="mscx-job-head"><strong data-mscx-job-title>초기 서버 동기화</strong><span class="mscx-job-badge" data-mscx-job-badge>작업 중</span></div><div class="mscx-progress" data-mscx-progress><i></i></div><div><div class="mscx-job-phase" data-mscx-job-phase>작업 준비</div><div class="mscx-job-message" data-mscx-job-message></div></div><div class="mscx-job-stats"><div class="mscx-job-stat"><span>진행</span><b data-mscx-job-items>-</b></div><div class="mscx-job-stat"><span>처리 용량</span><b data-mscx-job-bytes>-</b></div><div class="mscx-job-stat"><span>전송·복구</span><b data-mscx-job-transfer>-</b></div><div class="mscx-job-stat"><span>경과 시간</span><b data-mscx-job-elapsed>-</b></div><div class="mscx-job-stat"><span>마지막 활동</span><b data-mscx-job-activity>-</b></div><div class="mscx-job-stat"><span>재시도 / 실패</span><b data-mscx-job-retry>-</b></div></div><div class="mscx-job-current" data-mscx-job-current>현재 작업을 준비하고 있습니다.</div><div class="mscx-note">이 화면을 닫아도 작업은 계속됩니다. 새로고침 후에는 저장된 작업 영수증을 읽고 이미 서버에 일치하는 항목을 다시 전송하지 않고 이어서 확인합니다.</div></div>
@@ -2493,9 +2561,13 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     try { value = currentScopeProvider ? await currentScopeProvider({ namespace, pluginId, pluginVersion, force }) : await defaultCurrentScope(); }
     catch (error) { setStatus('scope_unavailable', error?.message || error); }
     const scope = normalizeScopeDescriptor(value);
+    const previousScopeId = String(state.scopeRouting.current?.scopeId || '');
     state.scopeRouting.current = scope;
     state.scopeRouting.currentAt = Date.now();
-    state.scopeRouting.routeCache.clear();
+    // Re-reading the same active chat must not throw away every resolved key
+    // route. The old unconditional clear multiplied host-context work across a
+    // ledger/archive scan even though the scope had not changed.
+    if (previousScopeId !== String(scope.scopeId || '')) state.scopeRouting.routeCache.clear();
     return scope;
   };
 
@@ -2595,14 +2667,42 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     const normalizedKey = String(key || '');
     if (!matchesRoute(space, normalizedKey)) return { routed: false, kind: 'global', space, key: normalizedKey, logicalKey: normalizedKey, remoteKey: normalizedKey, scopeId: '', mode: MODE_PLUGIN_ONLY };
     if (!scopeRoutingEnabled) return { routed: true, kind: 'global', space, key: normalizedKey, logicalKey: normalizedKey, remoteKey: normalizedKey, scopeId: '', mode: MODE_PLUGIN_ONLY };
+
+    // Many durable keys already contain their immutable scope id, while shared
+    // archive/control keys never need a chat scope. Let explicitly opted-in
+    // resolvers classify those keys before touching the RisuAI character/chat
+    // APIs. This keeps archive traversal proportional to storage layers instead
+    // of layers multiplied by repeated current-chat discovery.
+    let registry = null;
+    let preResolved = null;
+    if (preResolveKeyScope && resolveKeyScopeProvider) {
+      try {
+        registry = await loadScopeRegistry(false, false);
+        preResolved = await resolveKeyScopeProvider({ namespace, pluginId, pluginVersion, space, key: normalizedKey, currentScope: null, registry });
+      } catch (_) { preResolved = null; }
+    }
+    const preKind = String(preResolved?.kind || preResolved?.type || '').trim().toLowerCase();
+    const preScope = preKind === 'scope' ? normalizeScopeDescriptor(preResolved?.scope || preResolved, '') : null;
+    const preResolvedWithoutCurrent = preKind === 'shared'
+      || preKind === 'global'
+      || (preKind === 'scope' && Boolean(preScope?.scopeId) && !preResolved?.scopeAlias);
+    if (preResolvedWithoutCurrent) {
+      const routeScopeId = preKind === 'scope' ? preScope.scopeId : `__${preKind}__`;
+      const preCacheKey = `${space}\n${normalizedKey}\n${routeScopeId}`;
+      if (!routeOptions.noCache && state.scopeRouting.routeCache.has(preCacheKey)) return state.scopeRouting.routeCache.get(preCacheKey);
+      const route = await normalizeRouteDescriptor(preResolved, space, normalizedKey, null);
+      state.scopeRouting.routeCache.set(preCacheKey, route);
+      return route;
+    }
+
     const currentScope = normalizeScopeDescriptor(routeOptions.scope || await resolveCurrentScope(routeOptions.forceScope === true));
     const cacheKey = `${space}\n${normalizedKey}\n${currentScope.scopeId}`;
     if (!routeOptions.noCache && state.scopeRouting.routeCache.has(cacheKey)) return state.scopeRouting.routeCache.get(cacheKey);
-    let raw = null;
+    let raw = preResolved;
     try {
-      raw = resolveKeyScopeProvider
-        ? await resolveKeyScopeProvider({ namespace, pluginId, pluginVersion, space, key: normalizedKey, currentScope, registry: await loadScopeRegistry(false, false) })
-        : { kind: 'scope', ...currentScope };
+      raw = raw || (resolveKeyScopeProvider
+        ? await resolveKeyScopeProvider({ namespace, pluginId, pluginVersion, space, key: normalizedKey, currentScope, registry: registry || await loadScopeRegistry(false, false) })
+        : { kind: 'scope', ...currentScope });
     } catch (error) {
       setStatus('scope_route_failed', error?.message || error, { key: compact(normalizedKey, 180), space });
       raw = { kind: 'scope', ...currentScope };
@@ -2652,6 +2752,11 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     if (!route.routed || route.mode === MODE_PLUGIN_ONLY) return typeof legacyGet === 'function' ? await legacyGet() : null;
     if (route.mode === MODE_MIRROR) {
       const localValue = typeof legacyGet === 'function' ? await legacyGet() : null;
+      const config = await readConfig();
+      if (cachedBootstrapFailure(config.url)) {
+        setStatus('server_unavailable_local_only', 'memory_suite_server_unavailable', { scopeId: route.scopeId, mode: route.mode, key: compact(key, 160), space });
+        return localValue;
+      }
       const projected = isNullishStorageValue(localValue) ? null : await routeProjectValue(route, localValue);
       if (!isNullishStorageValue(projected)) {
         try {
@@ -2754,6 +2859,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       if (route.mode !== MODE_SERVER_ONLY) visible.push(key);
       if (route.mode !== MODE_PLUGIN_ONLY) requiresServer = true;
     }
+    if (!requiresServer) return [...new Set(visible)];
     let remote = { keys: [], tombstones: [] };
     try { remote = await remoteKeys(space, prefix, { allowPluginOnly: true }); }
     catch (error) {
@@ -2761,7 +2867,11 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       return [...new Set(visible)];
     }
     const tombstones = new Set();
-    for (const raw of Array.isArray(remote.tombstones) ? remote.tombstones : []) tombstones.add(scopedRemoteKeyInfo(raw).logicalKey);
+    for (const raw of Array.isArray(remote.tombstones) ? remote.tombstones : []) {
+      const decoded = scopedRemoteKeyInfo(raw);
+      if (decoded.scopeId && decoded.scopeId !== currentScope.scopeId) continue;
+      tombstones.add(decoded.logicalKey);
+    }
     for (const remoteKey of Array.isArray(remote.keys) ? remote.keys : []) {
       const decoded = scopedRemoteKeyInfo(remoteKey);
       if (decoded.scopeId && decoded.scopeId !== currentScope.scopeId) continue;
@@ -2846,7 +2956,13 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     cache.set(legacy, proxy);
     scheduleScopedAutomaticMigration(legacy, space);
     if (space === 'plugin') setTimeout(() => {
-      void hydrateScopeRegistryFromServer().then(() => scopedResumePendingSyncJob()).catch(() => {});
+      void (async () => {
+        const scope = await resolveCurrentScope(false);
+        const modeState = await readScopeMode(scope, false);
+        if (modeState.mode === MODE_PLUGIN_ONLY) return;
+        await hydrateScopeRegistryFromServer();
+        await scopedResumePendingSyncJob();
+      })().catch(() => {});
     }, 0);
     return proxy;
   };
@@ -3409,7 +3525,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       #${rootId} h3{margin:0;font-size:18px} #${rootId} .muted{color:#9eacc3;font-size:12px;line-height:1.5}
       #${rootId} .scope{padding:11px 12px;background:#172236;border:1px solid #3b4d6b;border-radius:10px} #${rootId} .scope b{display:block;margin-bottom:4px}
       #${rootId} .modes{display:grid;gap:8px} #${rootId} label.mode{display:flex;gap:9px;align-items:flex-start;border:1px solid #34425b;border-radius:10px;padding:10px;cursor:pointer}
-      #${rootId} input[type=text]{width:100%;padding:10px 11px;border-radius:9px;border:1px solid #465a79;background:#0b1321;color:#fff}
+      #${rootId} input[type=text],#${rootId} input[type=password]{width:100%;padding:10px 11px;border-radius:9px;border:1px solid #465a79;background:#0b1321;color:#fff}
       #${rootId} .actions{display:flex;flex-wrap:wrap;gap:8px} #${rootId} button{border:1px solid #50658a;background:#1d2a42;color:#fff;border-radius:9px;padding:9px 12px;font-weight:700;cursor:pointer} #${rootId} button.primary{background:#2d5bd1;border-color:#4c79e4} #${rootId} button.danger{background:#51212a;border-color:#8e4350}
       #${rootId} button:disabled{opacity:.45;cursor:not-allowed} #${rootId} .status{white-space:pre-wrap;border:1px solid #34425b;background:#0c1422;border-radius:10px;padding:11px;min-height:46px;font-size:12px;line-height:1.55}
       #${rootId} .job{display:none;border:1px solid #365275;background:#101d31;border-radius:12px;padding:12px;gap:9px} #${rootId} .job.show{display:grid}
@@ -3445,7 +3561,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       q('[data-job-retry]').textContent=`재시도 ${Number(job.retryCount||0)} · 실패 ${Number(job.failures||0)}`; q('[data-job-key]').textContent=`현재: ${job.currentKey || job.currentAction || '-'}`;
     };
     q('[data-test]').onclick = async()=>{ setMessage('서버 연결을 확인하고 있습니다…'); const result=await testConnection(q('[data-url]').value); setMessage(result.ok?`연결됨\nMemory Suite ${result.serverVersion}\nProtocol ${result.protocol?.major}.${result.protocol?.minor}\nnamespace ${namespace} · 항목 ${result.liveRecords}`:`연결 실패\n${result.error}`,result.ok?'good':'error'); };
-    q('[data-apply]').onclick = async()=>{ const mode=root.querySelector(`input[name="${rootId}-mode"]:checked`)?.value||MODE_PLUGIN_ONLY; try{ const job=await scopedStartConnectionConfigurationJob({mode,url:q('[data-url]').value,scope:initial.scope}); setMessage('설정 적용과 현재 스코프 초기 동기화를 시작했습니다.'); renderJob(job);}catch(error){setMessage(`설정 적용 시작 실패\n${error?.message||error}`,'error');} };
+    q('[data-apply]').onclick = async()=>{ const mode=root.querySelector(`input[name="${rootId}-mode"]:checked`)?.value||MODE_PLUGIN_ONLY; try{const job=await scopedStartConnectionConfigurationJob({mode,url:q('[data-url]').value,scope:initial.scope}); setMessage('설정 적용과 현재 스코프 초기 동기화를 시작했습니다.'); renderJob(job);}catch(error){setMessage(`설정 적용 시작 실패\n${error?.message||error}`,'error');} };
     q('[data-sync]').onclick = async()=>{ try{const job=await scopedStartSynchronizationJob();setMessage('현재 스코프 동기화를 시작했습니다.');renderJob(job);}catch(error){setMessage(`동기화 시작 실패\n${error?.message||error}`,'error');} };
     q('[data-restore]').onclick = async()=>{ try{const job=await scopedStartRestoreJob();setMessage('현재 스코프 복구를 시작했습니다.');renderJob(job);}catch(error){setMessage(`복구 시작 실패\n${error?.message||error}`,'error');} };
     let armedUntil=0;
@@ -3572,6 +3688,17 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       try {
         scope = normalizeScopeDescriptor(options.scope || await resolveCurrentScope(false));
         mode = (await readScopeMode(scope, false)).mode;
+        if (mode === MODE_PLUGIN_ONLY && options.probeServer !== true) {
+          const result = {
+            schema: 'memory-suite.plugin-server-diagnostics.v1', generatedAt: Date.now(), reachable: null,
+            reason: 'plugin_only_no_server_probe', namespace, pluginId, pluginVersion, storageMode: mode,
+            scope: scope ? { label: String(scope.label || ''), available: scope.available !== false } : null,
+            clientStatus: { ...state.status }
+          };
+          state.diagnostics.value = result;
+          state.diagnostics.at = Date.now();
+          return cloneDiagnosticValue(result);
+        }
         const connection = await bootstrap(force, true);
         if (connection?.capabilities?.['server-diagnostics.v1'] !== true) {
           const result = {
@@ -3634,7 +3761,16 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     if (state.diagnostics.timer) clearTimeout(state.diagnostics.timer);
     state.diagnostics.timer = setTimeout(() => {
       state.diagnostics.timer = null;
-      refreshDiagnostics(options).catch(() => {});
+      void (async () => {
+        const registry = await loadScopeRegistry(false, false);
+        const hasServerScope = Object.values(registry?.entries || {}).some(row => normalizeMode(row?.mode) !== MODE_PLUGIN_ONLY);
+        // Once legacy mode migration is complete, a fully plugin-only registry
+        // needs no startup chat lookup and no diagnostics request.
+        if (registry?.legacyGlobalModeImported === true && !hasServerScope) return;
+        const scope = await resolveCurrentScope(false);
+        if ((await readScopeMode(scope, false)).mode === MODE_PLUGIN_ONLY) return;
+        await refreshDiagnostics(options);
+      })().catch(() => {});
     }, Math.max(0, Number(delayMs || 0) || 0));
     return true;
   };
@@ -3849,13 +3985,14 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     })
   });
   scheduleManagementRegistration();
-  scheduleDiagnosticsRefresh(1200, { limit: 250 });
+  const startupDiagnosticsDelayMs = Math.max(1200, Math.min(15000, Number(options.startupDiagnosticsDelayMs || (3500 + (namespaceDelaySeed % 7) * 350)) || 3500));
+  scheduleDiagnosticsRefresh(startupDiagnosticsDelayMs, { limit: 250 });
   return bridge;
 
 };
 
   const PLUGIN_NAME = 'RE:TRACE';
-  const PLUGIN_VERSION = '1.9.43';
+const PLUGIN_VERSION = '1.9.48';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v2';
   const HANDOFF_ACCEPTED_SCHEMAS = new Set(['memory-session-bridge-v1', HANDOFF_SCHEMA]);
   const HANDOFF_JOURNAL_SCHEMA = 'memory-session-bridge-handoff-journal-v1';
@@ -3865,7 +4002,6 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
   const HAYAKU_HANDOFF_RECEIPT_SCHEMA = 'hayaku.session_handoff.receipt.v1';
   const HAYAKU_REQUIRED_HANDOFF_CONTRACT = 'hayaku.handoff_immutable_source.v1';
   const LIBRA_REQUIRED_HANDOFF_CONTRACT = 'libra.handoff_immutable_source.v1';
-  const GRADIA_REQUIRED_HANDOFF_CONTRACT = 'gradia.handoff_immutable_source.v1';
   const LIA_REQUIRED_HANDOFF_CONTRACT = 'lia.live_persona_handoff_immutable_source.v1';
   const LIBRA_PLUGIN_ID = 'libra';
   const LIBRA_IPC_SCHEMA = 'libra-retrace-ipc-v1';
@@ -3877,22 +4013,10 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
   const LIBRA_CHAT_HANDOFF_MARKER_SCHEMA = 'retrace.libra_handoff_marker.v1';
   const LIBRA_IPC_TIMEOUT_MAX_MS = 120000;
   const LIBRA_INSPECT_TIMEOUT_MS = 15000;
+  const LIBRA_INSPECT_SUMMARY_TIMEOUT_MS = 5000;
   const LIBRA_PREPARE_TIMEOUT_MS = 90000;
   const LIBRA_ADOPT_TIMEOUT_MS = 90000;
   const LIBRA_VERIFY_TIMEOUT_MS = 60000;
-  const GRADIA_PLUGIN_ID = 'serial_gradation_agents_for_rp';
-  const GRADIA_IPC_SCHEMA = 'gradia-retrace-ipc-v1';
-  const GRADIA_IPC_REQUEST_CHANNEL = 'gradia_retrace_bridge_request_v1';
-  const GRADIA_IPC_RESPONSE_CHANNEL = 'gradia_retrace_bridge_response_v1';
-  const GRADIA_INSPECT_SCHEMA = 'gradia.retrace.inspect.v1';
-  const GRADIA_CAPABILITIES_SCHEMA = 'gradia.retrace.capabilities.v1';
-  const GRADIA_HANDOFF_RECEIPT_SCHEMA = 'gradia.session_handoff.receipt.v1';
-  const GRADIA_CHAT_HANDOFF_MARKER_SCHEMA = 'retrace.gradia_handoff_marker.v1';
-  const GRADIA_IPC_TIMEOUT_MAX_MS = 120000;
-  const GRADIA_INSPECT_TIMEOUT_MS = 15000;
-  const GRADIA_PREPARE_TIMEOUT_MS = 90000;
-  const GRADIA_ADOPT_TIMEOUT_MS = 90000;
-  const GRADIA_VERIFY_TIMEOUT_MS = 60000;
   const LIA_PLUGIN_ID = 'lia_persona_linker';
   const LIA_IPC_SCHEMA = 'lia-persona-handoff-ipc-v1';
   const LIA_IPC_REQUEST_CHANNEL = 'lia_persona_handoff_request_v1';
@@ -4043,10 +4167,6 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     libraIpcPending: new Map(),
     libraIpcLastSeenAt: 0,
     libraIpcLastError: '',
-    gradiaIpcRegistered: false,
-    gradiaIpcPending: new Map(),
-    gradiaIpcLastSeenAt: 0,
-    gradiaIpcLastError: '',
     liaIpcRegistered: false,
     liaIpcPending: new Map(),
     liaIpcLastError: '',
@@ -4122,14 +4242,6 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       receiptSchema: LIBRA_HANDOFF_RECEIPT_SCHEMA,
       peerRole: 'canonical_long_term_memory'
     }),
-    gradia: Object.freeze({
-      key: 'gradia',
-      label: 'GRADIA',
-      pluginId: GRADIA_PLUGIN_ID,
-      handoffContract: GRADIA_REQUIRED_HANDOFF_CONTRACT,
-      receiptSchema: GRADIA_HANDOFF_RECEIPT_SCHEMA,
-      peerRole: 'narrative_planning_state'
-    }),
     lia: Object.freeze({
       key: 'lia',
       label: 'LIA',
@@ -4139,6 +4251,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       peerRole: 'live_persona_state'
     })
   });
+  const ACTIVE_RETRACE_PEER_KEYS = Object.freeze(['flashback', 'hayaku', 'libra', 'lia']);
 
   const peerCompatibilityPayload = value => {
     const source = value && typeof value === 'object' ? value : {};
@@ -4502,8 +4615,17 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       const result = await api.pluginStorage.setItem(key, value);
       if (result === false) return false;
       if (typeof api.pluginStorage.getItem === 'function') {
-        const readback = await api.pluginStorage.getItem(key);
-        if (JSON.stringify(readback) !== JSON.stringify(value)) throw new Error('retrace_pluginstorage_readback_mismatch');
+        const expected = JSON.stringify(value);
+        let matched = false;
+        for (const waitMs of [0, 40, 120, 240]) {
+          if (waitMs) await delay(waitMs);
+          const readback = await api.pluginStorage.getItem(key);
+          if (JSON.stringify(readback) === expected) {
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) throw new Error('retrace_pluginstorage_readback_mismatch');
       }
       return true;
     } catch (error) {
@@ -4576,7 +4698,8 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     pluginPrefixes:[COLD_START_PREFIX,COLD_START_RUN_PREFIX,INCREMENTAL_RECOVERY_PREFIX,INCREMENTAL_RECOVERY_RUN_PREFIX,HAYAKU_BACKUP_PREFIX,HAYAKU_BACKUP_CATALOG_PREFIX],
     excludedKeys:[SETTINGS_KEY,LOCAL_SETTINGS_BACKUP_KEY],
     excludedContains:['api_key','apikey','authorization','bearer','credential','secret','password','token'],
-    currentScopeProvider:memorySuiteRetraceCurrentScope, resolveKeyScope:memorySuiteRetraceResolveKeyScope
+    currentScopeProvider:memorySuiteRetraceCurrentScope, resolveKeyScope:memorySuiteRetraceResolveKeyScope,
+    preResolveKeyScope:true
   });
 
   const RetracePluginStorage = MemorySuiteStorageBridge.createPluginStorageProxy(RetraceLegacyPluginStorage);
@@ -4585,7 +4708,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     ['flashback', 'flashback_memory'],
     ['hayaku', 'hayaku_locator_continuity'],
     ['libra', 'libra'],
-    ['gradia', 'serial_gradation_agents_for_rp'],
     ['lia', 'lia_persona_linker']
   ].map(([namespace, peerPluginId]) => [namespace, createMemorySuiteStorageBridge({
     namespace,
@@ -4603,22 +4725,28 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     if (key.startsWith('vector_rag_memory:')) return 'flashback';
     if (key.startsWith('hayaku.v1') || key.startsWith('hayaku.archive.v1') || key.startsWith('hayaku.v2.')) return 'hayaku';
     if (key.startsWith('libra:v1:')) return 'libra';
-    if (key.startsWith('serial_gradation_agents_for_rp:') || key.startsWith('gradia.narrative.local_vector.')) return 'gradia';
     if (key.startsWith('liaPersona') || key.startsWith('dynamicPersonaLorebookGeneratorResultVault')) return 'lia';
     return '';
   };
 
   const memorySuitePeerSpaceForKey = keyValue => {
     const key = text(keyValue || '');
-    if (key.startsWith('gradia.narrative.local_vector.')) return 'local';
     if (key.startsWith('vector_rag_memory:local-vector-shard:')) return 'local';
     if (key.startsWith('libra:v1:local-vector:')) return 'local';
     return 'plugin';
   };
 
-  const peerServerRead = async (namespace, key, space = 'plugin') => {
+  const retraceMemorySuiteMode = async () => {
+    try { return text(await MemorySuiteStorageBridge.getMode()).trim() || 'plugin_only'; }
+    catch (_) { return 'plugin_only'; }
+  };
+
+  const peerServerRead = async (namespace, key, space = 'plugin', options = {}) => {
     const bridge = MemorySuitePeerServerBridges[namespace];
     if (!bridge) return { available: false, exists: false, tombstone: false, value: null, reason: 'unknown_namespace' };
+    if (options?.forceServer !== true && await retraceMemorySuiteMode() === 'plugin_only') {
+      return { available: false, skipped: true, exists: false, tombstone: false, value: null, reason: 'plugin_only_no_server_probe' };
+    }
     try {
       const result = await bridge.serverGet(space, key);
       return { available: true, ...result };
@@ -4629,18 +4757,42 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
 
   const inspectMemorySuitePeerServerData = async (options = {}) => {
     const rows = {};
-    const entries = Object.entries({ ...MemorySuitePeerServerBridges, retrace: MemorySuiteStorageBridge })
-      .filter(([namespace]) => namespace !== 'hayaku' || options?.hayakuOwnerReady === true);
-    if (options?.hayakuOwnerReady !== true) {
-      rows.hayaku = {
-        available: false,
-        skipped: true,
-        integrityOk: false,
-        records: 0,
-        liveRecords: 0,
-        tombstones: 0,
-        reason: 'hayaku_owner_absent_disabled'
-      };
+    const allEntries = Object.entries({ ...MemorySuitePeerServerBridges, retrace: MemorySuiteStorageBridge });
+    const peerAvailability = options?.peerAvailability && typeof options.peerAvailability === 'object'
+      ? options.peerAvailability
+      : {};
+    const entries = allEntries.filter(([namespace]) => namespace === 'retrace' || peerAvailability[namespace] !== false);
+    for (const [namespace] of allEntries) {
+      if (namespace !== 'retrace' && peerAvailability[namespace] === false) {
+        rows[namespace] = {
+          available: false, skipped: true, integrityOk: false, records: 0, liveRecords: 0, tombstones: 0,
+          reason: `${namespace}_owner_absent_disabled`
+        };
+      }
+    }
+    if (await retraceMemorySuiteMode() === 'plugin_only') {
+      for (const [namespace] of entries) {
+        rows[namespace] = {
+          available: false, skipped: true, integrityOk: false, records: 0, liveRecords: 0, tombstones: 0,
+          reason: 'plugin_only_no_server_probe'
+        };
+      }
+      Runtime.memorySuitePeerServer = { at: Date.now(), skipped: true, reason: 'plugin_only_no_server_probe', namespaces: rows };
+      return Runtime.memorySuitePeerServer;
+    }
+    try {
+      // A single RE:TRACE bootstrap preflight prevents every peer bridge from
+      // independently waiting on the same dead loopback endpoint.
+      await MemorySuiteStorageBridge.bootstrap(false);
+    } catch (error) {
+      const reason = text(error?.code || '') === 'MEMORY_SUITE_SERVER_UNAVAILABLE'
+        ? 'memory_suite_server_unavailable'
+        : compact(error?.message || error, 240);
+      for (const [namespace] of entries) {
+        rows[namespace] = { available: false, integrityOk: false, records: 0, liveRecords: 0, tombstones: 0, reason };
+      }
+      Runtime.memorySuitePeerServer = { at: Date.now(), available: false, reason, namespaces: rows };
+      return Runtime.memorySuitePeerServer;
     }
     await Promise.all(entries.map(async ([namespace, bridge]) => {
       try {
@@ -4672,10 +4824,9 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     const peerNamespace = memorySuitePeerNamespaceForKey(key);
     if (peerNamespace) {
       const space = memorySuitePeerSpaceForKey(key);
-      const [localValue, remote] = await Promise.all([
-        legacyStorageGet(key),
-        peerServerRead(peerNamespace, key, space)
-      ]);
+      const localValue = await legacyStorageGet(key);
+      if (await retraceMemorySuiteMode() === 'plugin_only') return localValue;
+      const remote = await peerServerRead(peerNamespace, key, space, { forceServer: true });
       // A server tombstone is authoritative for a serverized key and prevents
       // stale pluginStorage remnants from resurrecting data after guarded deletion.
       if (remote.available && remote.tombstone === true) return null;
@@ -6138,9 +6289,20 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     return normalized;
   };
 
+  const CURRENT_CONTEXT_HOST_TIMEOUT_MS = 1800;
   const currentContextHostCall = async (label, operation, fallback = null) => {
+    let timer = null;
     try {
-      return await Promise.resolve().then(operation);
+      return await Promise.race([
+        Promise.resolve().then(operation),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error(`${text(label || 'host context call')} timed out after ${CURRENT_CONTEXT_HOST_TIMEOUT_MS}ms`);
+            error.code = 'RETRACE_HOST_CONTEXT_TIMEOUT';
+            reject(error);
+          }, CURRENT_CONTEXT_HOST_TIMEOUT_MS);
+        })
+      ]);
     } catch (error) {
       const detail = compact(error?.message || error || '', 180);
       const chatSelectionRace = /(?:chatPage|reading ['"]chatPage['"]|undefined.*chatPage)/i.test(detail);
@@ -6151,6 +6313,8 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       });
       Runtime.warnings = Runtime.warnings.slice(-30);
       return fallback;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   };
 
@@ -6165,16 +6329,18 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         );
         const characterIndex = Number(characterIndexRaw);
         if (Number.isInteger(characterIndex) && characterIndex >= 0) {
-          const character = await currentContextHostCall(
-            attempt ? `retry${attempt}:getCharacterFromIndex` : 'getCharacterFromIndex',
-            () => indexed.getCharacterFromIndex(characterIndex),
-            null
-          );
-          const chatIndexRaw = await currentContextHostCall(
-            attempt ? `retry${attempt}:getCurrentChatIndex` : 'getCurrentChatIndex',
-            () => indexed.getCurrentChatIndex(),
-            -1
-          );
+          const [character, chatIndexRaw] = await Promise.all([
+            currentContextHostCall(
+              attempt ? `retry${attempt}:getCharacterFromIndex` : 'getCharacterFromIndex',
+              () => indexed.getCharacterFromIndex(characterIndex),
+              null
+            ),
+            currentContextHostCall(
+              attempt ? `retry${attempt}:getCurrentChatIndex` : 'getCurrentChatIndex',
+              () => indexed.getCurrentChatIndex(),
+              -1
+            )
+          ]);
           let chatIndex = Number(chatIndexRaw);
           let usedCharacterChatPageFallback = false;
           if ((!Number.isInteger(chatIndex) || chatIndex < 0) && character) {
@@ -6557,406 +6723,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     });
   };
 
-
-  const registerGradiaIpc = async () => {
-    if (Runtime.gradiaIpcRegistered) return true;
-    const api = liveApi(['addPluginChannelListener', 'postPluginChannelMessage']);
-    if (typeof api?.addPluginChannelListener !== 'function'
-      || typeof api?.postPluginChannelMessage !== 'function') return false;
-    await api.addPluginChannelListener(
-      GRADIA_IPC_RESPONSE_CHANNEL,
-      (message, metadata = {}) => {
-        const response = message && typeof message === 'object' && !Array.isArray(message) ? message : {};
-        if (response.schema !== GRADIA_IPC_SCHEMA || response.kind !== 'response') return;
-        const sender = text(metadata?.sender || '').trim();
-        if (sender !== GRADIA_PLUGIN_ID) return;
-        const requestId = text(response.requestId || '').trim();
-        const pending = Runtime.gradiaIpcPending.get(requestId);
-        if (!pending) return;
-        if (text(response.action || '').trim() !== pending.action) return;
-        Runtime.gradiaIpcPending.delete(requestId);
-        Runtime.gradiaIpcLastSeenAt = Date.now();
-        Runtime.gradiaIpcLastError = response.ok === true ? '' : text(response.error || 'GRADIA IPC request failed.');
-        clearTimeout(pending.timer);
-        if (response.ok === true) pending.resolve(response.result);
-        else {
-          const error = new Error(Runtime.gradiaIpcLastError || 'GRADIA IPC request failed.');
-          error.code = 'GRADIA_IPC_REJECTED';
-          error.remoteReachable = true;
-          error.action = pending.action;
-          pending.reject(error);
-        }
-      }
-    );
-    Runtime.gradiaIpcRegistered = true;
-    return true;
-  };
-
-  const requestGradiaIpc = async (action, payload = {}, options = {}) => {
-    const registered = await registerGradiaIpc().catch(error => {
-      warn('GRADIA IPC listener registration failed', error);
-      return false;
-    });
-    const api = liveApi(['postPluginChannelMessage']);
-    if (!registered || typeof api?.postPluginChannelMessage !== 'function') {
-      const error = new Error('GRADIA IPC API is unavailable. GRADIA v0.25.25 or later is required.');
-      error.code = 'GRADIA_IPC_UNAVAILABLE';
-      throw error;
-    }
-    const requestId = uuid();
-    const timeoutMs = Math.max(400, Math.min(GRADIA_IPC_TIMEOUT_MAX_MS, Number(options.timeoutMs || 4000) || 4000));
-    return await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        Runtime.gradiaIpcPending.delete(requestId);
-        const error = new Error(`GRADIA IPC timed out after ${timeoutMs}ms.`);
-        error.code = 'GRADIA_IPC_TIMEOUT';
-        error.action = text(action || '').trim();
-        Runtime.gradiaIpcLastError = error.message;
-        reject(error);
-      }, timeoutMs);
-      Runtime.gradiaIpcPending.set(requestId, { resolve, reject, timer, action: text(action || '').trim(), at: Date.now() });
-      Promise.resolve(api.postPluginChannelMessage(
-        GRADIA_PLUGIN_ID,
-        GRADIA_IPC_REQUEST_CHANNEL,
-        { schema: GRADIA_IPC_SCHEMA, kind: 'request', requestId, action: text(action || '').trim(), payload: clone(payload, {}) }
-      )).catch(error => {
-        const pending = Runtime.gradiaIpcPending.get(requestId);
-        if (!pending) return;
-        Runtime.gradiaIpcPending.delete(requestId);
-        clearTimeout(pending.timer);
-        Runtime.gradiaIpcLastError = text(error?.message || error);
-        reject(error);
-      });
-    });
-  };
-
-  const probeGradiaIpc = async (options = {}) => {
-    const timeoutMs = Math.max(500, Math.min(5000, Number(options.timeoutMs || 1800) || 1800));
-    const attempts = Math.max(1, Math.min(3, Number(options.attempts || 2) || 2));
-    let lastError = null;
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      try {
-        const result = await requestGradiaIpc('ping', {}, { timeoutMs });
-        const schemaOk = result?.schema === GRADIA_CAPABILITIES_SCHEMA;
-        return {
-          available: true, reachable: true, schemaOk, legacy: !schemaOk,
-          pluginVersion: text(result?.pluginVersion || ''), capabilities: clone(result, {}),
-          attempts: attempt, reason: schemaOk ? 'gradia_ping_ok' : 'gradia_ping_legacy_response'
-        };
-      } catch (error) {
-        lastError = error;
-        if (error?.remoteReachable === true || text(error?.code) === 'GRADIA_IPC_REJECTED') {
-          return {
-            available: true, reachable: true, schemaOk: false, legacy: true,
-            pluginVersion: '', capabilities: {}, attempts: attempt,
-            reason: 'gradia_ping_rejected_but_reachable', error: text(error?.message || error)
-          };
-        }
-        if (attempt < attempts) await delay(120);
-      }
-    }
-    return {
-      available: false, reachable: false, schemaOk: false, legacy: false,
-      pluginVersion: '', capabilities: {}, attempts,
-      reason: text(lastError?.code || 'gradia_ipc_unavailable'), error: text(lastError?.message || lastError || '')
-    };
-  };
-
-  const activeGradiaRuntime = () => {
-    try {
-      const candidate = globalThis.__SerialGradationAgentsForRP
-        || globalThis.__pluginApis__?.serial_gradation_agents_for_rp
-        || globalThis.__pluginApis__?.GRADIA;
-      if (candidate && typeof candidate === 'object') return candidate;
-    } catch (_) {}
-    return null;
-  };
-
-  const normalizeGradiaInspection = (inspection, identity = {}, readSource = 'gradia_plugin_ipc') => {
-    const source = inspection && typeof inspection === 'object' && !Array.isArray(inspection) ? inspection : {};
-    const schemaOk = source.schema === GRADIA_INSPECT_SCHEMA;
-    const scope = source.scope && typeof source.scope === 'object' ? source.scope : {};
-    const requestedChatId = text(identity?.chatId || '').trim();
-    const chatId = text(scope.chatId || '').trim();
-    const scopeMatches = !requestedChatId || !chatId || requestedChatId === chatId;
-    const integrityOk = schemaOk && scopeMatches && source?.integrity?.ok !== false;
-    const counts = source.counts && typeof source.counts === 'object' ? clone(source.counts, {}) : {};
-    const storyArcCount = Math.max(0, Math.min(1, Number(counts.storyArc || (source.storyArc ? 1 : 0)) || 0));
-    const writerDesignCount = Math.max(0, Math.min(1, Number(counts.writerDesign || (source.writerDesign ? 1 : 0)) || 0));
-    const narrativeArchiveCount = Math.max(
-      0,
-      Number(counts.narrativeArchive ?? source.narrativeArchive?.entries?.length ?? 0) || 0
-    );
-    return {
-      available: schemaOk && scopeMatches && integrityOk && (storyArcCount > 0 || writerDesignCount > 0 || narrativeArchiveCount > 0),
-      pluginAvailable: schemaOk,
-      inspectionAvailable: schemaOk && scopeMatches,
-      integrityOk,
-      reason: !schemaOk ? 'gradia_ipc_contract_unavailable'
-        : !scopeMatches ? 'gradia_scope_mismatch'
-          : !integrityOk ? text(source?.integrity?.reason || 'gradia_integrity_failed')
-            : (storyArcCount || writerDesignCount || narrativeArchiveCount) ? 'loaded' : 'empty',
-      readSource,
-      pluginVersion: text(source.pluginVersion || ''),
-      scope,
-      integrity: clone(source.integrity, { ok: integrityOk }),
-      counts: { ...counts, storyArc: storyArcCount, writerDesign: writerDesignCount, narrativeArchive: narrativeArchiveCount },
-      storyArc: source.storyArc && typeof source.storyArc === 'object' ? clone(source.storyArc, {}) : null,
-      writerDesign: source.writerDesign && typeof source.writerDesign === 'object' ? clone(source.writerDesign, {}) : null,
-      narrativeArchive: source.narrativeArchive && typeof source.narrativeArchive === 'object' ? clone(source.narrativeArchive, {}) : null,
-      narrativeArchiveRef: source.narrativeArchiveRef && typeof source.narrativeArchiveRef === 'object' ? clone(source.narrativeArchiveRef, {}) : null,
-      payloadIncluded: source.payloadIncluded !== false,
-      storyArcCount,
-      writerDesignCount,
-      narrativeArchiveCount,
-      manualUserIntentCount: Math.max(0, Number(counts.manualUserIntent || 0) || 0),
-      storyArcBeatCount: Math.max(0, Number(counts.storyArcBeats || source.storyArc?.beats?.length || 0) || 0),
-      completedTurnCount: Math.max(0, Number(counts.completedTurns || 0) || 0),
-      snapshotHash: text(source.snapshotHash || ''),
-      inspectedAt: text(source.inspectedAt || '')
-    };
-  };
-
-  const readGradiaSource = async (context, options = {}) => {
-    const identity = contextIdentity(context || await getCurrentContext());
-    const includePayload = options?.includePayload !== false;
-    const probe = await probeGradiaIpc({ timeoutMs: 1800, attempts: 2 });
-    if (probe.available) {
-      try {
-        const inspected = await requestGradiaIpc('inspect', { includePayload }, { timeoutMs: GRADIA_INSPECT_TIMEOUT_MS });
-        const normalized = normalizeGradiaInspection(inspected, identity, 'gradia_plugin_ipc');
-        normalized.capabilities = clone(probe.capabilities, {});
-        normalized.probe = clone(probe, {});
-        return normalized;
-      } catch (error) {
-        const code = text(error?.code || '').trim();
-        const reason = code === 'GRADIA_IPC_TIMEOUT' ? 'gradia_inspect_timeout' : 'gradia_inspect_failed';
-        warn('GRADIA IPC inspection failed after successful discovery', error);
-        return {
-          available: false, pluginAvailable: true, inspectionAvailable: false, integrityOk: false,
-          reason, readSource: 'gradia_plugin_ipc', pluginVersion: text(probe.pluginVersion || ''),
-          scope: {}, integrity: { ok: false, reason }, counts: {}, storyArc: null, writerDesign: null, narrativeArchive: null,
-          narrativeArchiveRef: null, payloadIncluded: includePayload,
-          storyArcCount: 0, writerDesignCount: 0, narrativeArchiveCount: 0, manualUserIntentCount: 0, storyArcBeatCount: 0,
-          completedTurnCount: 0, snapshotHash: '', capabilities: clone(probe.capabilities, {}), probe: clone(probe, {}),
-          errors: [text(error?.message || error || reason)]
-        };
-      }
-    }
-    const runtime = activeGradiaRuntime();
-    if (runtime && typeof runtime.inspectForRetrace === 'function') {
-      try {
-        const inspected = await runtime.inspectForRetrace({ includePayload });
-        const normalized = normalizeGradiaInspection(inspected, identity, 'gradia_runtime_api');
-        normalized.probe = clone(probe, {});
-        return normalized;
-      } catch (error) { warn('GRADIA runtime inspection failed', error); }
-    }
-    return {
-      available: false, pluginAvailable: false, inspectionAvailable: false, integrityOk: false,
-      reason: 'gradia_ipc_unavailable', readSource: 'none', pluginVersion: '', scope: {}, integrity: { ok: false },
-      counts: {}, storyArc: null, writerDesign: null, narrativeArchive: null, narrativeArchiveRef: null,
-      payloadIncluded: includePayload, storyArcCount: 0, writerDesignCount: 0, narrativeArchiveCount: 0,
-      manualUserIntentCount: 0, storyArcBeatCount: 0, completedTurnCount: 0, snapshotHash: '',
-      probe: clone(probe, {}), errors: [probe.error || 'GRADIA v0.25.25 or later IPC contract is required.']
-    };
-  };
-
-  const gradiaReceiptCountMatches = (receipt, field, expected) => (
-    Boolean(receipt && Object.prototype.hasOwnProperty.call(receipt, field))
-    && Number.isInteger(Number(receipt[field]))
-    && Number(receipt[field]) === expected
-  );
-
-  const gradiaOwnerReceiptMatches = (receipt, transport, mutation) => (
-    transport !== 'gradia_plugin_ipc'
-    || (
-      text(receipt?.ownerPluginId || '') === GRADIA_PLUGIN_ID
-      && text(receipt?.authorizedRequester || '') === 'flashback_hayaku_bridge'
-      && text(receipt?.mutation || '') === mutation
-    )
-  );
-
-  const gradiaArchiveReceiptCountMatches = (receipt, field, expected) => {
-    const required = Math.max(0, Number(expected || 0) || 0) > 0;
-    if (!receipt || !Object.prototype.hasOwnProperty.call(receipt, field)) return !required;
-    return Number.isInteger(Number(receipt[field])) && Number(receipt[field]) === expected;
-  };
-
-  const gradiaArchiveReceiptMatches = (receipt, options) => {
-    const expectedArchiveId = text(options?.expectedNarrativeArchiveId || '').trim();
-    const expectedArchiveDigest = text(options?.expectedNarrativeArchiveDigest || '').trim();
-    const expectedArchiveGeneration = Math.max(0, Number(options?.expectedNarrativeArchiveGeneration || 0) || 0);
-    if (expectedArchiveId && text(receipt?.narrativeArchiveId || '') !== expectedArchiveId) return false;
-    if (expectedArchiveDigest && text(receipt?.narrativeArchiveDigest || '') !== expectedArchiveDigest) return false;
-    if (expectedArchiveGeneration && Number(receipt?.narrativeArchiveGeneration || 0) !== expectedArchiveGeneration) return false;
-    return true;
-  };
-
-  const gradiaPreparationReceiptMatches = (receipt, options, transport) => {
-    const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
-    const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
-    const expectedNarrativeArchive = Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0);
-    return receipt?.schema === GRADIA_HANDOFF_RECEIPT_SCHEMA
-      && receipt?.action === 'prepared'
-      && receipt?.prepared === true
-      && receipt?.durable === true
-      && text(receipt?.transferId || '') === text(options?.transferId || '')
-      && gradiaReceiptCountMatches(receipt, 'storyArc', expectedStoryArc)
-      && gradiaReceiptCountMatches(receipt, 'expectedStoryArc', expectedStoryArc)
-      && gradiaReceiptCountMatches(receipt, 'writerDesign', expectedWriterDesign)
-      && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
-      && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
-      && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
-      && gradiaArchiveReceiptMatches(receipt, options)
-      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.gradia, { physicalField: 'physicalNarrativeArchiveCopies' })
-      && memorySuiteStorageReceiptMatches(receipt, 'gradia')
-      && gradiaOwnerReceiptMatches(receipt, transport, 'prepare_session_handoff');
-  };
-
-  const gradiaAdoptionReceiptMatches = (receipt, options, transport) => {
-    const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
-    const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
-    const expectedNarrativeArchive = Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0);
-    return receipt?.schema === GRADIA_HANDOFF_RECEIPT_SCHEMA
-      && receipt?.action === 'adopted'
-      && receipt?.verified === true
-      && receipt?.durable === true
-      && text(receipt?.targetChatId || '') === text(options?.targetChatId || '')
-      && text(receipt?.transferId || '') === text(options?.transferId || '')
-      && gradiaReceiptCountMatches(receipt, 'storyArc', expectedStoryArc)
-      && gradiaReceiptCountMatches(receipt, 'expectedStoryArc', expectedStoryArc)
-      && gradiaReceiptCountMatches(receipt, 'writerDesign', expectedWriterDesign)
-      && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
-      && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
-      && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
-      && gradiaArchiveReceiptMatches(receipt, options)
-      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.gradia, { physicalField: 'physicalNarrativeArchiveCopies' })
-      && memorySuiteStorageReceiptMatches(receipt, 'gradia')
-      && gradiaOwnerReceiptMatches(receipt, transport, 'adopt_session_handoff');
-  };
-
-  const gradiaVerificationReceiptMatches = (receipt, options, transport) => {
-    const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
-    const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
-    const expectedNarrativeArchive = Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0);
-    return receipt?.schema === GRADIA_HANDOFF_RECEIPT_SCHEMA
-      && receipt?.action === 'verified'
-      && receipt?.verified === true
-      && receipt?.durable === true
-      && text(receipt?.targetChatId || '') === text(options?.targetChatId || '')
-      && text(receipt?.transferId || '') === text(options?.transferId || '')
-      && gradiaReceiptCountMatches(receipt, 'storyArc', expectedStoryArc)
-      && gradiaReceiptCountMatches(receipt, 'expectedStoryArc', expectedStoryArc)
-      && gradiaReceiptCountMatches(receipt, 'writerDesign', expectedWriterDesign)
-      && gradiaReceiptCountMatches(receipt, 'expectedWriterDesign', expectedWriterDesign)
-      && gradiaArchiveReceiptCountMatches(receipt, 'narrativeArchive', expectedNarrativeArchive)
-      && gradiaArchiveReceiptCountMatches(receipt, 'expectedNarrativeArchive', expectedNarrativeArchive)
-      && gradiaArchiveReceiptMatches(receipt, options)
-      && sourcePreservationReceiptMatches(receipt, RETRACE_PEER_REQUIREMENTS.gradia, { physicalField: 'physicalNarrativeArchiveCopies' })
-      && memorySuiteStorageReceiptMatches(receipt, 'gradia')
-      && gradiaOwnerReceiptMatches(receipt, transport, 'verify_session_handoff');
-  };
-
-  const prepareGradiaSessionHandoff = async options => {
-    const runtime = activeGradiaRuntime();
-    try {
-      const result = await requestGradiaIpc('prepare_session_handoff', options || {}, { timeoutMs: GRADIA_PREPARE_TIMEOUT_MS });
-      if (!gradiaPreparationReceiptMatches(result, options, 'gradia_plugin_ipc')) throw new Error('GRADIA handoff preparation receipt is invalid.');
-      return { ...result, transport: 'gradia_plugin_ipc' };
-    } catch (error) {
-      // A live GRADIA owner rejection is authoritative. Do not issue the same
-      // mutation again through a shared-runtime fallback; only transport-level
-      // timeout/unavailability may fall back when such a runtime actually exists.
-      const code = text(error?.code || '').trim();
-      const ownerRejected = error?.remoteReachable === true || code === 'GRADIA_IPC_REJECTED';
-      if (!ownerRejected && runtime && typeof runtime.prepareSessionHandoff === 'function') {
-        const result = await runtime.prepareSessionHandoff(options || {});
-        if (!gradiaPreparationReceiptMatches(result, options, 'gradia_runtime_api')) throw new Error('GRADIA runtime handoff preparation receipt is invalid.');
-        return { ...result, transport: 'gradia_runtime_api' };
-      }
-      throw error;
-    }
-  };
-
-  const adoptGradiaSessionHandoff = async options => {
-    const expectedStoryArc = Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0));
-    const expectedWriterDesign = Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0));
-    const expectedNarrativeArchive = Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0);
-    const runtime = activeGradiaRuntime();
-    try {
-      const result = await requestGradiaIpc('adopt_session_handoff', options || {}, { timeoutMs: GRADIA_ADOPT_TIMEOUT_MS });
-      return { ...result, transport: 'gradia_plugin_ipc' };
-    } catch (error) {
-      const code = text(error?.code || '').trim();
-      const ownerRejected = error?.remoteReachable === true || code === 'GRADIA_IPC_REJECTED';
-      if (!ownerRejected && runtime && typeof runtime.adoptSessionHandoff === 'function') {
-        try { return { ...(await runtime.adoptSessionHandoff(options || {})), transport: 'gradia_runtime_api' }; }
-        catch (runtimeError) { error = runtimeError; }
-      }
-      return {
-        schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: false, durable: false,
-        storyArc: 0, expectedStoryArc, writerDesign: 0, expectedWriterDesign,
-        narrativeArchive: 0, expectedNarrativeArchive,
-        targetChatId: text(options?.targetChatId || ''), transferId: text(options?.transferId || ''),
-        transport: 'unavailable', reason: text(error?.message || error || 'gradia_handoff_adoption_failed')
-      };
-    }
-  };
-
-  const adoptGradiaSessionHandoffDurable = async options => {
-    let last = null;
-    const maxAttempts = 4;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      last = await adoptGradiaSessionHandoff(options || {});
-      if (gradiaAdoptionReceiptMatches(last, options, last?.transport)) return { ...last, attempts: attempt };
-      if (attempt < maxAttempts) await delay(Math.min(1200, 220 * attempt));
-    }
-    return { ...(last || {}), attempts: maxAttempts, verified: false, durable: false, reason: 'gradia_handoff_receipt_mismatch' };
-  };
-
-  const verifyDurableGradiaSessionHandoff = async options => {
-    if (options?.included !== true) return {
-      schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: true, durable: true,
-      adopted: false, storyArc: 0, expectedStoryArc: 0, writerDesign: 0, expectedWriterDesign: 0,
-      narrativeArchive: 0, expectedNarrativeArchive: 0, reason: 'no_gradia_data'
-    };
-    const payload = {
-      transferId: text(options?.transferId || ''),
-      targetChatId: text(options?.targetChatId || ''),
-      expectedStoryArc: Math.max(0, Math.min(1, Number(options?.expectedStoryArc || 0) || 0)),
-      expectedWriterDesign: Math.max(0, Math.min(1, Number(options?.expectedWriterDesign || 0) || 0)),
-      expectedNarrativeArchive: Math.max(0, Number(options?.expectedNarrativeArchive || 0) || 0),
-      expectedNarrativeArchiveId: text(options?.expectedNarrativeArchiveId || ''),
-      expectedNarrativeArchiveGeneration: Math.max(0, Number(options?.expectedNarrativeArchiveGeneration || 0) || 0),
-      expectedNarrativeArchiveDigest: text(options?.expectedNarrativeArchiveDigest || '')
-    };
-    const runtime = activeGradiaRuntime();
-    try {
-      const result = await requestGradiaIpc('verify_session_handoff', payload, { timeoutMs: GRADIA_VERIFY_TIMEOUT_MS });
-      return gradiaVerificationReceiptMatches(result, payload, 'gradia_plugin_ipc')
-        ? { ...result, transport: 'gradia_plugin_ipc' }
-        : { ...result, verified: false, durable: false, transport: 'gradia_plugin_ipc', reason: 'gradia_handoff_receipt_mismatch' };
-    } catch (error) {
-      const code = text(error?.code || '').trim();
-      const ownerRejected = error?.remoteReachable === true || code === 'GRADIA_IPC_REJECTED';
-      if (!ownerRejected && runtime && typeof runtime.verifySessionHandoff === 'function') {
-        try {
-          const result = await runtime.verifySessionHandoff(payload);
-          return gradiaVerificationReceiptMatches(result, payload, 'gradia_runtime_api')
-            ? { ...result, transport: 'gradia_runtime_api' }
-            : { ...result, verified: false, durable: false, transport: 'gradia_runtime_api', reason: 'gradia_handoff_receipt_mismatch' };
-        } catch (runtimeError) { error = runtimeError; }
-      }
-      return {
-        schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: false, durable: false,
-        storyArc: 0, expectedStoryArc: payload.expectedStoryArc, writerDesign: 0, expectedWriterDesign: payload.expectedWriterDesign,
-        narrativeArchive: 0, expectedNarrativeArchive: payload.expectedNarrativeArchive,
-        targetChatId: payload.targetChatId, transferId: payload.transferId, transport: 'unavailable',
-        reason: text(error?.message || error || 'gradia_handoff_verification_failed')
-      };
-    }
-  };
 
   const registerLiaIpc = async () => {
     if (Runtime.liaIpcRegistered) return true;
@@ -8310,6 +8076,7 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       readSource,
       archiveRef: ledger.archiveRef && typeof ledger.archiveRef === 'object' ? clone(ledger.archiveRef, {}) : null,
       archiveVerified,
+      archiveVerificationDeferred: ledger.archiveVerificationDeferred === true,
       storageLimits: clone(ledger?.storageLimits || ledger?.storage || {}, {}),
       packetAuthoring: normalizeHayakuPacketAuthoringProfile(
         packetAuthoring || ledger?.packetAuthoring,
@@ -8358,6 +8125,7 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         recordCount: Number(inspected?.recordCount ?? inspectedLedger?.recordCount ?? 0) || 0,
         archiveRef: clone(inspected?.archiveRef || inspectedLedger?.archiveRef || null, null),
         archiveVerified: inspected?.archiveVerified ?? inspectedLedger?.archiveVerified,
+        archiveVerificationDeferred: inspected?.archiveVerificationDeferred === true || inspectedLedger?.archiveVerificationDeferred === true,
         storageLimits: clone(inspected?.storageLimits || inspectedLedger?.storageLimits || {}, {})
       };
       return {
@@ -12369,7 +12137,7 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     const probe = await probeLibraIpc({ timeoutMs: 1800, attempts: 2 });
     if (probe.available) {
       try {
-        const inspected = await requestLibraIpc('inspect', { includeRecords }, { timeoutMs: includeRecords ? Math.max(30000, LIBRA_INSPECT_TIMEOUT_MS) : LIBRA_INSPECT_TIMEOUT_MS });
+        const inspected = await requestLibraIpc('inspect', { includeRecords }, { timeoutMs: includeRecords ? Math.max(30000, LIBRA_INSPECT_TIMEOUT_MS) : LIBRA_INSPECT_SUMMARY_TIMEOUT_MS });
         const normalized = normalizeLibraInspection(inspected, identity, 'libra_plugin_ipc');
         normalized.capabilities = clone(probe.capabilities, {});
         normalized.probe = clone(probe, {});
@@ -12654,13 +12422,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         raw = probe.capabilities;
         transport = 'libra_plugin_ipc';
         errorText = text(probe.error || '');
-      } else if (key === 'gradia') {
-        const probe = await probeGradiaIpc({ timeoutMs, attempts: 1 });
-        installed = probe.available === true || probe.reachable === true;
-        ownerReachable = installed;
-        raw = probe.capabilities;
-        transport = 'gradia_plugin_ipc';
-        errorText = text(probe.error || '');
       } else if (key === 'lia') {
         raw = await requestLiaIpc('capabilities', {}, { timeoutMs });
         installed = true;
@@ -12674,7 +12435,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         'FLASHBACK_IPC_REJECTED',
         'HAYAKU_IPC_REJECTED',
         'LIBRA_IPC_REJECTED',
-        'GRADIA_IPC_REJECTED',
         'LIA_IPC_REJECTED'
       ].includes(code) || error?.remoteReachable === true;
       ownerReachable = installed;
@@ -12754,14 +12514,13 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     flashback: Math.max(0, Number(preview?.flashback?.loadedRecords ?? preview?.flashback?.records ?? 0) || 0) > 0,
     hayaku: preview?.includeHayaku === true && Math.max(0, Number(preview?.hayakuRecordCount || 0) || 0) > 0,
     libra: preview?.includeLibra === true,
-    gradia: preview?.includeGradia === true,
     lia: isLiaLivePersonaId(preview?.identity?.personaId)
   });
 
   const inspectCompatibilitySuite = async (previewValue = null, options = {}) => {
     const preview = previewValue || Runtime.lastPreview || await inspectTransition();
     const required = compatibilityRequiredForPreview(preview);
-    const entries = await Promise.all(Object.keys(RETRACE_PEER_REQUIREMENTS).map(key => (
+    const entries = await Promise.all(ACTIVE_RETRACE_PEER_KEYS.map(key => (
       probeUniversalPeerCompatibility(key, {
         required: required[key] === true,
         timeoutMs: options.timeoutMs,
@@ -12853,7 +12612,7 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         ? `이번 승계에 사용되지 않는 설치 플러그인 ${formatNumber(warningCount)}개에서 호환 계약 불일치가 감지됐습니다. 현재 승계에는 참여하지 않으므로 진행할 수 있지만, 해당 플러그인의 데이터가 있는 세션에서는 업데이트가 필요합니다.`
         : '이번 승계에 필요한 모든 플러그인이 공통 비파괴 승계 계약을 만족합니다. 미설치 또는 사용하지 않는 플러그인은 승계를 막지 않습니다.';
     panel.className = `compatibility-panel ${statusClass}`;
-    panel.innerHTML = `<div class="compatibility-head"><div><strong>6개 플러그인 호환성</strong><span>${escapeHtml(warning)}</span></div><em>${escapeHtml(statusText)}</em></div>
+    panel.innerHTML = `<div class="compatibility-head"><div><strong>${formatNumber((suite.peers || []).length)}개 플러그인 호환성</strong><span>${escapeHtml(warning)}</span></div><em>${escapeHtml(statusText)}</em></div>
       <div class="compat-grid">${rows}</div>
       <div class="compat-actions"><button id="refreshCompatibility" class="btn" type="button">호환성 다시 확인</button>${(!suite.compatible || warningCount) ? '<button id="ackCompatibility" class="btn" type="button">경고 확인</button>' : ''}</div>`;
     bindCompatibilityControls();
@@ -12940,7 +12699,7 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     const panel = Runtime.root?.querySelector?.('#compatibilityPanel');
     if (panel) {
       panel.className = 'compatibility-panel checking';
-      panel.innerHTML = '<div class="compatibility-head"><div><strong>6개 플러그인 호환성</strong><span>공통 승계 계약과 버전 독립 호환성을 확인하는 중입니다.</span></div><em>CHECKING</em></div>';
+      panel.innerHTML = '<div class="compatibility-head"><div><strong>플러그인 호환성</strong><span>공통 승계 계약과 버전 독립 호환성을 확인하는 중입니다.</span></div><em>CHECKING</em></div>';
     }
     try {
       const suite = await inspectCompatibilitySuite(previewValue, { timeoutMs: 2800 });
@@ -13148,21 +12907,33 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     }
   };
 
-  const inspectTransition = async () => {
+  const inspectTransition = async (options = {}) => {
     const context = await getCurrentContext();
+    const identity = contextIdentity(context);
     const pendingHandoff = await inspectPendingNextSessionHandoff({ context });
     const hayakuOwnerGate = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
     const hayakuDisabled = { available: false, ownerReady: false, reason: 'hayaku_owner_absent', records: [], recordCount: 0, scope: hayakuScopeFor(context) };
     const noCapsule = { available: false, reason: 'hayaku_owner_absent', packets: [] };
-    const [flashback, hayaku, pendingColdStart, pendingIncrementalRecovery, libra, gradia, memorySuiteServer] = await Promise.all([
+    const [flashback, hayaku, pendingColdStart, pendingIncrementalRecovery, libra] = await Promise.all([
       readFlashbackSource(context, { includeRecords: false }),
       hayakuOwnerGate.ready === true ? readHayakuSource(context, { includeRecords: false, ownerGate: hayakuOwnerGate }) : Promise.resolve(hayakuDisabled),
       hayakuOwnerGate.ready === true ? readPendingColdStartCapsule(context, { ownerGate: hayakuOwnerGate }) : Promise.resolve(noCapsule),
       hayakuOwnerGate.ready === true ? readPendingIncrementalRecoveryCapsule(context, { ownerGate: hayakuOwnerGate }) : Promise.resolve(noCapsule),
-      readLibraSource(context, { includeRecords: false }),
-      readGradiaSource(context, { includePayload: false }),
-      inspectMemorySuitePeerServerData({ hayakuOwnerReady: hayakuOwnerGate.ready === true })
+      readLibraSource(context, { includeRecords: false })
     ]);
+    let memorySuiteServer = Runtime.memorySuitePeerServer;
+    if (options?.includeServerData === true) {
+      memorySuiteServer = await inspectMemorySuitePeerServerData({
+        peerAvailability: {
+          flashback: Boolean(activeFlashbackRuntime()) || Runtime.flashbackIpcLastSeenAt > 0 || flashback?.readSource === 'flashback_plugin_ipc',
+          hayaku: hayakuOwnerGate.ready === true,
+          libra: libra?.pluginAvailable === true,
+          lia: isLiaLivePersonaId(identity.personaId)
+        }
+      });
+    } else if (!memorySuiteServer || Date.now() - Number(memorySuiteServer.at || 0) > 30000) {
+      memorySuiteServer = { at: Date.now(), skipped: true, reason: 'server_probe_deferred', namespaces: {} };
+    }
     const baseHayakuRecordCount = hayakuOwnerGate.ready === true && hayaku.available
       ? Math.max(0, Number(hayaku.recordCount ?? hayaku.records?.length ?? 0) || 0)
       : 0;
@@ -13175,19 +12946,17 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         };
     const preview = {
       context,
-      identity: contextIdentity(context),
+      identity,
       flashback,
       hayaku,
       hayakuOwnerGate,
       libra,
-      gradia,
       pendingColdStart,
       pendingIncrementalRecovery,
       hayakuRecoveryAccounting,
       pendingHandoff,
       includeHayaku: hayakuOwnerGate.ready === true && (hayaku.available === true || pendingColdStart.available === true || pendingIncrementalRecovery.available === true),
       includeLibra: libra.available === true,
-      includeGradia: gradia.available === true,
       hayakuRecordCount: hayakuRecoveryAccounting.logicalRecordCount,
       hayakuCurrentRecordCount: hayakuRecoveryAccounting.currentSnapshotRecordCount,
       hayakuRecoveryRecordCount: hayakuRecoveryAccounting.recoveryRecordCount,
@@ -13195,9 +12964,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       hayakuArchiveRecordCount: hayakuRecoveryAccounting.archiveRecordCount,
       hayakuRecoveryDurableVerified: hayakuRecoveryAccounting.durableVerified,
       libraRecordCount: libra.recordCount,
-      gradiaStoryArcCount: gradia.storyArcCount,
-      gradiaWriterDesignCount: gradia.writerDesignCount,
-      gradiaNarrativeArchiveCount: gradia.narrativeArchiveCount,
       memorySuiteServer,
       serverDataDetected: Object.fromEntries(Object.entries(memorySuiteServer?.namespaces || {}).map(([key, value]) => [
         key,
@@ -13468,7 +13234,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     (status?.flashbackRequired !== true || status?.flashbackVerified === true)
     && (status?.hayakuRequired !== true || status?.hayakuVerified === true)
     && (status?.libraRequired !== true || status?.libraVerified === true)
-    && (status?.gradiaRequired !== true || status?.gradiaVerified === true)
     && (status?.liaRequired !== true || status?.liaVerified === true)
   );
 
@@ -13491,14 +13256,10 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     const hayakuRecords = Math.max(0, Number(bridge.hayakuRecordCount || 0) || 0);
     const libraRecords = Math.max(0, Number(bridge.libraRecordCount || 0) || 0);
     const libraWorldAdditional = Math.max(0, Number(bridge.libraWorldAdditionalCount || 0) || 0);
-    const gradiaStoryArc = Math.max(0, Number(bridge.gradiaStoryArcCount || 0) || 0);
-    const gradiaWriterDesign = Math.max(0, Number(bridge.gradiaWriterDesignCount || 0) || 0);
-    const gradiaNarrativeArchive = Math.max(0, Number(bridge.gradiaNarrativeArchiveCount || 0) || 0);
     const sourceLivePersonaId = text(bridge.sourceLiaLivePersonaId || '').trim();
     const flashbackRequired = bridge.includeFlashback === true && flashbackRecords > 0;
     const hayakuRequired = bridge.includeHayaku === true && hayakuRecords > 0;
     const libraRequired = bridge.includeLibra === true;
-    const gradiaRequired = bridge.includeGradia === true;
     const liaRequired = bridge.includeLiaLivePersona === true && isLiaLivePersonaId(sourceLivePersonaId);
     const libraOptions = withLegacyLibraWorldAdditionalExpectation({
       targetChatId, transferId,
@@ -13507,16 +13268,7 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       expectedArchiveGeneration: Math.max(0, Number(bridge.libraArchiveGeneration || 0) || 0),
       expectedArchiveDigest: text(bridge.libraArchiveDigest || '')
     }, libraWorldAdditional);
-    const gradiaOptions = {
-      targetChatId, transferId,
-      expectedStoryArc: gradiaStoryArc,
-      expectedWriterDesign: gradiaWriterDesign,
-      expectedNarrativeArchive: gradiaNarrativeArchive,
-      expectedNarrativeArchiveId: text(bridge.gradiaNarrativeArchiveId || ''),
-      expectedNarrativeArchiveGeneration: Math.max(0, Number(bridge.gradiaNarrativeArchiveGeneration || 0) || 0),
-      expectedNarrativeArchiveDigest: text(bridge.gradiaNarrativeArchiveDigest || '')
-    };
-    const [flashbackAdoption, hayakuAdoption, libraAdoption, gradiaAdoptionInitial, liaAdoption] = await Promise.all([
+    const [flashbackAdoption, hayakuAdoption, libraAdoption, liaAdoption] = await Promise.all([
       adoptFlashbackSessionHandoff({
         targetChatId, transferId,
         sourceScopeKey: text(bridge.sourceFlashbackScopeKey || ''),
@@ -13531,9 +13283,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       libraRequired
         ? adoptLibraSessionHandoffDurable(libraOptions)
         : Promise.resolve({ schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: true, durable: true, records: 0, expectedRecords: 0, reason: 'no_libra_data' }),
-      gradiaRequired
-        ? adoptGradiaSessionHandoffDurable(gradiaOptions)
-        : Promise.resolve({ schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, action: 'adopted', adopted: false, verified: true, durable: true, storyArc: 0, expectedStoryArc: 0, writerDesign: 0, expectedWriterDesign: 0, narrativeArchive: 0, expectedNarrativeArchive: 0, reason: 'no_gradia_data' }),
       adoptLiaLivePersonaHandoff({ sourceChatId, targetChatId, transferId, sourceLivePersonaId })
     ]);
     // A successful adoption response is not used as a substitute for a current
@@ -13542,9 +13291,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     const libraVerification = libraRequired
       ? await verifyDurableLibraSessionHandoff({ included: true, ...libraOptions })
       : { schema: LIBRA_HANDOFF_RECEIPT_SCHEMA, action: 'verified', verified: true, durable: true, records: 0, expectedRecords: 0, reason: 'no_libra_data' };
-    const gradiaAdoption = gradiaRequired && gradiaAdoptionInitial?.verified !== true
-      ? await verifyDurableGradiaSessionHandoff({ included: true, ...gradiaOptions })
-      : gradiaAdoptionInitial;
 
     const flashbackVerified = !flashbackRequired || (
       flashbackAdoption?.ok === true
@@ -13562,11 +13308,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     );
     const libraVerified = !libraRequired
       || libraVerificationReceiptMatches(libraVerification, libraOptions, libraVerification?.transport);
-    const gradiaVerified = !gradiaRequired || (
-      gradiaAdoption?.action === 'verified'
-        ? gradiaVerificationReceiptMatches(gradiaAdoption, gradiaOptions, gradiaAdoption?.transport)
-        : gradiaAdoptionReceiptMatches(gradiaAdoption, gradiaOptions, gradiaAdoption?.transport)
-    );
     const liaVerified = !liaRequired || liaAdoptionReceiptMatches(liaAdoption, {
       sourceChatId, targetChatId, transferId, sourceLivePersonaId
     });
@@ -13574,14 +13315,12 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       flashbackRequired, flashbackVerified,
       hayakuRequired, hayakuVerified,
       libraRequired, libraVerified,
-      gradiaRequired, gradiaVerified,
       liaRequired, liaVerified
     });
     const ownerStatus = {
       flashback: { required: flashbackRequired, verified: flashbackVerified, durable: flashbackAdoption?.durable === true, sourcePreserved: flashbackAdoption?.sourcePreserved === true, reason: text(flashbackAdoption?.reason || ''), receipt: clone(flashbackAdoption, {}) },
       hayaku: { required: hayakuRequired, verified: hayakuVerified, durable: hayakuAdoption?.durable === true, reason: text(hayakuAdoption?.reason || ''), receipt: clone(hayakuAdoption, {}) },
       libra: { required: libraRequired, verified: libraVerified, durable: libraVerification?.durable === true, reason: text(libraVerification?.reason || libraAdoption?.reason || ''), receipt: clone(libraVerification, {}) },
-      gradia: { required: gradiaRequired, verified: gradiaVerified, durable: gradiaAdoption?.durable === true, reason: text(gradiaAdoption?.reason || ''), receipt: clone(gradiaAdoption, {}) },
       lia: { required: liaRequired, verified: liaVerified, durable: liaAdoption?.durable === true && liaAdoption?.durableReadbackVerified === true, reason: text(liaAdoption?.reason || ''), receipt: clone(liaAdoption, {}) }
     };
     const finalJournal = await persistNextSessionHandoffJournal(targetChatId, transferId, {
@@ -13617,11 +13356,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       libraVerified, libraAdoption, libraVerification,
       libraRecords, libraWorldAdditional,
       libraSource: text(bridge.libraSource || 'none'),
-      gradiaScheduled: gradiaRequired && !gradiaVerified,
-      gradiaVerified, gradiaAdoption,
-      gradiaStoryArc, gradiaWriterDesign, gradiaNarrativeArchive,
-      gradiaStoryArcBeats: Math.max(0, Number(bridge.gradiaStoryArcBeatCount || 0) || 0),
-      gradiaSource: text(bridge.gradiaSource || 'none'),
       liaRequired, liaVerified, liaAdoption,
       sourceLivePersonaId: liaRequired ? sourceLivePersonaId : '',
       targetLivePersonaId: liaRequired ? text(liaAdoption?.livePersonaId || '') : '',
@@ -13690,8 +13424,8 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         transferId: pending.journal.transferId
       });
     }
-    const preview = await inspectTransition();
-    const { context, identity, flashback, hayaku, libra, gradia, pendingColdStart, pendingIncrementalRecovery } = preview;
+    const preview = await inspectTransition({ includeServerData: true });
+    const { context, identity, flashback, hayaku, libra, pendingColdStart, pendingIncrementalRecovery } = preview;
     const compatibilitySuite = await inspectCompatibilitySuite(preview, { timeoutMs: 3800, forceProbe: true });
     if (!compatibilitySuite.compatible) {
       const blocking = (compatibilitySuite.blocking || []).map(item => `${item.label}: ${item.reason}`).join(' / ');
@@ -13741,15 +13475,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         reason: libra.reason, records: libra.recordCount, integrity: libra.integrity, errors: libra.errors || []
       })}`);
     }
-    if (gradia.pluginAvailable && gradia.integrityOk === false) {
-      const inspectionFailed = ['gradia_inspect_timeout', 'gradia_inspect_failed'].includes(text(gradia.reason));
-      throw new Error(`${inspectionFailed
-        ? 'GRADIA is connected, but Story Arc/Writer/Narrative Archive inspection could not be verified; next-session handoff was stopped.'
-        : 'GRADIA Story Arc/Writer/Narrative Archive state integrity is incomplete; next-session handoff was stopped.'} ${JSON.stringify({
-        reason: gradia.reason, storyArc: gradia.storyArcCount, writerDesign: gradia.writerDesignCount,
-        narrativeArchive: gradia.narrativeArchiveCount, integrity: gradia.integrity, errors: gradia.errors || []
-      })}`);
-    }
     const targetChatId = uuid();
     const transferId = uuid();
     const createdAt = Date.now();
@@ -13768,23 +13493,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       || !libraLegacyWorldAdditionalMatches(libraPreparation, libraPrepareOptions)
     )) {
       throw new Error(`LIBRA next-session handoff preparation failed before creating the new chat: ${libraPreparation.reason || 'record_count_mismatch'}`);
-    }
-    const gradiaPreparation = preview.includeGradia
-      ? await prepareGradiaSessionHandoff({
-        transferId,
-        expectedStoryArc: gradia.storyArcCount,
-        expectedWriterDesign: gradia.writerDesignCount,
-        expectedNarrativeArchive: gradia.narrativeArchiveCount,
-        expectedSnapshotHash: gradia.snapshotHash
-      })
-      : { schema: GRADIA_HANDOFF_RECEIPT_SCHEMA, prepared: false, storyArc: 0, writerDesign: 0, narrativeArchive: 0, reason: 'no_gradia_data' };
-    if (preview.includeGradia && (
-      gradiaPreparation.prepared !== true
-      || Number(gradiaPreparation.storyArc || 0) !== Number(gradia.storyArcCount || 0)
-      || Number(gradiaPreparation.writerDesign || 0) !== Number(gradia.writerDesignCount || 0)
-      || Number(gradiaPreparation.narrativeArchive || 0) !== Number(gradia.narrativeArchiveCount || 0)
-    )) {
-      throw new Error(`GRADIA next-session handoff preparation failed before creating the new chat: ${gradiaPreparation.reason || 'record_count_mismatch'}`);
     }
 
     const nextCharacter = clone(context.character, null);
@@ -13818,20 +13526,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
           preparedAt: libraPreparation.preparedAt || new Date(createdAt).toISOString()
         }
       } : {}),
-      ...(preview.includeGradia ? {
-        gradiaSessionHandoff: {
-          schema: GRADIA_CHAT_HANDOFF_MARKER_SCHEMA,
-          transferId, sourceChatId: identity.chatId, targetChatId,
-          sourceStoryArcScopeKey: text(gradia.scope?.storyArcScopeKey || ''),
-          sourceWriterScopeKey: text(gradia.scope?.writerScopeKey || ''),
-          sourceNarrativeArchiveScopeKey: text(gradia.scope?.narrativeArchiveScopeKey || ''),
-          storyArcCount: gradia.storyArcCount,
-          writerDesignCount: gradia.writerDesignCount,
-          narrativeArchiveCount: gradia.narrativeArchiveCount,
-          sourceSnapshotHash: text(gradia.snapshotHash || ''),
-          preparedAt: gradiaPreparation.preparedAt || new Date(createdAt).toISOString()
-        }
-      } : {}),
       memorySessionBridge: {
         schema: HANDOFF_SCHEMA,
         timelineContract: 'session_epoch_then_completed_pair_v1',
@@ -13849,14 +13543,10 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         sourceFlashbackOwnerVersion: text(flashbackHandoffCapability?.pluginVersion || flashback.pluginVersion || ''),
         sourceHayakuScopeKey: text(hayaku.scope?.scopeKey || pendingIncrementalRecovery?.scope?.scopeKey || pendingColdStart?.scope?.scopeKey || ''),
         sourceLibraScopeKey: text(libra.scope?.scopeKey || ''),
-        sourceGradiaStoryArcScopeKey: text(gradia.scope?.storyArcScopeKey || ''),
-        sourceGradiaWriterScopeKey: text(gradia.scope?.writerScopeKey || ''),
-        sourceGradiaNarrativeArchiveScopeKey: text(gradia.scope?.narrativeArchiveScopeKey || ''),
         targetChatId,
         includeFlashback: true,
         includeHayaku: preview.includeHayaku === true,
         includeLibra: preview.includeLibra === true,
-        includeGradia: preview.includeGradia === true,
         includeLiaLivePersona: liaRequired,
         sourceLiaLivePersonaId: liaRequired ? sourceLivePersonaId : '',
         flashbackRecordCount: Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0),
@@ -13867,23 +13557,15 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         hayakuArchiveRecordCount: Math.max(0, Number(preview.hayakuArchiveRecordCount || 0) || 0),
         libraRecordCount: libra.recordCount,
         ...(Number(libra.worldAdditionalCount || 0) > 0 ? { libraWorldAdditionalCount: libra.worldAdditionalCount } : {}),
-        gradiaStoryArcCount: gradia.storyArcCount,
-        gradiaWriterDesignCount: gradia.writerDesignCount,
-        gradiaNarrativeArchiveCount: gradia.narrativeArchiveCount,
-        gradiaStoryArcBeatCount: gradia.storyArcBeatCount,
-        hayakuSource: hayaku.available
+              hayakuSource: hayaku.available
           ? (preview.hayakuPendingRecoveryRecordCount > 0 ? 'canonical_ledger+incremental_recovery_capsule' : 'canonical_ledger')
           : pendingColdStart.available
             ? (pendingIncrementalRecovery?.available ? 'pending_cold_start+incremental_recovery_capsule' : 'pending_cold_start')
             : pendingIncrementalRecovery?.available ? 'incremental_recovery_capsule' : 'none',
         libraSource: preview.includeLibra ? text(libra.readSource || 'unknown') : 'none',
-        gradiaSource: preview.includeGradia ? text(gradia.readSource || 'unknown') : 'none',
         libraArchiveId: text(libraPreparation?.archiveId || ''),
         libraArchiveGeneration: Math.max(0, Number(libraPreparation?.archiveGeneration || 0) || 0),
         libraArchiveDigest: text(libraPreparation?.archiveDigest || ''),
-        gradiaNarrativeArchiveId: text(gradiaPreparation?.narrativeArchiveId || ''),
-        gradiaNarrativeArchiveGeneration: Math.max(0, Number(gradiaPreparation?.narrativeArchiveGeneration || 0) || 0),
-        gradiaNarrativeArchiveDigest: text(gradiaPreparation?.narrativeArchiveDigest || ''),
         createdAt
       }
     };
@@ -13902,7 +13584,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         flashback: { required: Math.max(0, Number(flashback.loadedRecords ?? flashback.records ?? 0) || 0) > 0, verified: false },
         hayaku: { required: preview.includeHayaku === true && Number(preview.hayakuRecordCount || 0) > 0, verified: false },
         libra: { required: preview.includeLibra === true, verified: false },
-        gradia: { required: preview.includeGradia === true, verified: false },
         lia: { required: liaRequired, verified: false }
       }
     });
@@ -13938,16 +13619,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         || latestLibra.recordCount !== libra.recordCount
         || legacyWorldAdditionalChanged) {
         throw new Error('LIBRA canonical memory changed during handoff preparation. Run the transition again.');
-      }
-    }
-    if (preview.includeGradia) {
-      const latestGradia = await readGradiaSource(latest, { includePayload: false });
-      if (!latestGradia.integrityOk
-        || latestGradia.snapshotHash !== gradia.snapshotHash
-        || latestGradia.storyArcCount !== gradia.storyArcCount
-        || latestGradia.writerDesignCount !== gradia.writerDesignCount
-        || latestGradia.narrativeArchiveCount !== gradia.narrativeArchiveCount) {
-        throw new Error('GRADIA Story Arc/Writer/Narrative Archive state changed during handoff preparation. Run the transition again.');
       }
     }
     const writer = await saveCharacter(nextCharacter, context.characterIndex);
@@ -14403,7 +14074,7 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     confirmLabel: options.confirmLabel || '확인'
   });
 
-  const MEMORY_SUITE_SCOPE_NAMESPACES = Object.freeze(['flashback', 'hayaku', 'libra', 'gradia', 'lia', 'retrace']);
+  const MEMORY_SUITE_SCOPE_NAMESPACES = Object.freeze(['flashback', 'hayaku', 'libra', 'lia', 'retrace']);
   const MEMORY_SUITE_SCOPE_READ_MAX_BYTES = 20 * 1024 * 1024;
   const MEMORY_SUITE_SCOPE_PLAN_TTL_MS = 90 * 1000;
   const MEMORY_SUITE_SCOPE_STATUS_ORDER = Object.freeze(['active', 'referenced_ancestor', 'orphan_candidate', 'unverified']);
@@ -14414,16 +14085,8 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     unverified: '확인 불가'
   });
   const MEMORY_SUITE_NAMESPACE_LABELS = Object.freeze({
-    flashback: 'Flashback', hayaku: 'HAYAKU', libra: 'LIBRA', gradia: 'GRADIA', lia: 'LIA', retrace: 'RE:TRACE'
+    flashback: 'Flashback', hayaku: 'HAYAKU', libra: 'LIBRA', lia: 'LIA', retrace: 'RE:TRACE'
   });
-  const MEMORY_SUITE_GRADIA_STORE_SPECS = Object.freeze([
-    Object.freeze({ key: 'serial_gradation_agents_for_rp:story_arcs:v2', field: 'arcs', kind: 'Story Arc' }),
-    Object.freeze({ key: 'serial_gradation_agents_for_rp:writer_designs:v1', field: 'designs', kind: 'Writer/OOC' }),
-    Object.freeze({ key: 'serial_gradation_agents_for_rp:arc_cold_start_jobs:v1', field: 'jobs', kind: 'Arc 복구 작업' }),
-    Object.freeze({ key: 'serial_gradation_agents_for_rp:narrative_archives:v1', field: 'scopes', kind: 'Narrative Archive' }),
-    Object.freeze({ key: 'serial_gradation_agents_for_rp:native_chat_copy_registry:v1', field: 'entries', kind: '채팅 복사 기록' }),
-    Object.freeze({ key: 'serial_gradation_agents_for_rp:draft_checkpoints:v1', field: 'checkpoints', kind: '초안 체크포인트' })
-  ]);
 
   const MEMORY_SUITE_SCOPED_REMOTE_KEY_MARKER = '::memory-suite-scope:v1:';
   const scopeManagerScopedRemoteKeyInfo = keyValue => {
@@ -14978,120 +14641,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     for (const key of ['version', 'savedAt', 'updatedAt', 'schema']) delete copy[key];
     return copy;
   };
-  const scopeManagerScanGradia = async (snapshot, inventory, priorMap) => {
-    const aggregates = new Map();
-    let allParsed = true;
-    const ensureAggregate = scopeKey => {
-      const key = text(scopeKey || '').trim();
-      if (!key) return null;
-      const existing = aggregates.get(key);
-      if (existing) return existing;
-      const created = { scopeKey: key, values: [], stores: [], localKeys: new Set(), kinds: new Set(), links: [], parsed: true };
-      aggregates.set(key, created);
-      return created;
-    };
-    for (const spec of MEMORY_SUITE_GRADIA_STORE_SPECS) {
-      const records = scopeManagerRecordsForLogicalKey(snapshot, 'plugin', spec.key)
-        .filter(record => record.tombstone !== true);
-      for (const record of records) {
-        const keyInfo = scopeManagerScopedRemoteKeyInfo(record.key);
-        const loaded = await snapshot.read('plugin', record.key);
-        if (!loaded.ok || typeof loaded.parsed !== 'object') {
-          allParsed = false;
-          if (keyInfo.scopeId) ensureAggregate(keyInfo.scopeId).parsed = false;
-          continue;
-        }
-        const root = scopeManagerObject(loaded.parsed);
-        const container = scopeManagerContainer(root, spec.field);
-        const scopedEntries = keyInfo.scopeId
-          ? [[keyInfo.scopeId, container[keyInfo.scopeId] || Object.values(container)[0]]]
-          : Object.entries(container);
-        for (const [scopeKey, value] of scopedEntries) {
-          if (!scopeKey || !value || typeof value !== 'object') continue;
-          const aggregate = ensureAggregate(scopeKey);
-          aggregate.values.push(value);
-          aggregate.stores.push({ spec, record, loaded, root, container, scopedRecord: keyInfo.scoped });
-          aggregate.kinds.add(spec.kind);
-          aggregate.links.push(...scopeManagerCollectLinks(value, { archiveId: value?.archiveRef?.archiveId }));
-          for (const key of scopeManagerCollectLocalKeys(value, ['gradia.narrative.local_vector.'])) aggregate.localKeys.add(key);
-        }
-      }
-    }
-    const localReferenceCounts = new Map();
-    for (const aggregate of aggregates.values()) {
-      for (const localKey of aggregate.localKeys) localReferenceCounts.set(localKey, Number(localReferenceCounts.get(localKey) || 0) + 1);
-    }
-    const scopes = [];
-    const assignedLocal = new Set();
-    for (const aggregate of aggregates.values()) {
-      const mutations = [];
-      const members = [];
-      const byKey = new Map();
-      for (const store of aggregate.stores) {
-        if (byKey.has(store.record.key)) continue;
-        byKey.set(store.record.key, true);
-        if (store.scopedRecord) {
-          const owned = scopeManagerMember(store.record, false);
-          members.push(owned);
-          mutations.push(scopeManagerMutationFor(owned, 'remove'));
-        } else {
-          const shared = scopeManagerMember(store.record, true);
-          members.push(shared);
-          const nextRoot = clone(store.root, {});
-          const nextContainer = { ...scopeManagerContainer(nextRoot, store.spec.field) };
-          delete nextContainer[aggregate.scopeKey];
-          if (Object.prototype.hasOwnProperty.call(nextRoot, store.spec.field)) nextRoot[store.spec.field] = nextContainer;
-          else {
-            for (const key of Object.keys(nextRoot)) if (!['version', 'savedAt', 'updatedAt', 'schema'].includes(key)) delete nextRoot[key];
-            Object.assign(nextRoot, nextContainer);
-          }
-          nextRoot.savedAt = new Date().toISOString();
-          mutations.push(scopeManagerMutationFor(shared, 'set', scopeManagerEncodeLike(store.loaded.original, nextRoot)));
-        }
-      }
-      for (const localKey of aggregate.localKeys) {
-        const record = scopeManagerRecord(snapshot, 'local', localKey);
-        if (!record) continue;
-        assignedLocal.add(localKey);
-        const sharedVector = Number(localReferenceCounts.get(localKey) || 0) > 1;
-        members.push(scopeManagerMember(record, sharedVector));
-        if (!sharedVector) mutations.push(scopeManagerMutationFor(scopeManagerMember(record, false), 'remove'));
-      }
-      const descriptor = aggregate.values.reduce((current, value) => {
-        const next = scopeManagerDescriptorFrom(value, current);
-        return { ...current, ...Object.fromEntries(Object.entries(next).filter(([, item]) => item)) };
-      }, scopeManagerObject(scopeManagerPreviousFor(priorMap, 'gradia', aggregate.scopeKey)?.descriptor));
-      scopes.push(scopeManagerFinalize('gradia', {
-        scopeId: aggregate.scopeKey, scopeKey: aggregate.scopeKey, kind: Array.from(aggregate.kinds).join(' + ') || 'scope_data', descriptor,
-        members, links: aggregate.links, mutations,
-        coverageComplete: allParsed && aggregate.parsed !== false && aggregate.stores.length > 0,
-        keepPriorLinks: true
-      }, inventory, priorMap));
-    }
-    const unassignedLocal = snapshot.records.filter(record => record.space === 'local' && record.tombstone !== true && record.key.startsWith('gradia.narrative.local_vector.') && !assignedLocal.has(record.key));
-    if (unassignedLocal.length) {
-      const members = unassignedLocal.map(record => scopeManagerMember(record, false));
-      scopes.push(scopeManagerFinalize('gradia', {
-        scopeId: 'unassigned-local-vectors', kind: 'unassigned_local_vectors', descriptor: { displayName: 'GRADIA 연결 미확인 Narrative 벡터' },
-        members, mutations: scopeManagerPurgeMutations(members), links: [], coverageComplete: false
-      }, inventory, priorMap));
-    }
-    const archiveGroups = new Map();
-    for (const record of snapshot.records.filter(item => item.space === 'plugin' && item.tombstone !== true)) {
-      const match = /^serial_gradation_agents_for_rp:narrative_shared_archive:v1:(.+)$/.exec(record.key);
-      if (!match) continue;
-      const rows = archiveGroups.get(match[1]) || [];
-      rows.push(scopeManagerMember(record, false));
-      archiveGroups.set(match[1], rows);
-    }
-    for (const [archiveId, members] of archiveGroups.entries()) {
-      scopes.push(scopeManagerFinalize('gradia', {
-        scopeId: `archive:${archiveId}`, kind: 'shared_archive', descriptor: { displayName: `GRADIA Narrative 승계 아카이브 · ${archiveId}` },
-        members, mutations: scopeManagerPurgeMutations(members), links: [], coverageComplete: false
-      }, inventory, priorMap));
-    }
-    return scopes;
-  };
 
   const scopeManagerScanLia = async (snapshot, inventory, priorMap) => {
     const indexKey = 'liaPersonaLinkerLivePersonaIndexV2';
@@ -15272,7 +14821,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     if (namespace === 'flashback') return await scopeManagerScanFlashback(snapshot, inventory, priorMap);
     if (namespace === 'hayaku') return await scopeManagerScanHayaku(snapshot, inventory, priorMap);
     if (namespace === 'libra') return await scopeManagerScanLibra(snapshot, inventory, priorMap);
-    if (namespace === 'gradia') return await scopeManagerScanGradia(snapshot, inventory, priorMap);
     if (namespace === 'lia') return await scopeManagerScanLia(snapshot, inventory, priorMap);
     if (namespace === 'retrace') return await scopeManagerScanRetrace(snapshot, inventory, priorMap);
     return [];
@@ -15284,7 +14832,7 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     Runtime.serverScopeManagerLoading = true;
     Runtime.serverScopeManagerError = '';
     const body = Runtime.root?.querySelector?.('#serverDataBody');
-    if (body) body.innerHTML = '<div class="empty"><strong>서버 스코프 검사 중</strong><span>6개 namespace와 현재 RisuAI 채팅 목록을 비교하고 있습니다.</span></div>';
+    if (body) body.innerHTML = '<div class="empty"><strong>서버 스코프 검사 중</strong><span>5개 namespace와 현재 RisuAI 채팅 목록을 비교하고 있습니다.</span></div>';
     try {
       const inventory = await scopeManagerStableHostInventory();
       const priorCatalog = await MemorySuiteStorageBridge.managerListScopes().catch(() => ({ scopes: [] }));
@@ -15415,7 +14963,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       receipt = await requestHayakuIpc('memory_suite_prepare_server_scope_delete', payload, { ...options, requireAuthenticatedSender: true });
     }
     else if (scope.namespace === 'libra') receipt = await requestLibraIpc('memory_suite_prepare_server_scope_delete', payload, options);
-    else if (scope.namespace === 'gradia') receipt = await requestGradiaIpc('memory_suite_prepare_server_scope_delete', payload, options);
     else if (scope.namespace === 'lia') receipt = await requestLiaIpc('memory_suite_prepare_server_scope_delete', payload, options);
     else if (scope.namespace === 'retrace') receipt = await MemorySuiteStorageBridge.prepareServerScopeDeletion(payload);
     else throw new Error(`지원하지 않는 owner namespace입니다: ${scope.namespace}`);
@@ -15665,10 +15212,10 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       @media(max-width:560px){.session-handoff-flow{grid-template-columns:1fr}.bridge{height:100dvh;max-height:100dvh;border-radius:0;grid-template-columns:64px minmax(0,1fr);grid-template-rows:62px minmax(0,1fr)}.top{padding:0 10px}.brand span,.global-status{display:none}.flow,.metrics,.settings-feature-grid,.packet-sections,.analysis-console-metrics{grid-template-columns:1fr}.ledger-key small{display:none}.field-wide,.profile-actions{grid-column:1}}
       .server-scope-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.server-scope-filters{display:flex;gap:6px;flex-wrap:wrap}.server-scope-filters .btn.active{border-color:var(--lra-primary);background:var(--lra-primary-soft);color:var(--lra-primary)}.server-scope-list{display:grid;gap:10px}.server-scope-card{padding:14px;border:1px solid var(--lra-line);border-radius:15px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.server-scope-card.orphan{border-color:color-mix(in srgb,var(--lra-red) 38%,var(--lra-line))}.server-scope-card.ancestor{border-color:color-mix(in srgb,var(--lra-primary) 38%,var(--lra-line))}.server-scope-card.pinned{border-color:color-mix(in srgb,var(--lra-green) 45%,var(--lra-line))}.server-scope-head{display:flex;justify-content:space-between;gap:12px}.server-scope-head>div{min-width:0;display:grid;gap:2px}.server-scope-head strong{font-size:14px;overflow-wrap:anywhere}.server-scope-head small{color:var(--lra-text-3);overflow-wrap:anywhere}.server-scope-namespace{width:max-content;padding:2px 6px;border-radius:999px;background:var(--lra-surface-2);color:var(--lra-text-2);font-size:9px;font-weight:800}.server-scope-badge{height:max-content;padding:3px 8px;border-radius:999px;font-style:normal;font-size:9px;font-weight:800}.server-scope-badge.active{background:var(--lra-green-soft);color:var(--lra-green)}.server-scope-badge.ancestor{background:var(--lra-primary-soft);color:var(--lra-primary)}.server-scope-badge.orphan{background:color-mix(in srgb,var(--lra-red) 12%,var(--lra-surface));color:var(--lra-red)}.server-scope-badge.unverified{background:var(--lra-surface-2);color:var(--lra-text-2)}.server-scope-badge.pinned{background:var(--lra-green-soft);color:var(--lra-green)}.server-scope-card>p{margin:9px 0;color:var(--lra-text-2)}.server-scope-meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--lra-text-3);font-size:10px}.server-scope-meta span{padding:2px 6px;border-radius:999px;background:var(--lra-surface-2)}.server-scope-references{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}.server-scope-references b{width:100%;font-size:10px}.server-scope-references span{padding:2px 6px;border-radius:7px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px}.server-scope-blocked,.server-scope-safe{margin:10px 0;padding:8px 10px;border-radius:9px;font-size:10px}.server-scope-blocked{background:var(--lra-surface-2);color:var(--lra-text-2)}.server-scope-safe{background:color-mix(in srgb,var(--lra-red) 7%,var(--lra-surface));color:var(--lra-red)}.btn.danger{border-color:color-mix(in srgb,var(--lra-red) 45%,var(--lra-line));color:var(--lra-red)}.btn.danger:hover{background:color-mix(in srgb,var(--lra-red) 8%,var(--lra-surface))}
 
-      .server-data-summary{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 14px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.server-data-summary>div{display:grid;gap:3px}.server-data-summary span,.server-data-summary em{color:var(--lra-text-3);font-style:normal;font-size:10px}.server-data-summary.ok{border-color:color-mix(in srgb,var(--lra-green) 35%,var(--lra-line));background:color-mix(in srgb,var(--lra-green) 5%,var(--lra-surface))}.server-data-summary.warn{border-color:color-mix(in srgb,var(--lra-red) 28%,var(--lra-line));background:color-mix(in srgb,var(--lra-red) 4%,var(--lra-surface))}.server-data-scan-errors{display:grid;gap:5px;padding:12px 14px;border:1px solid color-mix(in srgb,var(--lra-red) 28%,var(--lra-line));border-radius:13px;background:color-mix(in srgb,var(--lra-red) 5%,var(--lra-surface));color:var(--lra-red)}.server-data-scan-errors span{font-size:10px;overflow-wrap:anywhere}.server-scope-group{display:grid;gap:9px}.server-scope-group-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;padding:4px 2px}.server-scope-group-head h3{margin:0;font-size:15px}.server-scope-group-head p{margin:2px 0 0;color:var(--lra-text-3);font-size:10px}.server-scope-group-head em{padding:3px 8px;border-radius:999px;background:var(--lra-surface-2);color:var(--lra-text-2);font-style:normal;font-weight:800}.server-scope-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:start}.server-scope-card.active{border-color:color-mix(in srgb,var(--lra-green) 34%,var(--lra-line))}.server-scope-card.referenced-ancestor{border-color:color-mix(in srgb,var(--lra-primary) 42%,var(--lra-line))}.server-scope-card.orphan-candidate{border-color:color-mix(in srgb,var(--lra-red) 38%,var(--lra-line))}.server-scope-card.unverified{border-style:dashed}.server-scope-main{min-width:0;display:grid;gap:10px}.server-scope-title{display:flex;align-items:flex-start;gap:9px;min-width:0}.server-scope-title>div{min-width:0;display:grid;gap:2px}.server-scope-title strong,.server-scope-title small{overflow-wrap:anywhere}.server-scope-title small{color:var(--lra-text-3);font-size:9px}.server-plugin-badge{flex:0 0 auto;padding:3px 7px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px;font-weight:850}.server-plugin-badge.hayaku{background:color-mix(in srgb,#e29a2b 13%,var(--lra-surface));color:#a96706}.server-plugin-badge.libra{background:color-mix(in srgb,#815bd9 13%,var(--lra-surface));color:#6840bf}.server-plugin-badge.flashback{background:color-mix(in srgb,#3d79d8 13%,var(--lra-surface));color:#2b62b7}.server-plugin-badge.gradia{background:color-mix(in srgb,#b4559a 13%,var(--lra-surface));color:#8c3978}.server-plugin-badge.lia{background:color-mix(in srgb,#24977d 13%,var(--lra-surface));color:#18755f}.server-plugin-badge.retrace{background:color-mix(in srgb,#4f5b6d 13%,var(--lra-surface));color:#354052}.server-scope-stats{display:flex;gap:7px;flex-wrap:wrap}.server-scope-stats span{padding:3px 7px;border-radius:8px;background:var(--lra-surface-2);color:var(--lra-text-3);font-size:9px}.server-scope-stats b{color:var(--lra-text)}.server-scope-refs{display:flex;gap:6px;flex-wrap:wrap}.server-scope-refs strong{width:100%;font-size:10px}.server-scope-refs span{padding:3px 7px;border-radius:8px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px}.server-scope-blocked,.server-scope-ready{padding:8px 10px;border-radius:9px;font-size:10px}.server-scope-blocked{background:var(--lra-surface-2);color:var(--lra-text-2)}.server-scope-ready{background:var(--lra-green-soft);color:var(--lra-green);font-weight:750}.server-scope-actions{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.server-scope-actions .btn{white-space:nowrap}@media(max-width:760px){.server-scope-card{grid-template-columns:1fr}.server-scope-actions{justify-content:flex-start}.server-data-summary{align-items:flex-start;flex-direction:column}}
+      .server-data-summary{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 14px;border:1px solid var(--lra-line);border-radius:14px;background:var(--lra-surface);box-shadow:var(--lra-shadow-sm)}.server-data-summary>div{display:grid;gap:3px}.server-data-summary span,.server-data-summary em{color:var(--lra-text-3);font-style:normal;font-size:10px}.server-data-summary.ok{border-color:color-mix(in srgb,var(--lra-green) 35%,var(--lra-line));background:color-mix(in srgb,var(--lra-green) 5%,var(--lra-surface))}.server-data-summary.warn{border-color:color-mix(in srgb,var(--lra-red) 28%,var(--lra-line));background:color-mix(in srgb,var(--lra-red) 4%,var(--lra-surface))}.server-data-scan-errors{display:grid;gap:5px;padding:12px 14px;border:1px solid color-mix(in srgb,var(--lra-red) 28%,var(--lra-line));border-radius:13px;background:color-mix(in srgb,var(--lra-red) 5%,var(--lra-surface));color:var(--lra-red)}.server-data-scan-errors span{font-size:10px;overflow-wrap:anywhere}.server-scope-group{display:grid;gap:9px}.server-scope-group-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;padding:4px 2px}.server-scope-group-head h3{margin:0;font-size:15px}.server-scope-group-head p{margin:2px 0 0;color:var(--lra-text-3);font-size:10px}.server-scope-group-head em{padding:3px 8px;border-radius:999px;background:var(--lra-surface-2);color:var(--lra-text-2);font-style:normal;font-weight:800}.server-scope-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:start}.server-scope-card.active{border-color:color-mix(in srgb,var(--lra-green) 34%,var(--lra-line))}.server-scope-card.referenced-ancestor{border-color:color-mix(in srgb,var(--lra-primary) 42%,var(--lra-line))}.server-scope-card.orphan-candidate{border-color:color-mix(in srgb,var(--lra-red) 38%,var(--lra-line))}.server-scope-card.unverified{border-style:dashed}.server-scope-main{min-width:0;display:grid;gap:10px}.server-scope-title{display:flex;align-items:flex-start;gap:9px;min-width:0}.server-scope-title>div{min-width:0;display:grid;gap:2px}.server-scope-title strong,.server-scope-title small{overflow-wrap:anywhere}.server-scope-title small{color:var(--lra-text-3);font-size:9px}.server-plugin-badge{flex:0 0 auto;padding:3px 7px;border-radius:999px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px;font-weight:850}.server-plugin-badge.hayaku{background:color-mix(in srgb,#e29a2b 13%,var(--lra-surface));color:#a96706}.server-plugin-badge.libra{background:color-mix(in srgb,#815bd9 13%,var(--lra-surface));color:#6840bf}.server-plugin-badge.flashback{background:color-mix(in srgb,#3d79d8 13%,var(--lra-surface));color:#2b62b7}.server-plugin-badge.lia{background:color-mix(in srgb,#24977d 13%,var(--lra-surface));color:#18755f}.server-plugin-badge.retrace{background:color-mix(in srgb,#4f5b6d 13%,var(--lra-surface));color:#354052}.server-scope-stats{display:flex;gap:7px;flex-wrap:wrap}.server-scope-stats span{padding:3px 7px;border-radius:8px;background:var(--lra-surface-2);color:var(--lra-text-3);font-size:9px}.server-scope-stats b{color:var(--lra-text)}.server-scope-refs{display:flex;gap:6px;flex-wrap:wrap}.server-scope-refs strong{width:100%;font-size:10px}.server-scope-refs span{padding:3px 7px;border-radius:8px;background:var(--lra-primary-soft);color:var(--lra-primary);font-size:9px}.server-scope-blocked,.server-scope-ready{padding:8px 10px;border-radius:9px;font-size:10px}.server-scope-blocked{background:var(--lra-surface-2);color:var(--lra-text-2)}.server-scope-ready{background:var(--lra-green-soft);color:var(--lra-green);font-weight:750}.server-scope-actions{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.server-scope-actions .btn{white-space:nowrap}@media(max-width:760px){.server-scope-card{grid-template-columns:1fr}.server-scope-actions{justify-content:flex-start}.server-data-summary{align-items:flex-start;flex-direction:column}}
     </style>
     <div class="bridge${Runtime.busy ? ' busy' : ''}">
-      <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>FLASHBACK · HAYAKU · LIBRA · GRADIA · LIA Compatibility Hub</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="exportRetraceDebug" class="btn">디버그 로그 내보내기</button><button id="closeBridge" class="btn">닫기</button></div></header>
+      <header class="top"><span class="mark" aria-label="Bridge">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>FLASHBACK · HAYAKU · LIBRA · LIA Compatibility Hub</span></div><div class="top-actions"><div class="global-status"><span class="status-dot"></span><span>준비됨</span></div><button id="exportRetraceDebug" class="btn">디버그 로그 내보내기</button><button id="closeBridge" class="btn">닫기</button></div></header>
       <aside class="side">
         <div class="nav-group-label">Operations</div>
         <button class="nav ${Runtime.activeTab === 'session' ? 'active' : ''}" data-tab="session"><span class="ic">↪</span><span>다음 세션</span></button>
@@ -15685,10 +15232,10 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       </aside>
       <main class="main">
         <section class="panel ${Runtime.activeTab === 'session' ? 'active' : ''}" data-panel="session">
-          <div class="panel-heading"><div><h2>다음 세션</h2><p>RE:TRACE가 FLASHBACK, HAYAKU, LIBRA, GRADIA, LIA의 호환 계약과 원본 보존을 확인한 뒤 새 세션을 승계합니다.</p></div></div>
-          <div id="compatibilityPanel" class="compatibility-panel checking"><div class="compatibility-head"><div><strong>6개 플러그인 호환성</strong><span>공통 승계 계약을 확인하는 중입니다.</span></div><em>CHECKING</em></div></div>
+          <div class="panel-heading"><div><h2>다음 세션</h2><p>RE:TRACE가 FLASHBACK, HAYAKU, LIBRA, LIA의 호환 계약과 원본 보존을 확인한 뒤 새 세션을 승계합니다.</p></div></div>
+          <div id="compatibilityPanel" class="compatibility-panel checking"><div class="compatibility-head"><div><strong>플러그인 호환성</strong><span>공통 승계 계약을 확인하는 중입니다.</span></div><em>CHECKING</em></div></div>
           <div class="card"><div class="heading"><div><strong>대화 이어가기</strong><span>새 채팅 저장 전후로 다섯 owner 플러그인의 비파괴 승계 계약과 영속 반영을 검증합니다.</span></div><em class="badge">원본 보존</em></div>
-            <div class="flow session-handoff-flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · GRADIA</b><small>Story Arc의 다음 5턴 비트·Writer/OOC·Narrative Archive를 새 세션 기준으로 재결속</small></div><div><b>3 · Flashback</b><small>원본은 그대로 보존하고 immutable archive reference만 새 세션에 연결·검증</small></div><div><b>4 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>5 · LIA</b><small>활성 Live Persona를 새 채팅 전용 Persona로 Fork·재바인딩</small></div><div><b>6 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
+            <div class="flow session-handoff-flow"><div><b>1 · LIBRA</b><small>정본 메모리를 IPC로 이전 세션 영구 기억에 채택·검증</small></div><div><b>2 · Flashback</b><small>원본은 그대로 보존하고 immutable archive reference만 새 세션에 연결·검증</small></div><div><b>3 · HAYAKU</b><small>이전 원장을 라이브 월드라인과 분리해 즉시 저장·검증</small></div><div><b>4 · LIA</b><small>활성 Live Persona를 새 채팅 전용 Persona로 Fork·재바인딩</small></div><div><b>5 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
             <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">모든 owner는 RE:TRACE 공통 호환 계약을 통과해야 합니다. 승계 과정은 원본 세션의 정본/원장/벡터/바인딩을 삭제·비우기·compact·이동하지 않으며, 새 세션은 immutable archive/reference 또는 안전한 fork를 통해 과거 기억을 실제 조회 가능한 상태로 이어받습니다.</p>
             <div class="actions"><button id="refreshTransition" class="btn">다시 확인</button><button id="createSession" class="btn primary">다음 세션 만들기</button></div>
           </div>
@@ -15735,11 +15282,11 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         <section class="panel ${Runtime.activeTab === 'serverdata' ? 'active' : ''}" data-panel="serverdata">
           <div class="panel-heading"><div><h2>서버 데이터 관리</h2><p>Memory Suite 서버의 스코프를 현재 RisuAI 채팅 목록과 대조합니다. 채팅이 보이지 않아도 자동 삭제하지 않으며 승계 조상과 확인 불가 데이터는 보호합니다.</p></div><div class="actions"><button id="refreshServerData" class="btn primary">새로고침</button></div></div>
           <div class="settings-callout">상태는 활성 · 승계 조상 · 고아 메모리 후보 · 확인 불가로 구분됩니다. 활성 스코프는 owner 플러그인이 서버 데이터를 pluginStorage/로컬 저장소에 복원하고 플러그인 단독 모드 전환을 증명한 뒤에만 서버에서 삭제됩니다. 고아 후보는 안정적인 채팅 목록 확인, 참조 관계 재검사, 삭제 직전 서버 백업과 두 단계 확인을 모두 통과해야 합니다.</div>
-          <div id="serverDataBody"><div class="empty"><strong>서버 스코프 조회 대기</strong><span>새로고침을 누르면 6개 namespace의 서버 데이터와 현재 캐릭터의 채팅 목록을 대조합니다.</span></div></div>
+          <div id="serverDataBody"><div class="empty"><strong>서버 스코프 조회 대기</strong><span>새로고침을 누르면 5개 namespace의 서버 데이터와 현재 캐릭터의 채팅 목록을 대조합니다.</span></div></div>
         </section>
         <section class="panel ${Runtime.activeTab === 'serverconnection' ? 'active' : ''}" data-panel="serverconnection"><div id="retraceMemorySuiteServerConnectionPanel"></div></section>
         <section class="panel ${Runtime.activeTab === 'provider' ? 'active' : ''}" data-panel="provider">
-          <div class="panel-heading"><div><h2>LLM 프로바이더</h2><p>GRADIA v0.24.3 계열의 provider·reasoning 계층을 Primary 단일 프로필로 사용합니다.</p></div></div>
+          <div class="panel-heading"><div><h2>LLM 프로바이더</h2><p>공통 provider·reasoning 계층을 Primary 단일 프로필로 사용합니다.</p></div></div>
           <div class="settings-callout">콜드스타트와 증분 재분석은 아래 Primary 프로필을 사용합니다. 이전 버전의 Aux 설정만 구성되어 있었다면 최초 로드 시 Primary로 자동 이전됩니다.</div>
           ${providerBlock('primary', 'Primary profile')}
           <div id="providerStatus" class="status">설정을 수정한 뒤 저장하거나 연결 테스트를 실행하세요.</div>
@@ -15892,22 +15439,21 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
             ? `LIBRA 연결됨 · 정본 조회 실패 (${preview.libra.reason})`
             : `LIBRA 연결됨 · 정본 없음 (${preview.libra.reason})`
           : 'LIBRA IPC 연결 없음 · LIBRA v1.0.4+ 필요';
-      const gradiaLine = preview.includeGradia
-        ? `GRADIA Story Arc ${formatNumber(preview.gradiaStoryArcCount)}개 · Writer/OOC ${formatNumber(preview.gradiaWriterDesignCount)}개 · Narrative Archive ${formatNumber(preview.gradiaNarrativeArchiveCount)}개 승계 준비`
-        : preview.gradia.pluginAvailable
-          ? ['gradia_inspect_timeout', 'gradia_inspect_failed'].includes(text(preview.gradia.reason))
-            ? `GRADIA 연결됨 · Story Arc 조회 실패 (${preview.gradia.reason})`
-            : `GRADIA 연결됨 · 승계할 Story Arc/Writer/Narrative Archive 상태 없음 (${preview.gradia.reason})`
-          : 'GRADIA IPC 연결 없음 · GRADIA v0.25.25+ 필요';
       const serverNamespaces = preview.memorySuiteServer?.namespaces || {};
       const serverDetected = Object.entries(serverNamespaces)
         .filter(([, row]) => row?.available === true && Number(row?.liveRecords || 0) > 0)
         .map(([name, row]) => `${name.toUpperCase()} ${formatNumber(row.liveRecords)}`);
-      const memorySuiteLine = Object.values(serverNamespaces).some(row => row?.available === true)
+      const memorySuiteLine = preview.memorySuiteServer?.reason === 'server_probe_deferred'
+        ? 'Memory Suite 서버 자동 조회 생략 · pluginStorage/owner IPC 경로 사용'
+        : preview.memorySuiteServer?.reason === 'plugin_only_no_server_probe'
+          ? 'Memory Suite 플러그인 단독 모드 · 서버 요청 없음'
+          : Object.values(serverNamespaces).some(row => row?.available === true)
         ? `Memory Suite 서버 인식 · ${serverDetected.length ? serverDetected.join(' · ') : '저장 데이터 없음'}`
         : 'Memory Suite 서버 미연결 · pluginStorage/owner IPC 경로 사용';
-      node.textContent = `${memorySuiteLine}\n${libraLine}\n${gradiaLine}\n${flashbackLine}\n${hayakuLine}`;
-      await refreshCompatibility(preview).catch(error => warn('compatibility refresh failed', error));
+      node.textContent = `${memorySuiteLine}\n${libraLine}\n${flashbackLine}\n${hayakuLine}`;
+      // Transition data is already complete. The secondary contract sweep must
+      // not keep the whole RE:TRACE window in a loading state.
+      void refreshCompatibility(preview).catch(error => warn('compatibility refresh failed', error));
       return preview;
     } catch (error) {
       node.textContent = `확인 실패: ${error?.message || error}`;
@@ -16154,6 +15700,34 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     return normalizeSettings(current);
   };
 
+  const saveHayakuAutoRepairSelection = async selectNode => {
+    if (!selectNode || selectNode.dataset.saving === 'true') return Runtime.settings;
+    const previous = Runtime.settings?.hayakuAutoRepair === true;
+    const requested = selectNode.value === 'true';
+    selectNode.dataset.saving = 'true';
+    selectNode.disabled = true;
+    try {
+      const draft = readProviderSettingsFromUi();
+      draft.hayakuAutoRepair = requested;
+      const settings = await saveSettings(draft);
+      selectNode.value = String(settings.hayakuAutoRepair === true);
+      if (settings.hayakuAutoRepair !== true) {
+        if (Runtime.hayakuAutoRepair.timer != null) clearTimeout(Runtime.hayakuAutoRepair.timer);
+        Runtime.hayakuAutoRepair.timer = null;
+        Runtime.hayakuAutoRepair.queuedReason = '';
+      }
+      await refreshHayakuAutoRepairStatus();
+      return settings;
+    } catch (error) {
+      selectNode.value = String(previous);
+      await refreshHayakuAutoRepairStatus().catch(() => {});
+      throw error;
+    } finally {
+      delete selectNode.dataset.saving;
+      selectNode.disabled = false;
+    }
+  };
+
   const refreshHayakuAutoRepairStatus = async () => {
     const node = Runtime.root?.querySelector?.('#hayakuAutoRepairStatus');
     if (!node) return null;
@@ -16251,7 +15825,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
     let hayakuSummary = null;
     let flashbackSummary = null;
     let libraSummary = null;
-    let gradiaSummary = null;
     let hayakuOwnerGate = null;
     if (context) {
       try { pending = await inspectPendingNextSessionHandoff({ context }); } catch (error) { pending = { available: false, error: text(error?.message || error) }; }
@@ -16272,7 +15845,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
       }
       try { flashbackSummary = await readFlashbackSource(context, { includeRecords: false, skipRuntime: true, skipIpc: true }); } catch (error) { flashbackSummary = { available: false, error: text(error?.message || error) }; }
       try { libraSummary = await readLibraSource(context, { includeRecords: false }); } catch (error) { libraSummary = { available: false, error: text(error?.message || error) }; }
-      try { gradiaSummary = await readGradiaSource(context, { includePayload: false }); } catch (error) { gradiaSummary = { available: false, error: text(error?.message || error) }; }
     }
     let settings = null;
     try { settings = await loadSettings(); } catch (_) {}
@@ -16346,7 +15918,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
           },
           hayaku: { registered: Runtime.hayakuIpcRegistered === true, unavailableUntil: Runtime.hayakuIpcUnavailableUntil || 0, pending: Runtime.hayakuIpcPending?.size || 0 },
           libra: { registered: Runtime.libraIpcRegistered === true, lastSeenAt: Runtime.libraIpcLastSeenAt || 0, lastError: Runtime.libraIpcLastError || '', pending: Runtime.libraIpcPending?.size || 0 },
-          gradia: { registered: Runtime.gradiaIpcRegistered === true, lastSeenAt: Runtime.gradiaIpcLastSeenAt || 0, lastError: Runtime.gradiaIpcLastError || '', pending: Runtime.gradiaIpcPending?.size || 0 },
           lia: { registered: Runtime.liaIpcRegistered === true, lastError: Runtime.liaIpcLastError || '', pending: Runtime.liaIpcPending?.size || 0 }
         },
         handoffResumeInFlight: Runtime.handoffResumePromises?.size || 0,
@@ -16372,7 +15943,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
           hayakuPendingRecoveryRecordCount: Math.max(0, Number(transition.hayakuPendingRecoveryRecordCount || 0) || 0),
           hayakuArchiveRecordCount: Math.max(0, Number(transition.hayakuArchiveRecordCount || 0) || 0),
           includeLibra: transition.includeLibra === true,
-          includeGradia: transition.includeGradia === true,
           pendingHandoff: transition.pendingHandoff
         } : null
       },
@@ -16380,7 +15950,6 @@ const memorySuiteRetraceResolveKeyScope = async ({ key, currentScope, registry }
         hayaku: hayakuSummary,
         flashback: flashbackSummary,
         libra: libraSummary,
-        gradia: gradiaSummary,
         pendingColdStart: pendingColdStart ? { available: pendingColdStart.available === true, reason: text(pendingColdStart.reason || ''), packetCount: Array.isArray(pendingColdStart.packets) ? pendingColdStart.packets.length : 0, scope: pendingColdStart.scope } : null,
         pendingIncrementalRecovery: pendingIncremental ? { available: pendingIncremental.available === true, reason: text(pendingIncremental.reason || ''), packetCount: Array.isArray(pendingIncremental.packets) ? pendingIncremental.packets.length : 0, recoveryId: text(pendingIncremental.capsule?.recoveryId || ''), sourceHash: text(pendingIncremental.capsule?.sourceHash || ''), scope: pendingIncremental.scope } : null
       },
@@ -16702,8 +16271,7 @@ ${error?.message || error}`);
     }
     root.querySelector('#hayakuAutoRepairEnabled')?.addEventListener('change', async event => {
       try {
-        const settings = await saveSettings(readProviderSettingsFromUi());
-        await refreshHayakuAutoRepairStatus();
+        const settings = await saveHayakuAutoRepairSelection(event.currentTarget);
         if (settings.hayakuAutoRepair === true) {
           const gate = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
           if (gate.ready === true) {
@@ -16940,9 +16508,6 @@ ${error?.message || error}`);
           + (preview.includeLibra
             ? `LIBRA 정본 레코드 ${formatNumber(preview.libraRecordCount)}개\n`
             : 'LIBRA 데이터 없음\n')
-          + (preview.includeGradia
-            ? `GRADIA Story Arc ${formatNumber(preview.gradiaStoryArcCount)}개 · Writer/OOC ${formatNumber(preview.gradiaWriterDesignCount)}개 · Narrative Archive ${formatNumber(preview.gradiaNarrativeArchiveCount)}개\n`
-            : 'GRADIA 세션 데이터 없음\n')
           + (isLiaLivePersonaId(preview.identity?.personaId) ? 'LIA Live Persona · 새 채팅 전용 Fork\n' : 'LIA Live Persona 없음\n')
           + `Flashback 기억 ${formatNumber(preview.flashback.records)}개\n`
           + (preview.includeHayaku
@@ -16956,7 +16521,6 @@ ${error?.message || error}`);
             result.flashbackVerified ? '' : result.flashbackRecords > 0 ? `Flashback: ${result.flashbackAdoption?.reason || 'not_verified'}` : '',
             result.hayakuVerified ? '' : result.hayakuRecords > 0 ? `HAYAKU: ${result.hayakuAdoption?.reason || 'not_verified'}` : '',
             result.libraVerified ? '' : result.libraScheduled ? `LIBRA: ${result.libraVerification?.reason || result.libraAdoption?.reason || 'not_verified'}` : '',
-            result.gradiaVerified ? '' : result.gradiaScheduled ? `GRADIA: ${result.gradiaAdoption?.reason || 'not_verified'}` : '',
             result.liaVerified ? '' : result.liaRequired ? `LIA: ${result.liaAdoption?.reason || 'not_verified'}` : ''
           ].filter(Boolean);
           await retraceAlert(`새 채팅은 보존되었지만 일부 승계 대상의 owner handoff가 아직 미완료입니다. 같은 버튼으로 동일 target/transfer를 재시도할 수 있습니다.\ntransferId: ${result.transferId}${failedOwners.length ? `\n\n${failedOwners.join('\n')}` : ''}`);
@@ -16978,11 +16542,6 @@ ${error?.message || error}`);
           : result.libraRecords > 0
             ? `LIBRA 승계 표식 저장 · 영속 검증 실패: ${result.libraAdoption?.reason || 'unknown'}`
             : 'LIBRA 데이터 없음';
-        const gradiaStatus = result.gradiaVerified
-          ? `GRADIA 승계 확인: Story Arc ${formatNumber(result.gradiaAdoption?.storyArc || result.gradiaStoryArc)} · Writer/OOC ${formatNumber(result.gradiaAdoption?.writerDesign || result.gradiaWriterDesign)} · Narrative Archive ${formatNumber(result.gradiaAdoption?.narrativeArchive || result.gradiaNarrativeArchive)}`
-          : (result.gradiaStoryArc > 0 || result.gradiaWriterDesign > 0 || result.gradiaNarrativeArchive > 0)
-            ? `GRADIA 승계 표식 저장 · 영속 검증 실패: ${result.gradiaAdoption?.reason || 'unknown'}`
-            : 'GRADIA 세션 데이터 없음';
         const liaStatus = result.liaRequired
           ? result.liaVerified
             ? `LIA Live Persona Fork 확인: ${result.targetLivePersonaId || result.liaAdoption?.livePersonaName || 'new Live Persona'}`
@@ -16991,7 +16550,6 @@ ${error?.message || error}`);
         await retraceAlert(
           `다음 세션을 만들었습니다.\n`
           + `${libraStatus}\n`
-          + `${gradiaStatus}\n`
           + `${liaStatus}\n`
           + `${flashbackStatus}\n`
           + hayakuStatus
@@ -17125,7 +16683,6 @@ ${error?.message || error}`);
     readFlashbackViewer: async () => readFlashbackViewer(await getCurrentContext()),
     readHayakuViewer: async () => readHayakuViewerSource(await getCurrentContext()),
     readLibraViewer: async () => await readLibraSource(await getCurrentContext(), { includeRecords: true }),
-    readGradiaSource: async () => await readGradiaSource(await getCurrentContext(), { includePayload: true }),
     lastTransition: () => clone(Runtime.lastTransition, null),
     lastColdStart: () => clone(Runtime.lastColdStart, null),
     lastIncrementalRecovery: () => clone(Runtime.lastIncrementalRecovery, null),
@@ -17153,11 +16710,9 @@ ${error?.message || error}`);
       extractJsonObject, normalizeBridgeRecallAliases, normalizeColdStartPacket, normalizeIncrementalRecoveryPacket,
       validateBridgeCapsulePacketSet, bridgePacketHasSemanticPayload, priorTurnContextForChunk,
       requestLibraIpc, probeLibraIpc, normalizeLibraInspection, readLibraSource,
-      requestGradiaIpc, probeGradiaIpc, normalizeGradiaInspection, readGradiaSource,
       peerCompatibilityPayload, evaluatePeerCompatibility, inspectCompatibilitySuite, probeUniversalPeerCompatibility, sourcePreservationReceiptMatches,
       requestLiaIpc, adoptLiaLivePersonaHandoff, liaAdoptionReceiptMatches, isLiaLivePersonaId,
       prepareLibraSessionHandoff, adoptLibraSessionHandoff, adoptLibraSessionHandoffDurable, verifyDurableLibraSessionHandoff,
-      prepareGradiaSessionHandoff, adoptGradiaSessionHandoff, adoptGradiaSessionHandoffDurable, verifyDurableGradiaSessionHandoff,
       requiredHandoffsVerified,
       sealNextSessionHandoffJournal, nextSessionHandoffJournalFromChat,
       inspectPendingNextSessionHandoff, inspectPendingHandoffDurableStatus, reconcilePendingHandoffJournalFromDurableReadback, persistNextSessionHandoffJournal, performPendingNextSessionHandoff,
@@ -17190,17 +16745,21 @@ ${error?.message || error}`);
   // authenticated probe succeeds.
   await registerHayakuIpc().catch(error => warn('HAYAKU IPC registration failed', error));
   await loadSettings().catch(() => normalizeSettings({}));
-  if (Runtime.settings?.hayakuAutoRepair === true) {
-    const startupOwner = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
-    if (startupOwner.ready === true) {
-      await registerHayakuRecoveryEventIpc().catch(error => warn('HAYAKU recovery event registration failed', error));
-      scheduleHayakuAutoRepairSweep('startup', 1200);
-    }
-  }
   await registerLibraIpc().catch(error => warn('LIBRA IPC registration failed', error));
-  await registerGradiaIpc().catch(error => warn('GRADIA IPC registration failed', error));
   await registerLiaIpc().catch(error => warn('LIA IPC registration failed', error));
   await registerUi();
+  if (Runtime.settings?.hayakuAutoRepair === true) {
+    const startupAutoRepairTimer = setTimeout(() => {
+      void (async () => {
+        const startupOwner = await probeLiveHayakuOwner({ force: true, timeoutMs: 2200 });
+        if (startupOwner.ready === true) {
+          await registerHayakuRecoveryEventIpc().catch(error => warn('HAYAKU recovery event registration failed', error));
+          scheduleHayakuAutoRepairSweep('startup', 1200);
+        }
+      })().catch(error => warn('HAYAKU deferred startup probe failed', error));
+    }, 700);
+    startupAutoRepairTimer?.unref?.();
+  }
   const unloadApi = liveApi(['onUnload']);
   if (typeof unloadApi?.onUnload === 'function') {
     await unloadApi.onUnload(async () => {
@@ -17224,11 +16783,6 @@ ${error?.message || error}`);
         pending.reject(new Error('RE:TRACE unloaded before LIBRA IPC completed.'));
       }
       Runtime.libraIpcPending.clear();
-      for (const pending of Runtime.gradiaIpcPending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error('RE:TRACE unloaded before GRADIA IPC completed.'));
-      }
-      Runtime.gradiaIpcPending.clear();
       for (const pending of Runtime.liaIpcPending.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error('RE:TRACE unloaded before LIA IPC completed.'));

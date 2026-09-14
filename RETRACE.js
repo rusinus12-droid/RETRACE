@@ -1,7 +1,7 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.77
+//@version 1.9.80
 /* v1.9.74 places scoped control styles in the actual RE:TRACE renderer, adds reference-aligned cards and state views, preserving owner/server mutation contracts. */
 /* v1.9.72 / BOOK_UX 5.18: verified RisuAI native branch prefixes, source-bound adoption, preserved consent and read-only lineage status. */
 /* v1.9.66 rebases handoff target creation onto the fresh host Character, detects source/concurrent edits, and verifies chat readback without destructive rollback. */
@@ -241,7 +241,89 @@ function createMemorySuiteHostLineage() {
 /* END LIBRARIAN HOST LINEAGE SDK */
 const MemorySuiteHostLineage = createMemorySuiteHostLineage();
 
-/* LIBRARIAN SYSTEM STORAGE SDK v1.8.19
+/* LIBRARIAN PORTABLE TRANSFER SDK v1.0.0 */
+// File bytes never become pluginStorage, prompt text, or debug-log payloads.
+const createMemorySuitePortableTransferClient = (options = {}) => {
+  if(typeof options.request!=='function')throw Error('portable_request_adapter_required');
+  const request=options.request,pollMs=Math.max(20,Number(options.pollMs)||350);
+  const pause=ms=>new Promise(r=>setTimeout(r,ms));
+  const check=signal=>{if(signal?.aborted)throw Object.assign(Error('portable_cancelled'),{code:'PORTABLE_CANCELLED'});};
+  const ref=s=>({transferId:s.transferId,transferToken:s.transferToken});
+  const progress=(cb,value)=>{try{cb?.(value);}catch(_){};};
+  const assertServer=(s,r)=>{if(r?.dataInstanceId&&s?.dataInstanceId&&r.dataInstanceId!==s.dataInstanceId)throw Error('portable_server_changed');return r;};
+  const b64encode=bytes=>{let s='';for(let p=0;p<bytes.length;p+=0x8000)s+=String.fromCharCode(...bytes.subarray(p,p+0x8000));return btoa(s);};
+  const b64decode=text=>{if(typeof text!=='string'||text.length>400000||text.length%4||!/^[A-Za-z0-9+/]*={0,2}$/.test(text))throw Error('portable_chunk_invalid');const raw=atob(text),b=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)b[i]=raw.charCodeAt(i);return b;};
+  // Incremental SHA-256: at most one 64-byte tail, never a whole-file buffer.
+  // Used even when WebCrypto is unavailable in an opaque plugin iframe.
+  const sha256Stream = () => {
+    const K=new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+    const h=new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]),tail=new Uint8Array(64),w=new Uint32Array(64);let used=0,total=0,done=false;
+    const r=(x,n)=>(x>>>n)|(x<<(32-n));
+    const block=(b,off)=>{for(let i=0;i<16;i++){const j=off+4*i;w[i]=(b[j]<<24)|(b[j+1]<<16)|(b[j+2]<<8)|b[j+3];}for(let i=16;i<64;i++){const x=w[i-15],y=w[i-2];w[i]=(w[i-16]+(r(x,7)^r(x,18)^(x>>>3))+w[i-7]+(r(y,17)^r(y,19)^(y>>>10)))>>>0;}
+      let [a,bv,c,d,e,f,g,v]=h;for(let i=0;i<64;i++){const t1=(v+(r(e,6)^r(e,11)^r(e,25))+((e&f)^((~e)&g))+K[i]+w[i])>>>0,t2=((r(a,2)^r(a,13)^r(a,22))+((a&bv)^(a&c)^(bv&c)))>>>0;v=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=bv;bv=a;a=(t1+t2)>>>0;}[a,bv,c,d,e,f,g,v].forEach((v,i)=>h[i]=(h[i]+v)>>>0);
+    };
+    const update=bytes=>{if(done)throw Error('portable_hash_finalized');total+=bytes.length;let i=0;if(used){const n=Math.min(64-used,bytes.length);tail.set(bytes.subarray(0,n),used);used+=n;i=n;if(used===64){block(tail,0);used=0;}}for(;i+64<=bytes.length;i+=64)block(bytes,i);if(i<bytes.length){tail.set(bytes.subarray(i));used=bytes.length-i;}};
+    const hex=()=>{if(done)throw Error('portable_hash_finalized');done=true;const end=new Uint8Array(used<56?64:128);end.set(tail.subarray(0,used));end[used]=128;const view=new DataView(end.buffer);view.setUint32(end.length-8,Math.floor(total/0x20000000));view.setUint32(end.length-4,(total*8)>>>0);for(let i=0;i<end.length;i+=64)block(end,i);return Array.from(h,v=>v.toString(16).padStart(8,'0')).join('');};
+    return {update,hex};
+  };
+  const digest=async bytes=>{const c=options.crypto||(typeof crypto!=='undefined'?crypto:null);if(c?.subtle){const b=await c.subtle.digest('SHA-256',bytes);return Array.from(new Uint8Array(b),n=>n.toString(16).padStart(2,'0')).join('');}const h=sha256Stream();h.update(bytes);return h.hex();};
+  const op=prefix=>prefix+'-'+Date.now()+'-'+(typeof crypto!=='undefined'&&crypto?.randomUUID?crypto.randomUUID():Math.random().toString(36).slice(2));
+  const cancel=async s=>{if(s?.transferId)return request('cancel',ref(s));};
+  const wait=async(s,{signal,onProgress,target='ready'}={})=>{
+    const start=Date.now();
+    while(Date.now()-start<20*60*1000){check(signal);const r=assertServer(s,await request('status',ref(s)));progress(onProgress,r);
+      if(r.status===target)return r;
+      if(['failed','cancelled'].includes(r.status))throw Object.assign(Error(r.error||'portable_'+r.status),{transfer:s,code:r.error||r.status});
+      await pause(pollMs);
+    }
+    throw Object.assign(Error('portable_status_timeout_check_history'),{transfer:s});
+  };
+  const startExport=async opts=>{
+    check(opts?.signal);const cap=await request('capabilities',{});check(opts?.signal);
+    const s=await request('export-start',{operationId:op('portable-export'),mode:opts?.mode==='snapshot'?'snapshot':'migration'});assertServer(cap,s);progress(opts?.onProgress,s);
+    try{return await wait(s,opts);}catch(e){if(opts?.signal?.aborted)await cancel(s).catch(()=>{});throw Object.assign(e,{transfer:s});}
+  };
+  const download=async(s,sink,opts={})=>{
+    if(s?.status!=='ready'||s.kind!=='export'||!Number.isSafeInteger(s.totalBytes)||s.totalBytes<=0)throw Error('portable_export_not_ready');
+    try{
+      await sink.prepare?.(s);let offset=0,verifiedChunks=0;const wholeHash=sha256Stream();
+      while(offset<s.totalBytes){check(opts.signal);const part=await request('download-chunk',{...ref(s),offset});
+        if(part.offset!==offset||part.totalBytes!==s.totalBytes)throw Error('portable_download_changed');const bytes=b64decode(part.base64);
+        if(!bytes.length||bytes.length>Math.min(s.chunkBytes||262144,s.totalBytes-offset))throw Error('portable_download_bounds');
+        const local=await digest(bytes);if(local&&local!==part.sha256)throw Error('portable_download_digest');if(local)verifiedChunks++;
+        check(opts.signal);wholeHash.update(bytes);await sink.write(bytes);offset+=bytes.length;progress(opts.onProgress,{...s,phase:'download',bytes:offset,totalBytes:s.totalBytes});
+      }
+      check(opts.signal);const clientSha256=wholeHash.hex();if(clientSha256!==s.sha256)throw Error('portable_download_whole_digest');await sink.close(s);await cancel(s).catch(()=>{});
+      return {ok:true,bytes:offset,serverSha256:s.sha256,clientSha256,verifiedChunks,sink:sink.kind||'provided',downloadStarted:sink.browserDownload===true};
+    }catch(e){try{await sink.abort?.();}catch(_){}if(opts.signal?.aborted)await cancel(s).catch(()=>{});throw Object.assign(e,{transfer:s});}
+  };
+  const upload=async(file,opts={})=>{
+    if(!file||typeof file.slice!=='function'||!Number.isSafeInteger(file.size))throw Error('portable_file_required');
+    check(opts.signal);const cap=await request('capabilities',{});if(file.size<22||file.size>cap.limits.maxArchiveBytes)throw Error('portable_archive_size_limit');
+    const s=await request('upload-start',{operationId:op('portable-upload'),size:file.size});assertServer(cap,s);progress(opts.onProgress,s);
+    try{
+      const wholeHash=sha256Stream();
+      for(let offset=0;offset<file.size;){check(opts.signal);const n=Math.min(cap.limits.chunkBytes,file.size-offset),bytes=new Uint8Array(await file.slice(offset,offset+n).arrayBuffer());if(bytes.length!==n)throw Error('portable_file_changed');
+        wholeHash.update(bytes);const sha256=await digest(bytes),body={...ref(s),offset,base64:b64encode(bytes),...(sha256?{sha256}:{})};check(opts.signal);
+        const result=await request('upload-chunk',body);if(result.receivedBytes!==offset+n||sha256&&result.sha256!==sha256)throw Error('portable_upload_receipt_invalid');
+        offset+=n;progress(opts.onProgress,{...s,phase:'upload',bytes:offset,totalBytes:file.size});
+      }
+      check(opts.signal);await request('upload-finish',{...ref(s),sha256:wholeHash.hex()});return await wait(s,opts);
+    }catch(e){if(opts.signal?.aborted)await cancel(s).catch(()=>{});throw Object.assign(e,{transfer:s});}
+  };
+  const planRestore=async s=>assertServer(s,await request('restore-plan',ref(s)));
+  const restore=async(s,plan,{replaceAcknowledged=false,onProgress}={})=>{
+    if(!plan?.planId||plan.dataInstanceId!==s.dataInstanceId)throw Error('portable_restore_plan_required');
+    // No AbortSignal after execution begins: aborting a view cannot roll back
+    // an already running durable server transaction. Observe status/history.
+    await request('restore-execute',{...ref(s),planId:plan.planId,confirmation:plan.confirmation,replaceAcknowledged});
+    return await wait(s,{onProgress,target:'restored'});
+  };
+  return Object.freeze({capabilities:()=>request('capabilities',{}),startExport,download,upload,planRestore,restore,cancel,status:s=>request('status',ref(s))});
+};
+/* END LIBRARIAN PORTABLE TRANSFER SDK */
+
+/* LIBRARIAN SYSTEM STORAGE SDK v1.8.22
  * Scope-routed durable storage client shared by Flashback, HAYAKU, LIBRA, LIA and RE:TRACE.
  * The server stores opaque values. Each plugin keeps ownership of its own data schema.
  */
@@ -402,6 +484,60 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     try { if (typeof TextEncoder === 'function') return new TextEncoder().encode(String(serialized)).byteLength; } catch (_) {}
     return String(serialized).length * 2;
   };
+
+
+  const createScopedSyncMetrics = () => ({
+    localReadCount: 0, localReadBytes: 0, localWriteCount: 0, localWriteBytes: 0,
+    localRemoveCount: 0, remoteReadCount: 0, remoteReadBytes: 0,
+    remoteListCount: 0, remoteListBytes: 0, remoteWriteCount: 0, remoteWriteBytes: 0,
+    byOperation: {}
+  });
+  const cloneScopedSyncMetrics = metrics => {
+    const value = metrics && typeof metrics === 'object' ? metrics : createScopedSyncMetrics();
+    try { return JSON.parse(JSON.stringify(value)); } catch (_) { return createScopedSyncMetrics(); }
+  };
+  const recordScopedSyncMetric = (metrics, operation, values = {}) => {
+    if (!metrics || typeof metrics !== 'object') return;
+    const op = String(operation || 'unknown');
+    const row = metrics.byOperation[op] || { count: 0, localBytes: 0, remoteBytes: 0 };
+    row.count += Math.max(1, Number(values.count || 1) || 1);
+    row.localBytes += Math.max(0, Number(values.localBytes || 0) || 0);
+    row.remoteBytes += Math.max(0, Number(values.remoteBytes || 0) || 0);
+    metrics.byOperation[op] = row;
+    for (const field of ['localReadCount','localReadBytes','localWriteCount','localWriteBytes','localRemoveCount','remoteReadCount','remoteReadBytes','remoteListCount','remoteListBytes','remoteWriteCount','remoteWriteBytes']) {
+      if (Object.prototype.hasOwnProperty.call(values, field)) metrics[field] += Math.max(0, Number(values[field] || 0) || 0);
+    }
+  };
+  const mergeScopedSyncMetrics = (target, source) => {
+    if (!target || !source || typeof source !== 'object') return target;
+    for (const field of ['localReadCount','localReadBytes','localWriteCount','localWriteBytes','localRemoveCount','remoteReadCount','remoteReadBytes','remoteListCount','remoteListBytes','remoteWriteCount','remoteWriteBytes']) {
+      target[field] = Math.max(0, Number(target[field] || 0) || 0) + Math.max(0, Number(source[field] || 0) || 0);
+    }
+    for (const [operation, row] of Object.entries(source.byOperation || {})) {
+      const current = target.byOperation[operation] || { count: 0, localBytes: 0, remoteBytes: 0 };
+      current.count += Math.max(0, Number(row?.count || 0) || 0);
+      current.localBytes += Math.max(0, Number(row?.localBytes || 0) || 0);
+      current.remoteBytes += Math.max(0, Number(row?.remoteBytes || 0) || 0);
+      target.byOperation[operation] = current;
+    }
+    return target;
+  };
+  const scopedSyncRemoteValueBytes = remote => remote?.exists === true
+    ? Math.max(0, Number(remote?.valueBytes || 0) || storageValueBytes(remote?.value)) : 0;
+  const scopedSyncFailure = ({ key = '', stage = 'unknown', operation = 'unknown', error, localBytes = 0, remoteBytes = 0 } = {}) => {
+    const message = compact(error?.message || error || 'memory_suite_scope_sync_failed', 700);
+    const errorCode = String(error?.code || 'MEMORY_SUITE_SCOPE_SYNC_FAILED');
+    const retryable = typeof error?.retryable === 'boolean' ? error.retryable : retryableSyncError(error);
+    return {
+      key: String(key || ''), stage: String(stage || 'unknown'), errorCode, message,
+      operation: String(operation || 'unknown'),
+      localBytes: Math.max(0, Number(localBytes || 0) || 0),
+      remoteBytes: Math.max(0, Number(remoteBytes || 0) || 0), retryable,
+      error: message
+    };
+  };
+
+  // MEMORY_SUITE_SCOPE_SYNC_DIAGNOSTICS_V1
 
   // Batch-read values may legally use keys such as "__proto__".  Assigning
   // those keys with Object.assign or bracket notation can invoke inherited
@@ -1954,6 +2090,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
 
   const createBackgroundJob = async (kind, target = {}) => {
     const currentConfig = await readConfig(true);
+    const requestedMode = target.requestedMode ? normalizeMode(target.requestedMode) : (target.mode ? normalizeMode(target.mode) : currentConfig.mode);
     const existing = state.syncJob.current;
     if (existing && !syncJobTerminal(existing.status)) {
       const sameTarget = existing.kind === kind
@@ -1979,7 +2116,8 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       phase: 'queued',
       sourceMode: currentConfig.mode,
       sourceUrl: currentConfig.url,
-      targetMode: target.mode ? normalizeMode(target.mode) : currentConfig.mode,
+      requestedMode, effectiveMode: currentConfig.mode,
+      targetMode: requestedMode,
       targetUrl: target.url ? normalizeServerUrl(target.url) : currentConfig.url,
       totalItems: 0,
       processedItems: 0,
@@ -2014,6 +2152,8 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
 
   const completeBackgroundJob = async (result = null) => {
     updateSyncJob({
+      requestedMode: result?.requestedMode || state.syncJob.current?.requestedMode || state.syncJob.current?.targetMode || '',
+      effectiveMode: result?.effectiveMode || state.syncJob.current?.sourceMode || '',
       status: 'completed', phase: 'completed', currentAction: '완료', currentKey: '',
       message: '작업이 안전하게 완료되었습니다.', result: result ? cloneSyncJob(result) : null,
       error: '', nextRetryAt: 0, finishedAt: Date.now()
@@ -2023,6 +2163,8 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
 
   const failBackgroundJob = async error => {
     updateSyncJob({
+      requestedMode: error?.requestedMode || state.syncJob.current?.requestedMode || state.syncJob.current?.targetMode || '',
+      effectiveMode: error?.effectiveMode || state.syncJob.current?.sourceMode || '',
       status: 'failed', phase: 'failed', currentAction: '작업 중단', currentKey: '',
       message: '작업을 완료하지 못했습니다.', error: compact(error?.message || error, 700),
       nextRetryAt: 0, finishedAt: Date.now()
@@ -2040,7 +2182,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       try {
         let result;
         if (job.kind === 'connection_config') {
-          result = await configureConnection({ mode: job.targetMode, url: job.targetUrl }, { onProgress: applySyncProgressToJob });
+          result = await configureConnection({ mode: job.requestedMode || job.targetMode, url: job.targetUrl }, { onProgress: applySyncProgressToJob });
         } else if (job.kind === 'manual_sync') {
           result = await synchronizeAllLegacy({ allowOverwrite: true, restoreMissingLocal: true, onProgress: applySyncProgressToJob });
           if (!result.ok) throw new Error(`sync_failures:${result.failures.length}`);
@@ -3653,10 +3795,40 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       Object.assign(progress, patch || {}, { phase: String(phase || progress.phase), lastActivityAt: Date.now() });
       try { onProgress?.({ ...progress }); } catch (_) {}
     };
+    const metrics = createScopedSyncMetrics();
+    const readLocal = async (key, operation = 'local_read') => {
+      const value = await legacyRead(legacy, key);
+      const bytes = isNullishStorageValue(value) ? 0 : storageValueBytes(value);
+      recordScopedSyncMetric(metrics, operation, { localReadCount: 1, localReadBytes: bytes, localBytes: bytes });
+      return value;
+    };
+    const writeLocal = async (key, value, operation = 'local_write') => {
+      const bytes = isNullishStorageValue(value) ? 0 : storageValueBytes(value);
+      recordScopedSyncMetric(metrics, operation, { localWriteCount: 1, localWriteBytes: bytes, localBytes: bytes });
+      return await legacyWriteVerified(legacy, key, value);
+    };
+    const removeLocal = async (key, operation = 'local_remove') => {
+      recordScopedSyncMetric(metrics, operation, { localRemoveCount: 1 });
+      return await legacyRemoveVerified(legacy, key);
+    };
+    const readRemote = async (remoteKey, operation = 'remote_read') => {
+      const remote = await remoteGet(space, remoteKey, { allowPluginOnly: true });
+      const bytes = scopedSyncRemoteValueBytes(remote);
+      recordScopedSyncMetric(metrics, operation, { remoteReadCount: 1, remoteReadBytes: bytes, remoteBytes: bytes });
+      return remote;
+    };
+    const writeRemote = async (...args) => {
+      const value = args[3];
+      const bytes = args[0] === 'set' ? storageValueBytes(value) : 0;
+      recordScopedSyncMetric(metrics, 'remote_write', { remoteWriteCount: 1, remoteWriteBytes: bytes, remoteBytes: bytes });
+      return await remoteMutate(...args);
+    };
     const integrityBefore = await remoteIntegrity({ allowPluginOnly: true });
+    recordScopedSyncMetric(metrics, 'integrity_before', { remoteReadCount: 1, remoteReadBytes: storageValueBytes(integrityBefore), remoteBytes: storageValueBytes(integrityBefore) });
     report('inventory', { message: `${scope.label || scope.scopeId} 데이터 목록을 조사하고 있습니다.` });
     const localRows = await collectScopedLegacyRows(legacy, space, scope);
     const listing = await remoteKeys(space, '', { allowPluginOnly: true });
+    recordScopedSyncMetric(metrics, 'remote_keys', { remoteReadCount: 1, remoteReadBytes: storageValueBytes(listing), remoteListCount: 1, remoteListBytes: storageValueBytes(listing), remoteBytes: storageValueBytes(listing) });
     const remoteRecords = new Map((Array.isArray(listing.records) ? listing.records : []).map(row => [String(row?.key || ''), row]));
     const remoteKeysForScope = new Set();
     for (const remoteKey of Array.isArray(listing.keys) ? listing.keys : []) {
@@ -3677,19 +3849,25 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       schema: 'memory-suite.scope-sync.v1', namespace, space, scope, startedAt: progress.startedAt,
       totalItems: progress.totalItems, processedItems: 0, processedBytes: 0, transferredBytes: 0,
       uploaded: 0, restored: 0, matched: 0, removedByTombstone: 0,
-      plannedUploaded: 0, plannedRestored: 0, dryRun, conflicts: [], failures: [],
+      plannedUploaded: 0, plannedRestored: 0, dryRun, conflicts: [], failures: [], failureDetails: [],
+      metrics, requestedMode: syncOptions.requestedMode || '', effectiveMode: syncOptions.effectiveMode || '',
       integrityBefore, integrityAfter: null
     };
     for (const row of localRows) {
-      let bytes = 0, action = '비교';
+      let bytes = 0, localBytes = 0, remoteBytes = 0, stage = 'local_read', operation = 'local_compare', action = '비교';
       try {
         report('sync_local', { currentKey: row.key, currentAction: 'pluginStorage → 서버 비교' });
-        const local = await legacyRead(legacy, row.key);
+        stage = 'local_read'; operation = 'local_compare';
+        const local = await readLocal(row.key, operation);
+        localBytes = isNullishStorageValue(local) ? 0 : storageValueBytes(local);
         const projected = isNullishStorageValue(local) ? null : await routeProjectValue(row.route, local);
         bytes = isNullishStorageValue(projected) ? 0 : storageValueBytes(projected);
+        localBytes = bytes;
         if (isNullishStorageValue(projected)) action = '빈 값 건너뜀';
         else {
-          const remote = await remoteGet(space, row.route.remoteKey, { allowPluginOnly: true });
+          stage = 'remote_read'; operation = 'remote_compare';
+          const remote = await readRemote(row.route.remoteKey, operation);
+          remoteBytes = scopedSyncRemoteValueBytes(remote);
           if (remote.exists === true && jsonComparable(remote.value) === jsonComparable(projected)) { result.matched += 1; action = '일치 확인'; }
           else if (flashbackWriterAlias(row.route.remoteKey) && remote.exists === true) {
             result.conflicts.push({ key:row.key, remoteKey:row.route.remoteKey, reason:'flashback_server_canonical_mismatch', localPreserved:true, serverPreserved:true });
@@ -3699,9 +3877,9 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
             if (!dryRun && syncOptions.allowOverwrite !== false && syncOptions.restoreMissingLocal === true) {
               const removed = await routeRemoveLocal(
                 row.route,
-                async()=>legacyRead(legacy,row.key),
-                async next=>legacyWriteVerified(legacy,row.key,next),
-                async()=>legacyRemoveVerified(legacy,row.key)
+                async()=>readLocal(row.key,'tombstone_local_read'),
+                async next=>writeLocal(row.key,next,'tombstone_local_write'),
+                async()=>removeLocal(row.key,'tombstone_local_remove')
               );
               if (!removed) throw new Error('pluginstorage_tombstone_apply_failed');
               result.removedByTombstone += 1;
@@ -3718,43 +3896,53 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
             result.plannedUploaded += 1;
             action = remote.exists === true ? '서버 덮어쓰기 예정' : '서버 업로드 예정';
           } else {
-            await remoteMutate('set', space, row.route.remoteKey, projected, { allowPluginOnly: true,
+            stage = 'remote_write'; operation = 'remote_write';
+            await writeRemote('set', space, row.route.remoteKey, projected, { allowPluginOnly: true,
               ...(flashbackWriterAlias(row.route.remoteKey) ? { expectedRevision:remote.revision || 0 } : {}) });
             result.uploaded += 1; result.transferredBytes += bytes; action = '서버 저장·검증 완료';
           }
         }
-      } catch (error) { result.failures.push({ key: row.key, error: compact(error?.message || error, 240) }); action = '실패'; }
+      } catch (error) { const detail = scopedSyncFailure({ key: row.key, stage, operation, error, localBytes, remoteBytes }); result.failures.push(detail); result.failureDetails.push(detail); action = '실패'; }
       finally {
         result.processedItems += 1; result.processedBytes += bytes;
-        Object.assign(progress, { processedItems: result.processedItems, processedBytes: result.processedBytes, transferredBytes: result.transferredBytes, uploaded: result.uploaded, restored: result.restored, matched: result.matched, removedByTombstone: result.removedByTombstone, failureCount: result.failures.length, conflictCount: result.conflicts.length });
+        Object.assign(progress, { processedItems: result.processedItems, processedBytes: result.processedBytes, transferredBytes: result.transferredBytes, uploaded: result.uploaded, restored: result.restored, matched: result.matched, removedByTombstone: result.removedByTombstone, failureCount: result.failures.length, conflictCount: result.conflicts.length, metrics: cloneScopedSyncMetrics(metrics) });
         report('sync_local', { currentKey: row.key, currentAction: action });
       }
     }
     for (const remoteKey of missingRemoteRows) {
-      let bytes = Math.max(0, Number(remoteRecords.get(remoteKey)?.valueBytes || 0) || 0), action = '서버 → pluginStorage 복구';
+      let bytes = Math.max(0, Number(remoteRecords.get(remoteKey)?.valueBytes || 0) || 0), localBytes = 0, remoteBytes = bytes, stage = 'remote_read', operation = 'restore_remote_read', action = '서버 → pluginStorage 복구';
       try {
         const decoded = scopedRemoteKeyInfo(remoteKey);
         const route = await resolveScopedRoute(space, decoded.logicalKey, { scope, noCache: true });
-        const remote = await remoteGet(space, remoteKey, { allowPluginOnly: true });
+        stage = 'remote_read'; operation = 'restore_remote_read';
+        const remote = await readRemote(remoteKey, operation);
+        remoteBytes = scopedSyncRemoteValueBytes(remote) || bytes;
         if (remote.exists === true) {
-          const current = await legacyRead(legacy, decoded.logicalKey);
+          stage = 'local_read'; operation = 'restore_local_read';
+          const current = await readLocal(decoded.logicalKey, operation);
+          localBytes = isNullishStorageValue(current) ? 0 : storageValueBytes(current);
           const merged = await routeMergeValue(route, remote.value, current);
           if (dryRun) {
             result.plannedRestored += 1; action = '복구 가능 확인';
           } else {
-            if (!await legacyWriteVerified(legacy, decoded.logicalKey, merged)) throw new Error('pluginstorage_restore_failed');
+            stage = 'local_write'; operation = 'restore_local_write';
+            if (!await writeLocal(decoded.logicalKey, merged, operation)) throw new Error('pluginstorage_restore_failed');
             result.restored += 1; result.transferredBytes += bytes; action = '복구·readback 완료';
           }
         }
-      } catch (error) { result.failures.push({ key: remoteKey, error: compact(error?.message || error, 240) }); action = '복구 실패'; }
+      } catch (error) { const detail = scopedSyncFailure({ key: remoteKey, stage, operation, error, localBytes, remoteBytes }); result.failures.push(detail); result.failureDetails.push(detail); action = '복구 실패'; }
       finally {
         result.processedItems += 1; result.processedBytes += bytes;
-        Object.assign(progress, { processedItems: result.processedItems, processedBytes: result.processedBytes, transferredBytes: result.transferredBytes, uploaded: result.uploaded, restored: result.restored, matched: result.matched, removedByTombstone: result.removedByTombstone, failureCount: result.failures.length, conflictCount: result.conflicts.length });
+        Object.assign(progress, { processedItems: result.processedItems, processedBytes: result.processedBytes, transferredBytes: result.transferredBytes, uploaded: result.uploaded, restored: result.restored, matched: result.matched, removedByTombstone: result.removedByTombstone, failureCount: result.failures.length, conflictCount: result.conflicts.length, metrics: cloneScopedSyncMetrics(metrics) });
         report('sync_remote', { currentKey: remoteKey, currentAction: action });
       }
     }
     report('integrity_after', { currentKey: '', currentAction: dryRun ? '사전검사 완료' : '최종 무결성 확인', message: dryRun ? '쓰기 없는 모드 전환 사전검사를 완료했습니다.' : '현재 스코프 동기화 후 서버 DATA 무결성을 확인하고 있습니다.' });
     result.integrityAfter = dryRun ? integrityBefore : await remoteIntegrity({ allowPluginOnly: true });
+    if (!dryRun) recordScopedSyncMetric(metrics, 'integrity_after', { remoteReadCount: 1, remoteReadBytes: storageValueBytes(result.integrityAfter), remoteBytes: storageValueBytes(result.integrityAfter) });
+    result.metrics = cloneScopedSyncMetrics(metrics);
+    result.failureDetails = result.failures.slice();
+    result.diagnostics = { schema: 'memory-suite.scope-sync-diagnostics.v1', metrics: result.metrics, failures: result.failureDetails.slice() };
     result.ok = result.failures.length === 0 && result.conflicts.length === 0;
     report(result.ok ? 'scope_complete' : 'scope_incomplete', { currentKey: '', currentAction: result.ok ? '스코프 동기화 완료' : '확인 필요', message: result.ok ? `${scope.label || scope.scopeId} 동기화를 완료했습니다.` : `실패 ${result.failures.length} · 충돌 ${result.conflicts.length}` });
     if (!result.ok) {
@@ -3767,17 +3955,51 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
   const scopedSynchronizeAll = async (syncOptions = {}) => {
     const scope = normalizeScopeDescriptor(syncOptions.scope || await resolveCurrentScope(true));
     if (syncOptions.allowRecoveryRequired !== true) await assertRecoveryActionAllowed(scope, 'synchronize');
-    const result = { schema: 'memory-suite.scope-sync-all.v1', namespace, scope, plugin: null, local: null, uploaded: 0, restored: 0, matched: 0, removedByTombstone:0, plannedUploaded:0, plannedRestored:0, failures: [], totalItems: 0, processedItems: 0, processedBytes: 0, transferredBytes: 0 };
+    const modeState = await readScopeMode(scope, true);
+    const requestedMode = normalizeMode(syncOptions.requestedMode || syncOptions.mode || modeState.mode);
+    const result = {
+      schema: 'memory-suite.scope-sync-all.v1', namespace, scope, plugin: null, local: null,
+      requestedMode, effectiveMode: modeState.mode,
+      uploaded: 0, restored: 0, matched: 0, removedByTombstone: 0,
+      plannedUploaded: 0, plannedRestored: 0, failures: [], failureDetails: [], conflicts: [],
+      totalItems: 0, processedItems: 0, processedBytes: 0, transferredBytes: 0,
+      metrics: createScopedSyncMetrics()
+    };
     const forward = progress => { try { syncOptions.onProgress?.(progress); } catch (_) {} };
-    if (state.legacy.plugin) {
-      result.plugin = await scopedSynchronizeSpace(state.legacy.plugin, 'plugin', { ...syncOptions, scope, onProgress: forward });
-      for (const field of ['uploaded','restored','matched','removedByTombstone','plannedUploaded','plannedRestored','totalItems','processedItems','processedBytes','transferredBytes']) result[field] += Number(result.plugin?.[field] || 0);
+    const addPart = (space, part) => {
+      result[space] = part;
+      for (const field of ['uploaded','restored','matched','removedByTombstone','plannedUploaded','plannedRestored','totalItems','processedItems','processedBytes','transferredBytes']) result[field] += Number(part?.[field] || 0);
+      mergeScopedSyncMetrics(result.metrics, part?.metrics);
+      for (const failure of Array.isArray(part?.failures) ? part.failures : []) {
+        const detail = { ...failure, space: String(space) };
+        result.failures.push(detail); result.failureDetails.push(detail);
+      }
+      for (const conflict of Array.isArray(part?.conflicts) ? part.conflicts : []) result.conflicts.push({ ...conflict, space: String(space) });
+    };
+    const runPart = async (legacy, space) => {
+      if (!legacy || (space === 'local' && typeof legacy.keys !== 'function')) return;
+      try {
+        const part = await scopedSynchronizeSpace(legacy, space, { ...syncOptions, scope, requestedMode, effectiveMode: modeState.mode, onProgress: forward });
+        addPart(space, part);
+      } catch (error) {
+        const part = error?.result && typeof error.result === 'object' ? error.result : null;
+        if (part) addPart(space, part);
+        else {
+          const detail = scopedSyncFailure({ key: '', stage: 'scope', operation: space + '_scope_sync', error });
+          result.failures.push({ ...detail, space }); result.failureDetails.push({ ...detail, space });
+        }
+      }
+    };
+    await runPart(state.legacy.plugin, 'plugin');
+    await runPart(state.legacy.local, 'local');
+    result.metrics = cloneScopedSyncMetrics(result.metrics);
+    result.diagnostics = { schema: 'memory-suite.scope-sync-diagnostics.v1', metrics: result.metrics, failures: result.failureDetails.slice(), conflicts: result.conflicts.slice() };
+    result.ok = result.failures.length === 0 && result.conflicts.length === 0;
+    if (!result.ok) {
+      const error = new Error('memory_suite_scope_sync_incomplete:' + scope.scopeId + ':failures=' + result.failures.length + ',conflicts=' + result.conflicts.length);
+      error.code = 'MEMORY_SUITE_SCOPE_SYNC_INCOMPLETE'; error.result = result;
+      throw error;
     }
-    if (state.legacy.local && typeof state.legacy.local?.keys === 'function') {
-      result.local = await scopedSynchronizeSpace(state.legacy.local, 'local', { ...syncOptions, scope, onProgress: forward });
-      for (const field of ['uploaded','restored','matched','removedByTombstone','plannedUploaded','plannedRestored','totalItems','processedItems','processedBytes','transferredBytes']) result[field] += Number(result.local?.[field] || 0);
-    }
-    result.ok = true;
     return result;
   };
 
@@ -4183,28 +4405,30 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     const recoveryLock = await recoveryLockForScope(scope);
     if (recoveryLock && target !== MODE_SERVER_ONLY) throw recoveryRequiredError(scope, recoveryLock, `set_mode_${target}`);
     const current = await readScopeMode(scope, true);
-    if (target === current.mode) return { changed:false, from:current.mode, to:target, scope, modeLabel:modeLabel(target) };
+    if (target === current.mode) return { changed:false, requestedMode:target, effectiveMode:current.mode, from:current.mode, to:target, scope, modeLabel:modeLabel(target) };
     if (!state.legacy.plugin) throw new Error('memory_suite_pluginstorage_unavailable');
     const onProgress = typeof operationOptions.onProgress === 'function' ? operationOptions.onProgress : null;
     try {
       if (current.mode === MODE_PLUGIN_ONLY && target !== MODE_PLUGIN_ONLY) {
         // Discover every deterministic conflict before the first server or local write.
         // This prevents a late key conflict from leaving an earlier key partially seeded.
-        const preflight = await scopedSynchronizeAll({ scope, dryRun:true, allowOverwrite:false, restoreMissingLocal:false, onProgress });
-        const seeded = await scopedSynchronizeAll({ scope, allowOverwrite:false, restoreMissingLocal:false, onProgress });
+        const preflight = await scopedSynchronizeAll({ scope, requestedMode:target, effectiveMode:current.mode, dryRun:true, allowOverwrite:false, restoreMissingLocal:false, onProgress });
+        const seeded = await scopedSynchronizeAll({ scope, requestedMode:target, effectiveMode:current.mode, allowOverwrite:false, restoreMissingLocal:false, onProgress });
         const settled = seeded;
         if (!preflight.ok || !seeded.ok || !settled.ok) throw new Error('memory_suite_scope_mode_seed_failed');
         await remoteIntegrity({ allowPluginOnly:true });
       } else if (current.mode === MODE_MIRROR && target === MODE_SERVER_ONLY) {
-        await scopedSynchronizeAll({ scope, allowOverwrite:true, restoreMissingLocal:true, onProgress });
+        await scopedSynchronizeAll({ scope, requestedMode:target, effectiveMode:current.mode, allowOverwrite:true, restoreMissingLocal:true, onProgress });
         await remoteIntegrity({ allowPluginOnly:true });
       } else if (current.mode === MODE_SERVER_ONLY && target !== MODE_SERVER_ONLY) {
         await scopedRestoreAll({ scope, onProgress });
       }
       const saved = await persistScopedMode(target, scope, { source:'safe_scope_mode_transition' });
-      return { changed:true, from:current.mode, to:target, scope, modeLabel:modeLabel(target), config:saved };
+      return { changed:true, requestedMode:target, effectiveMode:target, from:current.mode, to:target, scope, modeLabel:modeLabel(target), config:saved };
     } catch (error) {
       state.scopeRouting.transientModes.delete(scope.scopeId);
+      error.requestedMode = target; error.effectiveMode = current.mode;
+      error.modeTransition = { requestedMode: target, effectiveMode: current.mode, from: current.mode, to: target, scope };
       throw error;
     }
   };
@@ -4249,10 +4473,13 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
         urlChanged = true;
       }
       const modeResult = await scopedSetModeSafely(targetMode, { ...operationOptions, scope });
-      const from = { mode:currentMode, modeLabel:modeLabel(currentMode), url:currentUrl, scope };
-      const to = { mode:targetMode, modeLabel:modeLabel(targetMode), url:targetUrl, scope };
-      return { ok:true, scope, url:targetUrl, mode:targetMode, modeLabel:modeLabel(targetMode), from, to, transition:modeResult, modeResult, connectionTest };
+      const effectiveMode = normalizeMode(modeResult?.effectiveMode || targetMode);
+      const from = { mode:currentMode, modeLabel:modeLabel(currentMode), requestedMode:currentMode, effectiveMode:currentMode, url:currentUrl, scope };
+      const to = { mode:effectiveMode, modeLabel:modeLabel(effectiveMode), requestedMode:targetMode, effectiveMode, url:targetUrl, scope };
+      return { ok:true, scope, url:targetUrl, mode:effectiveMode, modeLabel:modeLabel(effectiveMode), requestedMode:targetMode, effectiveMode, from, to, transition:modeResult, modeResult, connectionTest };
     } catch (error) {
+      error.requestedMode = targetMode; error.effectiveMode = currentMode;
+      error.modeTransition = { requestedMode: targetMode, effectiveMode: currentMode, from: currentMode, to: targetMode, scope };
       if (urlChanged) {
         try { await persistServerUrl(currentUrl); resetBootstrapCache(); }
         catch (rollbackError) { error.urlRollbackError = compact(rollbackError?.message || rollbackError, 300); }
@@ -4299,13 +4526,14 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     if (!random) random = `${now.toString(36)}_${Math.random().toString(36).slice(2,10)}`;
     const jobId = `${namespace}_${kind}_${scope.scopeId}_${random}`.replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 240);
     const currentMode = (await readScopeMode(scope, true)).mode;
+    const requestedMode = target.requestedMode ? normalizeMode(target.requestedMode) : (target.mode ? normalizeMode(target.mode) : currentMode);
     const currentUrl = normalizeServerUrl(await getArgumentValue(urlArguments, defaultUrl));
     state.syncJob.current = {
       schema: SYNC_JOB_SCHEMA, namespace, pluginId, pluginVersion,
       jobId, id: jobId, kind: String(kind || 'manual_sync'),
       scopeId: scope.scopeId, scopeKey: scope.scopeKey, scopeLabel: scope.label,
-      sourceMode: currentMode, sourceUrl: currentUrl,
-      targetMode: target.mode ? normalizeMode(target.mode) : currentMode,
+      sourceMode: currentMode, sourceUrl: currentUrl, requestedMode, effectiveMode: currentMode,
+      targetMode: requestedMode,
       targetUrl: target.url ? normalizeServerUrl(target.url) : currentUrl,
       status: 'queued', phase: 'queued', message: '작업을 준비하고 있습니다.',
       startedAt: now, updatedAt: now, lastActivityAt: now, finishedAt: 0,
@@ -4337,7 +4565,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       try {
         let result;
         if (job.kind === 'connection_config') {
-          result = await scopedConfigureConnection({ mode: job.targetMode, url: job.targetUrl }, { scope, onProgress: applySyncProgressToJob });
+          result = await scopedConfigureConnection({ mode: job.requestedMode || job.targetMode, url: job.targetUrl }, { scope, onProgress: applySyncProgressToJob });
         } else if (job.kind === 'manual_sync') {
           await assertRecoveryActionAllowed(scope, 'manual_sync');
           const mode = (await readScopeMode(scope, true)).mode;
@@ -4351,6 +4579,8 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
           throw new Error(`memory_suite_unknown_background_job:${job.kind}`);
         }
         updateSyncJob({
+          requestedMode: result?.requestedMode || state.syncJob.current?.requestedMode || state.syncJob.current?.targetMode || '',
+          effectiveMode: result?.effectiveMode || state.syncJob.current?.sourceMode || '',
           status: 'completed', phase: 'completed', currentAction: '완료', currentKey: '',
           message: '작업이 안전하게 완료되었습니다.', result: cloneSyncJob(result), error: '',
           nextRetryAt: 0, finishedAt: Date.now()
@@ -4373,6 +4603,8 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
           return null;
         }
         updateSyncJob({
+          requestedMode: error?.requestedMode || state.syncJob.current?.requestedMode || state.syncJob.current?.targetMode || '',
+          effectiveMode: error?.effectiveMode || state.syncJob.current?.sourceMode || '',
           status: 'failed', phase: 'failed', currentAction: '작업 중단', currentKey: '',
           message: '작업을 완료하지 못했습니다.', error: compact(error?.message || error, 700),
           result:compactRestoreEvidence(error?.result || null),
@@ -4591,21 +4823,24 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       card.classList.add('show'); const total=Math.max(0,Number(job.totalItems||0)), done=Math.max(0,Number(job.processedItems||0)); const percent=total?Math.min(100,Math.round(done/total*100)):0;
       card.classList.toggle('terminal',terminal); card.classList.toggle('failed',job.status==='failed');
       q('[data-job-title]').textContent = `${job.message || (terminal?'작업 결과':'작업 진행 중')}${total ? ` · ${terminal&&job.status==='completed'?100:percent}%` : ''}`; q('[data-job-bar]').style.width=`${terminal&&job.status==='completed'?100:percent}%`;
-      q('[data-job-phase]').textContent=`현재 단계: ${job.phase || '준비'}`; q('[data-job-count]').textContent=`진행: ${done.toLocaleString()} / ${total ? total.toLocaleString() : '조사 중'}`;
+      q('[data-job-phase]').textContent=`현재 단계: ${job.phase || '준비'}`; q('[data-job-count]').textContent=`진행: ${done.toLocaleString()} / ${total || terminal ? total.toLocaleString() : '조사 중'}${job.status==='completed' && total===0 ? ' · 이동할 데이터 없음' : ''}`;
       q('[data-job-bytes]').textContent=`처리: ${formatBytes(job.processedBytes)} · 전송: ${formatBytes(job.transferredBytes)}`; q('[data-job-time]').textContent=`경과: ${Math.max(0,Math.floor((Date.now()-Number(job.startedAt||Date.now()))/1000))}초`;
       q('[data-job-retry]').textContent=`재시도 ${Number(job.retryCount||0)} · 실패 ${Number(job.failures||0)}`; q('[data-job-key]').textContent=`현재: ${job.currentKey || job.currentAction || '-'}`;
       const terminalActions=q('[data-job-terminal-actions]'); terminalActions.style.display=terminal?'flex':'none';
       const result=job.result&&typeof job.result==='object'?job.result:{};
       q('[data-job-result]').textContent=terminal
-        ? [job.status==='completed'?'완료 결과':'실패 결과',integratesCompute?`저장 방식 ${modeLabel(job.targetMode || initial.mode)} · 연산 ${normalizeMode(job.targetMode || initial.mode) === MODE_PLUGIN_ONLY ? '로컬' : '서버 우선 · 실패 시 로컬'}`:'',`복원 ${Number(job.restored||result.restored||0)} · 업로드 ${Number(job.uploaded||result.uploaded||0)} · 일치 ${Number(job.matched||result.matched||0)}`,`삭제 표식 ${Number(job.removedByTombstone||result.removed||0)} · 검증 ${Number(result.verified||0)}`,job.recoveryRequired?'복구 필수 잠금: 활성 · 서버 단독 유지':'복구 필수 잠금: 없음',job.error?`오류: ${job.error}`:''].filter(Boolean).join('\n')
+        ? [job.status==='completed'?'완료 결과':'실패 결과',`요청 모드: ${modeLabel(job.requestedMode || job.targetMode || initial.mode)}`,`현재 적용 모드: ${modeLabel(job.effectiveMode || result.effectiveMode || job.sourceMode || initial.mode)}`,job.status==='failed'?'전환 미완료 · 현재 적용 모드를 확인하세요.':'',integratesCompute?`연산: ${normalizeMode(job.effectiveMode || result.effectiveMode || job.sourceMode || initial.mode) === MODE_PLUGIN_ONLY ? '로컬' : '서버 우선 · 실패 시 로컬'}`:'',`복원 ${Number(job.restored||result.restored||0)} · 업로드 ${Number(job.uploaded||result.uploaded||0)} · 일치 ${Number(job.matched||result.matched||0)}`,`삭제 표식 ${Number(job.removedByTombstone||result.removed||0)} · 검증 ${Number(result.verified||0)}`,job.recoveryRequired?'복구 필수 잠금: 활성 · 서버 단독 유지':'복구 필수 잠금: 없음',job.error?`오류: ${job.error}`:''].filter(Boolean).join('\n')
         : '';
+      const diagnosticText = terminal ? JSON.stringify({ schema:'memory-suite.scope-sync-diagnostics.v1', requestedMode:job.requestedMode || job.targetMode || '', effectiveMode:job.effectiveMode || job.sourceMode || '', failures:result.failures || [], metrics:result.metrics || {}, result }, null, 2) : '';
+      const diagnosticBox = q('[data-job-diagnostics]'); if (diagnosticBox) { diagnosticBox.value = diagnosticText; diagnosticBox.style.display = terminal && diagnosticText ? 'block' : 'none'; }
+      const copyButton = q('[data-job-copy]'); if (copyButton && !copyButton.dataset.bound) { copyButton.dataset.bound = '1'; copyButton.onclick = async () => { try { const value = q('[data-job-diagnostics]')?.value || ''; if (navigator?.clipboard?.writeText) await navigator.clipboard.writeText(value); else { q('[data-job-diagnostics]')?.select?.(); document.execCommand?.('copy'); } setMessage('Detailed diagnostics copied','good'); } catch (error) { setMessage('Detailed diagnostics copy failed\n' + (error?.message || error),'error'); } }; }
       if(terminal&&job.status==='completed'&&normalizeMode(job.targetMode)!==MODE_PLUGIN_ONLY&&computeProbeJobId!==job.jobId){computeProbeJobId=job.jobId;try{computeBridge?.scheduleProbe?.(0);}catch(_){}}
       if(terminal&&job.jobId!==terminalRefreshId){terminalRefreshId=job.jobId;scheduleLifecycleTimeout(()=>{void scopedGetConnectionSettings({scope:initial.scope,force:true}).then(settings=>applyRecoveryGuard(settings.recoveryRequired)).catch(()=>{});},0);}
     };
     for(const [selector,choice] of [['[data-reset-empty]','empty'],['[data-reset-upload]','upload']]){
       q(selector).onclick=async()=>{try{await acceptServerReset(choice);setMessage('선택을 저장했습니다. 기존 실행의 재업로드를 막기 위해 RisuAI를 새로고침한 뒤 사용하세요.','good');}catch(error){setMessage(error.message,'error');}};
     }
-    q('[data-test]').onclick = async()=>{ setMessage(integratesCompute?'Storage와 Compute 연결을 확인하고 있습니다…':'서버 연결을 확인하고 있습니다…'); const storageResult=await testConnection(q('[data-url]').value); let computeResult=null; if(integratesCompute&&storageResult.ok&&computeBridge?.probe){try{computeResult=await computeBridge.probe({force:true,reason:'integrated_connection_test'});}catch(error){computeResult={ok:false,error:compact(error?.message||error,300)};}} const storageLine=storageResult.ok?`${integratesCompute?'Storage: ':''}연결됨 · Librarian System ${storageResult.serverVersion} · 항목 ${storageResult.liveRecords}`:`${integratesCompute?'Storage: ':''}연결 실패 · ${storageResult.error}`; const computeLine=!integratesCompute?'':!storageResult.ok?'Compute: Storage 연결 실패로 확인하지 않음':computeResult?.ok?`Compute: 연결됨 · ${Number(computeResult.operations?.length||computeResult.operationCount||0)}개 연산`:`Compute: 연결 실패 · 연산 시 로컬 폴백 · ${computeResult?.error||computeResult?.reason||'unavailable'}`; setMessage([storageLine,computeLine].filter(Boolean).join('\n'),storageResult.ok&&(!integratesCompute||computeResult?.ok)?'good':storageResult.ok?'':'error'); };
+    q('[data-test]').onclick = async()=>{ setMessage(integratesCompute?'Storage와 Compute 연결을 확인하고 있습니다…':'서버 연결을 확인하고 있습니다…'); const storageResult=await testConnection(q('[data-url]').value); let computeResult=null; if(integratesCompute&&storageResult.ok&&computeBridge?.probe){try{computeResult=await computeBridge.probe({force:true,deep:true,reason:'integrated_connection_test'});}catch(error){computeResult={ok:false,error:compact(error?.message||error,300)};}} const storageLine=storageResult.ok?`${integratesCompute?'Storage: ':''}연결됨 · Librarian System ${storageResult.serverVersion} · 항목 ${storageResult.liveRecords}`:`${integratesCompute?'Storage: ':''}연결 실패 · ${storageResult.error}`; const computeLine=!integratesCompute?'':!storageResult.ok?'Compute: Storage 연결 실패로 확인하지 않음':computeResult?.ok?`Compute: 연결됨 · ${Number(computeResult.operations?.length||computeResult.operationCount||0)}개 연산`:`Compute: 연결 실패 · 연산 시 로컬 폴백 · ${computeResult?.error||computeResult?.reason||'unavailable'}`; setMessage([storageLine,computeLine].filter(Boolean).join('\n'),storageResult.ok&&(!integratesCompute||computeResult?.ok)?'good':storageResult.ok?'':'error'); };
     q('[data-apply]').onclick = async()=>{ const mode=root.querySelector(`input[name="${rootId}-mode"]:checked`)?.value||MODE_PLUGIN_ONLY; try{const job=await scopedStartConnectionConfigurationJob({mode,url:q('[data-url]').value,scope:initial.scope}); setMessage('설정 적용과 현재 스코프 초기 동기화를 시작했습니다.'); renderJob(job);}catch(error){setMessage(`설정 적용 시작 실패\n${error?.message||error}`,'error');} };
     q('[data-sync]').onclick = async()=>{ try{const job=await scopedStartSynchronizationJob({scope:initial.scope});setMessage('현재 스코프 동기화를 시작했습니다.');renderJob(job);}catch(error){setMessage(`동기화 시작 실패\n${error?.userMessage||error?.message||error}`,'error');} };
     q('[data-restore]').onclick = async()=>{ try{const job=await scopedStartRestoreJob({scope:initial.scope});setMessage('현재 스코프 복구를 시작했습니다.');renderJob(job);}catch(error){setMessage(`복구 시작 실패\n${error?.userMessage||error?.message||error}`,'error');} };
@@ -5191,6 +5426,13 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     getCachedDiagnostics,
     decorateDebugExport,
     decorateDebugExportSync,
+    managerPortable: async (action, body = {}) => {
+      const allowed=['capabilities','export-start','upload-start','upload-chunk','upload-finish','download-chunk','status','cancel','restore-plan','restore-execute'];
+      if(!allowed.includes(action))throw new Error('portable_action_not_supported');
+      const connection=await managerConnection();
+      if(connection.capabilities?.['portable-transfer.v1']!==true)throw new Error('portable_transfer_server_upgrade_required');
+      return (await managerRequest('POST','/v1/manager/portable/'+action,body)).result;
+    },
     managerControl: async (action, body = {}) => {
       const allowed=['status','backups','history','backup-create','backup-check','restore-plan','restore-execute'];
       if(!allowed.includes(action))throw new Error('control_action_not_supported');
@@ -5236,7 +5478,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
 };
 
   const PLUGIN_NAME = 'RE:TRACE';
-const PLUGIN_VERSION = '1.9.77';
+const PLUGIN_VERSION = '1.9.80';
   const RETRACE_SETTING_UI_ID = 'retrace-main-setting';
   const RETRACE_HAMBURGER_UI_ID = 'retrace-main-hamburger';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v2';
@@ -12525,10 +12767,10 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
       ...scopeManagerArray(pluginListing?.records),
       ...scopeManagerArray(localListing?.records)
     ];
-    return {integrity, records};
+    return {integrity, pluginListing, localListing, records};
   };
   const scopeManagerNamespaceSnapshot = async (namespace, listing = null) => {
-    const {integrity, records} = listing || await scopeManagerNamespaceListing(namespace);
+    const {integrity, records, pluginListing, localListing} = listing || await scopeManagerNamespaceListing(namespace);
     const recordMap = scopeManagerRecordMap(records);
     const cache = new Map();
     let batchRequests = 0;
@@ -14472,6 +14714,89 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     }catch(error){if(action==='diagnose'&&state.diagnosis?.management==='조회 중')state.diagnosis.management='실패 · 권한/서버 기록 확인';say('작업 확인 필요: '+String(error?.message||error)+'\n응답이 끊겼다면 상태·이력을 먼저 조회하세요. 복원 실행을 시작한 경우 실패하더라도 재연결 확인이 필요할 수 있습니다.');}
     finally{setBusy(false);renderServerControl();}
   };
+  // Full server-memory ZIP workflow. The UI holds transfer receipts only;
+  // server-side SQLite validation/restore remains the data authority.
+  const portableClient = () => createMemorySuitePortableTransferClient({request:(action,body)=>MemorySuiteStorageBridge.managerPortable(action,body)});
+  const renderPortableTransfer = () => {
+    const root=Runtime.root,state=Runtime.portableTransfer||{},out=root?.querySelector('#portableTransferStatus');if(!out)return;
+    out.textContent=state.message||'기본은 안전 이관 ZIP입니다. 구 SQLite를 새 서버에 붙이지 않고 논리 레코드·삭제 표식·scope catalog를 현재 스키마의 새 DB로 재구성합니다. RisuAI 원본 채팅과 plugin_only 자료는 서버 밖 데이터라 포함되지 않습니다.';
+    const set=(action,disabled)=>{const b=root.querySelector('[data-portable-action="'+action+'"]');if(b)b.disabled=disabled;};
+    set('export',Runtime.busy===true||state.intentBusy===true);set('upload',Runtime.busy===true||state.intentBusy===true||!state.file);set('restore',Runtime.busy===true||state.intentBusy===true||!state.plan||!state.uploaded);
+    set('cancel',!state.controller||state.restoring===true);const file=root.querySelector('#portableBackupFile');if(file)file.disabled=Runtime.busy===true;
+    const summary=root.querySelector('#portableRestorePreview');
+    if(summary)summary.textContent=state.plan?'복원 형식: '+(state.uploaded?.archiveKind==='logical_migration'?'안전 이관 / 새 DB 재구성':'기존 DB 스냅샷')+'\n복원 대상: '+state.plan.namespaces.join(' · ')+'\n현재 서버 기록: '+state.plan.existingRecords+' (삭제 표식 '+state.plan.existingTombstones+')\n백업 검사: '+(state.plan.verified?'통과':'미확인')+'\n현재 데이터가 바뀌면 이 계획으로 복원하지 않습니다. 아직 복원은 실행하지 않았습니다.':'';
+  };
+  const createRetracePortableSink = async (mode='migration') => {
+    const filename=(mode==='snapshot'?'Librarian-Server-Backup-':'Librarian-Migration-')+new Date().toISOString().replace(/[:.]/g,'-')+'.zip';
+    // Must be invoked from the original click before other network awaits.
+    if(typeof globalThis.showSaveFilePicker==='function'){
+      try{
+        const handle=await globalThis.showSaveFilePicker({suggestedName:filename,types:[{description:'ZIP backup',accept:{'application/zip':['.zip']}}]});let writer;
+        return {kind:'file_system_access',async prepare(){writer=await handle.createWritable();},async write(bytes){await writer.write(bytes);},async close(){await writer.close();},async abort(){if(writer)await writer.abort();}};
+      }catch(e){if(e?.name==='AbortError')throw e;if(!['SecurityError','NotAllowedError','TypeError'].includes(e?.name))throw e;}
+    }
+    const launchFileDownload=(blob,name)=>{const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;a.style.display='none';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),5*60*1000);};
+    // OPFS, where available, keeps the working ZIP off the JS heap. Opaque
+    // plugin origins may reject it; fall back to an explicitly bounded Blob.
+    if(globalThis.navigator?.storage?.getDirectory){
+      try{
+        const root=await navigator.storage.getDirectory(),dir=await root.getDirectoryHandle('librarian-portable-downloads',{create:true});
+        for await(const [name] of dir.entries()){const m=/^zip-(\d+)-/.exec(name);if(m&&Date.now()-Number(m[1])>24*60*60*1000)await dir.removeEntry(name).catch(()=>{});}
+        const temp='zip-'+Date.now()+'-'+Math.random().toString(36).slice(2)+'.zip',handle=await dir.getFileHandle(temp,{create:true});let writer;
+        return {kind:'opfs',browserDownload:true,async prepare(meta){const estimate=await navigator.storage.estimate?.();if(Number.isFinite(estimate?.quota)&&estimate.quota-(estimate.usage||0)<meta.totalBytes*1.1)throw Error('브라우저 파일 보관 공간이 부족합니다.');writer=await handle.createWritable();},async write(bytes){await writer.write(bytes);},async close(meta){await writer.close();const file=await handle.getFile();if(file.size!==meta.totalBytes)throw Error('portable_local_file_size_mismatch');launchFileDownload(file,filename);setTimeout(()=>{void dir.removeEntry(temp).catch(()=>{});},10*60*1000);},async abort(){try{await writer?.abort();}finally{await dir.removeEntry(temp).catch(()=>{});}}};
+      }catch(e){/* Host does not expose origin-private storage. No data is uploaded here. */}
+    }
+    const chunks=[];let total=0;
+    return {kind:'bounded_blob',browserDownload:true,async prepare(meta){if(meta.totalBytes>64*1024*1024)throw Error('현재 브라우저의 안전 다운로드 한도는 64 MiB입니다. 파일 저장 권한 또는 OPFS를 지원하는 데스크톱 브라우저에서 다시 시도하세요. 생성된 서버 백업은 그대로 보존됩니다.');},async write(bytes){total+=bytes.length;if(total>64*1024*1024)throw Error('portable_blob_size_limit');chunks.push(bytes);},async close(){const blob=new Blob(chunks,{type:'application/zip'});launchFileDownload(blob,filename);chunks.length=0;},async abort(){chunks.length=0;}};
+  };
+  const handlePortableTransfer = async event => {
+    const b=event.target?.closest?.('[data-portable-action]');if(!b||b.disabled)return;
+    const action=b.dataset.portableAction,state=Runtime.portableTransfer||(Runtime.portableTransfer={});
+    if(action==='cancel'){if(!state.restoring)state.controller?.abort();return;}
+    if(Runtime.busy||state.intentBusy)return;state.intentBusy=true;renderPortableTransfer();const client=portableClient();
+    const update=value=>{state.message=value;renderPortableTransfer();};
+    const report=p=>{const label={preparing:'준비',snapshot:'일관된 서버 사본 생성',packing:'ZIP 포장','migration-export':'논리 데이터 추출','migration-inspect':'이관 ZIP 검사','migration-rebuild':'새 DB 재구성',upload:'ZIP 업로드',inspecting:'압축·DB 검사',ready:'파일 준비 완료',download:'파일 저장',restoring:'서버 복원',restored:'서버 복원 완료'}[p.phase]||p.phase;
+      update(label+' · '+scopeManagerFormatBytes(p.phase==='packing'||p.phase==='inspecting'?p.processedBytes:p.bytes)+' / '+scopeManagerFormatBytes(p.phase==='packing'||p.phase==='inspecting'?p.expandedBytes:p.totalBytes));};
+    let sink=null,ownsBusy=false;
+    try{
+      const exportMode=root.querySelector('#portableExportMode')?.value==='snapshot'?'snapshot':'migration';
+      if(action==='export')sink=await createRetracePortableSink(exportMode);
+      if(action==='upload'&&!state.file)throw Error('업로드할 ZIP 파일을 선택하세요.');
+      let approvedPlan=null;
+      if(action==='restore'){
+        if(!state.uploaded)throw Error('먼저 ZIP을 업로드하고 검사하세요.');
+        // Re-plan immediately before confirmation, never silently refresh a
+        // plan after the user has approved a different target fingerprint.
+        state.plan=await client.planRestore(state.uploaded);renderPortableTransfer();approvedPlan=state.plan;
+        if(!(await retraceConfirm(approvedPlan.warning,{title:'서버 전체 기억 복원',confirmLabel:'복원 시작',danger:approvedPlan.hasExistingData})))return;
+      }
+      setBusy(true);ownsBusy=true;state.controller=new AbortController();state.restoring=action==='restore';renderPortableTransfer();
+      const opts={signal:state.controller.signal,onProgress:report};
+      if(action==='export'){
+        if(state.exported)await client.cancel(state.exported).catch(()=>{});
+        const ready=await client.startExport({...opts,mode:exportMode});state.exported=ready;
+        const result=await client.download(ready,sink,opts);state.exported=null;
+        update((result.downloadStarted?'ZIP 다운로드를 시작했습니다. 브라우저의 다운로드 완료 여부를 확인하세요.':'ZIP 파일 저장을 완료했습니다.')+'\n크기: '+scopeManagerFormatBytes(result.bytes)+'\n서버 SHA-256: '+result.serverSha256+'\n저장 경로: '+result.sink+'\n서버에 만든 안전 백업도 보존됩니다.');
+      }else if(action==='upload'){
+        state.plan=null;
+        if(state.uploaded)await client.cancel(state.uploaded).catch(()=>{});
+        state.uploaded=await client.upload(state.file,opts);state.plan=await client.planRestore(state.uploaded);
+        update('ZIP 검사와 가져오기가 완료되었습니다. 기존 서버 자료는 아직 변경하지 않았습니다.\n다섯 namespace: '+state.uploaded.namespaces.join(' · ')+'\n백업 ID: '+state.uploaded.backupId+'\n아래 미리보기를 확인한 뒤 복원 시작을 누르세요.');
+      }else if(action==='restore'){
+        state.plan=null;
+        const control=Runtime.serverControl||(Runtime.serverControl={});control.reconnect=approvedPlan.namespaces.slice();renderServerControl();
+        const result=await client.restore(state.uploaded,approvedPlan,{replaceAcknowledged:approvedPlan.hasExistingData,onProgress:report});
+        Runtime.serverScopeScanCache={};Runtime.serverScopeCatalog=null;state.uploaded=null;
+        await refreshServerControl().catch(()=>{});
+        update('서버 데이터 복원 완료: '+result.namespaces.join(' · ')+'\n복원 전 자료는 서버 사전 백업으로 보존됩니다.\n아직 RisuAI 원문·Persona·plugin_only 기억까지 복원한 것은 아닙니다.\n각 플러그인의 서버 연결 설정에서 “서버 자료 사용 · 로컬 업로드 안 함”을 선택하고 RisuAI를 새로고침하세요. 원문 비교 규칙도 원래 설정과 대조해 주세요.');
+      }
+    }catch(e){
+      if(sink)try{await sink.abort();}catch(_){}
+      if(e?.transfer&&!state.restoring){await client.cancel(e.transfer).catch(()=>{});if(action==='export')state.exported=null;if(action==='upload'){state.uploaded=null;state.plan=null;}}
+      if(e?.name!=='AbortError')update('작업 확인 필요: '+String(e?.message||e)+'\n복원 실행 중 연결이 끊겼다면 작업 이력에서 결과부터 확인하세요. 동일 복원을 자동으로 다시 실행하지 않습니다.');
+    }finally{state.controller=null;state.restoring=false;state.intentBusy=false;if(ownsBusy)setBusy(false);renderPortableTransfer();}
+  };
+
   const renderShell = () => {
     const root = Runtime.root;
     if (!root) return;
@@ -14579,7 +14904,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
               <div class="card control-hero"><div class="control-heading"><h3>내 라이브러리 서버</h3><button class="btn" data-server-control="refresh">새로고침</button></div><div id="serverControlSummary"></div></div>
               <div class="control-grid"><div class="card"><h3>플러그인별 저장 상태</h3><p>마지막 접촉은 현재 접속 여부를 뜻하지 않습니다.</p><div id="serverControlPlugins"></div></div><div><div class="card"><h3>필요한 작업으로 바로 이동</h3><div class="control-item"><div class="control-grow"><strong>현재 자료를 안전하게 보관</strong><p>서버에 새 백업을 만듭니다.</p></div><button class="btn primary" data-server-control="backup-create">백업 만들기</button></div><div class="control-item"><strong class="control-grow">이전 상태로 되돌리기</strong><button class="btn" data-server-page="backups">백업 보기</button></div><div class="control-item"><strong class="control-grow">불필요한 서버 사본 정리</strong><button class="btn" data-server-page="data">데이터 관리</button></div><div class="control-item"><strong class="control-grow">연결 문제 확인</strong><button class="btn" data-server-page="connection">진단하기</button></div></div><div class="card"><div class="control-heading"><h3>최근 작업</h3><button class="btn" data-server-page="history">전체 보기</button></div><ul id="serverControlRecent" class="control-history"></ul></div></div></div>
             </section>
-            <section data-server-view="backups" hidden>
+            <section data-server-view="backups" hidden><div class="card" id="portableBackupCard"><h3>서버 데이터 안전 이관 · 백업·복원</h3><p><strong>권장:</strong> 구 DATA 폴더를 새 서버에 붙이지 않고 논리 데이터를 이관 ZIP으로 내보낸 뒤 새 서버가 현재 스키마의 빈 DB를 다시 만듭니다. 기존 DB 스냅샷은 물리 복구 호환용으로만 남깁니다.</p><label>내보내기 형식<select id="portableExportMode"><option value="migration" selected>안전 이관 ZIP (논리 데이터 / 새 DB)</option><option value="snapshot">기존 DB 스냅샷 ZIP (호환용)</option></select></label><div class="actions"><button class="btn primary" data-portable-action="export">전체 데이터 이관 ZIP 저장</button><label class="btn">백업 ZIP 선택<input id="portableBackupFile" type="file" accept=".zip,application/zip" style="display:block;max-width:100%;margin-top:6px"></label><button class="btn" data-portable-action="upload" disabled>선택 ZIP 업로드 · 검사</button><button class="btn danger" data-portable-action="restore" disabled>확인 후 전체 복원</button><button class="btn" id="portableCancel" data-portable-action="cancel" disabled>전송 취소</button></div><p>안전 이관은 서버에 실제 저장된 다섯 owner의 레코드·벡터·삭제 표식·scope catalog를 새 DB에 재작성합니다. RisuAI 원본 채팅·plugin_only 자료·API 키·과거 실행 lease는 이관 권한으로 복원하지 않습니다. 파일 전송은 256 KiB 단위, ZIP32 최대 2 GiB입니다.</p><pre id="portableTransferStatus" role="status" aria-live="polite" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre><pre id="portableRestorePreview" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre></div>
               <div class="control-grid"><div class="card"><div class="control-heading"><h3>저장된 백업</h3><button class="btn primary" data-server-control="backup-create">백업 만들기</button></div><p>검사하거나 복원할 백업을 선택하세요.</p><label for="serverControlBackups">백업 선택</label><select id="serverControlBackups"><option value="">먼저 상태 조회</option></select><div id="serverControlBackupCards" class="control-backup-list"></div><div id="serverControlBackupInfo" class="control-detail"></div><button class="btn" data-server-control="backup-check">선택 백업 검사</button><p>검사 표시는 마지막 검사 결과입니다. 복원 전 서버가 다시 검증합니다.</p></div>
               <div class="card"><h3>복원 범위</h3><p>선택한 플러그인의 서버 자료를 백업 시점으로 되돌립니다.</p><fieldset class="control-checks"><legend>복원할 플러그인 선택</legend><label><input type="checkbox" data-control-namespace value="libra">LIBRA</label><label><input type="checkbox" data-control-namespace value="hayaku">HAYAKU</label><label><input type="checkbox" data-control-namespace value="flashback">Flashback</label><label><input type="checkbox" data-control-namespace value="lia">LIA</label><label><input type="checkbox" data-control-namespace value="retrace">RE:TRACE</label></fieldset><div class="settings-callout">미리보기는 자료를 변경하지 않습니다. 복원을 실행하기 전 현재 서버 자료를 백업합니다.</div><div class="actions"><button class="btn primary" data-server-control="restore-plan">복원 미리보기</button><button class="btn danger" data-server-control="restore-execute" disabled>미리본 내용으로 복원</button></div><div id="serverControlPreview"></div><p>복원 후 각 플러그인에서 ‘서버 자료 사용 · 로컬 업로드 안 함’으로 다시 연결하고 RisuAI를 새로고침하세요.</p></div></div>
             </section>
@@ -14615,7 +14940,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
   const setBusy = value => {
     Runtime.busy = Boolean(value);
     Runtime.root?.querySelector?.('.bridge')?.classList?.toggle('busy', Runtime.busy);
-    Runtime.root?.querySelectorAll?.('button:not(#closeBridge):not(#serverScopeDeleteCancel):not(.nav):not([data-server-page]):not(#analysisReturnToRisu):not(#retraceDialogConfirm):not(#retraceDialogCancel)').forEach(button => {
+    Runtime.root?.querySelectorAll?.('button:not(#closeBridge):not(#portableCancel):not(#serverScopeDeleteCancel):not(.nav):not([data-server-page]):not(#analysisReturnToRisu):not(#retraceDialogConfirm):not(#retraceDialogCancel)').forEach(button => {
       if (Runtime.busy) {
         if (!button.disabled) button.dataset.bridgeBusyDisabled = 'true';
         button.disabled = true;
@@ -15078,6 +15403,10 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     bindDebugExportButton(root.querySelector('#serverControlExportDebug'));
     setServerPage(Runtime.serverControlPage);
     root.querySelector('#serverControl')?.addEventListener('click',event=>{void handleServerControl(event);});
+    root.querySelector('#portableBackupCard')?.addEventListener('click',event=>{void handlePortableTransfer(event);});
+    root.querySelector('#portableBackupFile')?.addEventListener('change',event=>{const state=Runtime.portableTransfer||(Runtime.portableTransfer={});state.file=event.target.files?.[0]||null;state.plan=null;state.message=state.file?'선택 파일: '+state.file.name+' · '+scopeManagerFormatBytes(state.file.size):'ZIP 파일을 선택하세요.';renderPortableTransfer();});
+    root.querySelector('#portableExportMode')?.addEventListener('change',()=>{const state=Runtime.portableTransfer||(Runtime.portableTransfer={});state.exported=null;state.message='내보내기 형식을 변경했습니다. 새 ZIP을 생성하세요.';renderPortableTransfer();});
+    renderPortableTransfer();
     root.querySelector('#serverControlBackupCards')?.addEventListener('click',event=>{
       const button=event.target?.closest?.('[data-control-backup]');if(!button||Runtime.busy)return;
       const select=root.querySelector('#serverControlBackups');if(select){select.value=button.getAttribute('data-control-backup');select.dispatchEvent(new Event('change',{bubbles:true}));}
@@ -15567,6 +15896,7 @@ ${error?.message || error}`);
         pending.reject(new Error('RE:TRACE unloaded before LIA IPC completed.'));
       }
       Runtime.liaIpcPending.clear();
+      Runtime.portableTransfer?.controller?.abort();
       try { await MemorySuiteStorageBridge.dispose?.(); } catch (_) {}
       for (const bridge of Object.values(MemorySuitePeerServerBridges)) {
         try { await bridge.dispose?.(); } catch (_) {}

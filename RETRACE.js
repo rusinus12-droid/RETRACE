@@ -1,8 +1,9 @@
 //@name flashback_hayaku_bridge
 //@display-name RE:TRACE
 //@api 3.0
-//@version 1.9.68
-/* v1.9.68 / BOOK_UX 5.18: verified RisuAI native branch prefixes, source-bound adoption, preserved consent and read-only lineage status. */
+//@version 1.9.77
+/* v1.9.74 places scoped control styles in the actual RE:TRACE renderer, adds reference-aligned cards and state views, preserving owner/server mutation contracts. */
+/* v1.9.72 / BOOK_UX 5.18: verified RisuAI native branch prefixes, source-bound adoption, preserved consent and read-only lineage status. */
 /* v1.9.66 rebases handoff target creation onto the fresh host Character, detects source/concurrent edits, and verifies chat readback without destructive rollback. */
 /* v1.9.65 replaces the full-rerender settings shell with a Flashback-inspired status workspace: a real Owner/compatibility overview, persistent accessible tabs, privacy-safe diagnostics, and horizontal mobile navigation. Owner-only mutation, authenticated IPC allowlists, immutable-source handoff, storage gating, server deletion proof, and provider retirement are unchanged. */
 /* v1.9.64 adopts Storage SDK 1.8.13 paged namespace inspection, bounded batch reads, oversized-record fallback, and the 4 MiB interactive value guard. Owner-only mutation, immutable-source handoff, recovery proof, and cross-namespace write restrictions are unchanged. */
@@ -240,7 +241,7 @@ function createMemorySuiteHostLineage() {
 /* END LIBRARIAN HOST LINEAGE SDK */
 const MemorySuiteHostLineage = createMemorySuiteHostLineage();
 
-/* LIBRARIAN SYSTEM STORAGE SDK v1.8.16
+/* LIBRARIAN SYSTEM STORAGE SDK v1.8.19
  * Scope-routed durable storage client shared by Flashback, HAYAKU, LIBRA, LIA and RE:TRACE.
  * The server stores opaque values. Each plugin keeps ownership of its own data schema.
  */
@@ -651,12 +652,37 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     ? '미러'
     : (mode === MODE_SERVER_ONLY ? '서버 단독' : '플러그인 단독');
 
+  let resetChoice = null;
+  let resetReloadRequired = false;
+  const resetChoiceKey = 'memory_suite_reset_choice.' + namespace;
+  const readResetChoice = async () => {
+    const store = state.legacy.plugin;
+    if(!store?.getItem)return null;
+    const value=await store.getItem(resetChoiceKey);
+    try { resetChoice=typeof value==='string'?JSON.parse(value):value; } catch(_){resetChoice=null;}
+    if(resetChoice && resetChoice.url!==(await readConfig()).url)resetChoice=null;
+    return resetChoice;
+  };
+  const acceptServerReset = async choice => {
+    if(!['empty','upload'].includes(choice))throw new Error('reset_choice_invalid');
+    const connection=await bootstrap(true,true);
+    const epoch=Number(connection.resetEpochs?.[namespace]||0);
+    if(!epoch)throw new Error('server_has_not_been_reset');
+    const value={epoch,url:connection.requestedUrl||connection.url,choice};
+    const store=state.legacy.plugin;
+    if(!store?.setItem||!store?.getItem)throw new Error('reset_preference_storage_unavailable');
+    if(await store.setItem(resetChoiceKey,JSON.stringify(value))===false)throw new Error('reset_preference_write_failed');
+    const actual=await readResetChoice();
+    if(JSON.stringify(actual)!==JSON.stringify(value))throw new Error('reset_preference_readback_failed');
+    resetReloadRequired=true;
+    return {ok:true,reloadRequired:true,choice};
+  };
   const normalizeServerUrl = rawValue => {
     const raw = String(rawValue || defaultUrl).trim().replace(/\/+$/, '') || defaultUrl;
     try {
       const parsed = new URL(raw);
-      const host = String(parsed.hostname || '').toLowerCase();
-      if (parsed.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1'].includes(host)) {
+      const host = String(parsed.hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+      if (parsed.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1', 'host.docker.internal'].includes(host)) {
         throw new Error('server_url_must_be_loopback_http');
       }
       return parsed.origin;
@@ -835,8 +861,9 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       if (payload.capabilities?.[capability] !== true) throw new Error(`memory_suite_capability_missing:${capability}`);
     }
     return {
+      resetEpochs: payload.resetEpochs || {},
       requestedUrl: requestedUrl || '',
-      url: String(payload.url).replace(/\/+$/, ''),
+      url: String(requestedUrl || payload.url).replace(/\/+$/, ''),
       token: String(payload.token),
       version: String(payload.version || ''),
       protocol: payload.protocol || {},
@@ -870,6 +897,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
         method: 'GET',
         headers: {
           Authorization: `Bearer ${connection.token}`,
+        'X-Memory-Suite-Reset-Epochs': JSON.stringify(connection.resetEpochs || {}),
           'X-Memory-Suite-Plugin': pluginId,
           'X-Memory-Suite-Plugin-Version': pluginVersion
         }
@@ -955,6 +983,13 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
   const request = async (method, route, body = null, requestOptions = {}) => {
     const connection = await bootstrap(requestOptions.forceBootstrap === true, requestOptions.allowPluginOnly === true);
     if (!connection) throw new Error('memory_suite_server_not_enabled');
+    const resetEpoch=Number(connection.resetEpochs?.[namespace]||0);
+    if(resetEpoch && !route.startsWith('/v1/manager/')){
+      const choice=await readResetChoice();
+      if(resetReloadRequired || choice?.epoch!==resetEpoch || choice?.url!==(connection.requestedUrl||connection.url)){
+        throw new Error('서버 자료가 초기화 또는 복원되었습니다. 서버 연결 설정에서 서버 자료 사용 또는 로컬 기억 다시 업로드를 선택한 뒤 RisuAI를 새로고침하세요.');
+      }
+    }
     const requestScope = requestOptions.scope && typeof requestOptions.scope === 'object'
       ? requestOptions.scope
       : state.scopeRouting.current;
@@ -966,6 +1001,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       method,
       headers: {
         Authorization: `Bearer ${connection.token}`,
+        'X-Memory-Suite-Reset-Epochs': JSON.stringify(connection.resetEpochs || {}),
         'X-Memory-Suite-Plugin': pluginId,
         'X-Memory-Suite-Plugin-Version': pluginVersion,
         ...(requestScopeId ? { 'X-Memory-Suite-Scope-Id': encodeURIComponent(requestScopeId) } : {}),
@@ -2724,7 +2760,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     const root = document.createElement('div');
     root.id = managementRootId;
     root.innerHTML = `<style>
-      #${managementRootId}{position:fixed;inset:0;z-index:2147483000;background:rgba(4,8,15,.72);display:flex;align-items:center;justify-content:center;padding:18px}
+      #${managementRootId}{position:fixed;inset:0;z-index:28;background:rgba(4,8,15,.72);display:flex;align-items:center;justify-content:center;padding:18px}
       #${managementRootId} .ms-dialog-card{width:min(820px,100%);max-height:94vh;overflow:auto;background:#101827;border:1px solid #334155;border-radius:17px;padding:18px;box-shadow:0 24px 80px rgba(0,0,0,.48)}
       #${managementRootId} .ms-dialog-close{display:flex;justify-content:flex-end;margin-top:12px} #${managementRootId} .ms-dialog-close button{padding:9px 14px;border:1px solid #475569;border-radius:9px;background:#1e293b;color:#eef3ff;cursor:pointer;font-weight:700}
     </style><div class="ms-dialog-card"><div data-ms-dialog-panel></div><div class="ms-dialog-close"><button data-ms-dialog-close type="button">닫기</button></div></div>`;
@@ -3133,7 +3169,8 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     if (!scopeInput || scope.scopeId === state.scopeRouting.current?.scopeId) registry = await maybeImportLegacyGlobalMode(scope, registry);
     const stored = registry.entries[scope.scopeId];
     const transient = state.scopeRouting.transientModes.get(scope.scopeId);
-    const mode = VALID_MODES.has(transient) ? transient : normalizeMode(stored?.mode || MODE_PLUGIN_ONLY);
+    const choice=await readResetChoice();
+    const mode = choice?.choice==='empty' ? MODE_SERVER_ONLY : VALID_MODES.has(transient) ? transient : normalizeMode(stored?.mode || MODE_PLUGIN_ONLY);
     return { scope: stored ? normalizeScopeDescriptor(stored, scope.scopeId) : scope, mode, modeLabel: modeLabel(mode), explicit: !!stored };
   };
   const scopeExecutionPolicyFromModeState = modeState => {
@@ -3319,6 +3356,10 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     if (currentMode === MODE_PLUGIN_ONLY) return typeof legacyGet === 'function' ? await legacyGet() : null;
     const route = await resolveScopedRoute(space, key);
     if (!route.routed || route.mode === MODE_PLUGIN_ONLY) return typeof legacyGet === 'function' ? await legacyGet() : null;
+    if(resetChoice?.choice==='empty'){
+      const row=await remoteGet(space,route.remoteKey,{allowPluginOnly:true});
+      return row.exists===true?await routeMergeValue(route,row.value,null):null;
+    }
     if (flashbackWriterAlias(route.remoteKey)) {
       // Server-selected Flashback corpora never accept a local-ahead mirror as
       // canonical. Import only an absent server key, under the writer fence.
@@ -3596,6 +3637,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
   };
 
   const scopedSynchronizeSpace = async (legacy, space = 'plugin', syncOptions = {}) => {
+    if((await readResetChoice())?.choice==='empty')throw new Error('서버 자료 사용 모드에서는 기존 로컬 기억을 자동 업로드하지 않습니다. 로컬 기억 다시 업로드를 명시적으로 선택하세요.');
     if (!legacy) throw new Error('memory_suite_pluginstorage_unavailable');
     const scope = normalizeScopeDescriptor(syncOptions.scope || await resolveCurrentScope(true));
     if (!scope.scopeId) throw new Error('memory_suite_current_scope_unavailable');
@@ -4136,6 +4178,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
 
   const scopedSetModeSafely = async (requestedMode, operationOptions = {}) => {
     const target = normalizeMode(requestedMode);
+    if ((await readResetChoice())?.choice === 'empty' && target !== MODE_SERVER_ONLY) throw new Error('reset_empty_mode_locked: select local upload and reload before changing storage mode');
     const scope = normalizeScopeDescriptor(operationOptions.scope || await resolveCurrentScope(true));
     const recoveryLock = await recoveryLockForScope(scope);
     if (recoveryLock && target !== MODE_SERVER_ONLY) throw recoveryRequiredError(scope, recoveryLock, `set_mode_${target}`);
@@ -4503,9 +4546,9 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
           <label class="mode"><input type="radio" name="${rootId}-mode" value="server_only"><span><b>서버 단독</b><br><small>${integratesCompute ? '서버를 영구 정본으로 사용하고 서버에서 우선 연산합니다. 연산 실패는 로컬로 복귀합니다.' : '현재 스코프의 영구 정본을 Librarian System DATA에 저장합니다.'}</small></span></label>
         </div>
         <div class="scope" data-mode-summary${integratesCompute ? '' : ' hidden'}></div>
-        <label data-server-fields><b>서버 주소</b><input data-url type="text" value="${esc(initial.url)}"></label>
+        <p>Docker는 host.docker.internal 주소를 입력할 수 있습니다. PocketRisu의 /proxy2 경유 요청은 PocketRisu 서버에서 출발합니다. localhost는 그 서버 또는 컨테이너 자신입니다. 백엔드가 실행 중인 위치와 접근 경로를 확인하세요.</p><label data-server-fields><b>서버 주소</b><input data-url type="text" value="${esc(initial.url)}"></label>
         <div class="actions"><button data-test>연결 테스트</button><button class="primary" data-apply>설정 적용</button><button data-sync>지금 동기화</button><button data-restore>서버 → pluginStorage 복구</button><button class="danger" data-delete>현재 스코프 pluginStorage 삭제</button></div>
-        <div class="status" data-status>${integratesCompute ? `현재 방식: ${esc(initial.modeLabel)}\n연산: ${initial.executionPolicy?.computeMode === 'prefer_server' ? '서버 우선 · 실패 시 로컬' : '로컬'}` : `현재 모드: ${esc(initial.modeLabel)}\n서버 상태를 확인할 수 있습니다.`}</div>
+        <div class="actions"><button data-reset-empty>서버 자료 사용 · 로컬 업로드 안 함</button><button data-reset-upload>초기화 후 로컬 기억 다시 업로드</button></div><div class="status" data-status>${integratesCompute ? `현재 방식: ${esc(initial.modeLabel)}\n연산: ${initial.executionPolicy?.computeMode === 'prefer_server' ? '서버 우선 · 실패 시 로컬' : '로컬'}` : `현재 모드: ${esc(initial.modeLabel)}\n서버 상태를 확인할 수 있습니다.`}</div>
       </div>
       <div class="job" data-job><b data-job-title>작업 진행 중</b><div class="bar"><i data-job-bar></i></div><div class="grid"><span data-job-phase></span><span data-job-count></span><span data-job-bytes></span><span data-job-time></span><span data-job-retry></span><span data-job-key></span></div><div class="result" data-job-result></div><div class="actions" data-job-terminal-actions style="display:none"><button data-job-dismiss type="button">결과 확인 닫기</button></div></div>
     </div>`;
@@ -4559,6 +4602,9 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
       if(terminal&&job.status==='completed'&&normalizeMode(job.targetMode)!==MODE_PLUGIN_ONLY&&computeProbeJobId!==job.jobId){computeProbeJobId=job.jobId;try{computeBridge?.scheduleProbe?.(0);}catch(_){}}
       if(terminal&&job.jobId!==terminalRefreshId){terminalRefreshId=job.jobId;scheduleLifecycleTimeout(()=>{void scopedGetConnectionSettings({scope:initial.scope,force:true}).then(settings=>applyRecoveryGuard(settings.recoveryRequired)).catch(()=>{});},0);}
     };
+    for(const [selector,choice] of [['[data-reset-empty]','empty'],['[data-reset-upload]','upload']]){
+      q(selector).onclick=async()=>{try{await acceptServerReset(choice);setMessage('선택을 저장했습니다. 기존 실행의 재업로드를 막기 위해 RisuAI를 새로고침한 뒤 사용하세요.','good');}catch(error){setMessage(error.message,'error');}};
+    }
     q('[data-test]').onclick = async()=>{ setMessage(integratesCompute?'Storage와 Compute 연결을 확인하고 있습니다…':'서버 연결을 확인하고 있습니다…'); const storageResult=await testConnection(q('[data-url]').value); let computeResult=null; if(integratesCompute&&storageResult.ok&&computeBridge?.probe){try{computeResult=await computeBridge.probe({force:true,reason:'integrated_connection_test'});}catch(error){computeResult={ok:false,error:compact(error?.message||error,300)};}} const storageLine=storageResult.ok?`${integratesCompute?'Storage: ':''}연결됨 · Librarian System ${storageResult.serverVersion} · 항목 ${storageResult.liveRecords}`:`${integratesCompute?'Storage: ':''}연결 실패 · ${storageResult.error}`; const computeLine=!integratesCompute?'':!storageResult.ok?'Compute: Storage 연결 실패로 확인하지 않음':computeResult?.ok?`Compute: 연결됨 · ${Number(computeResult.operations?.length||computeResult.operationCount||0)}개 연산`:`Compute: 연결 실패 · 연산 시 로컬 폴백 · ${computeResult?.error||computeResult?.reason||'unavailable'}`; setMessage([storageLine,computeLine].filter(Boolean).join('\n'),storageResult.ok&&(!integratesCompute||computeResult?.ok)?'good':storageResult.ok?'':'error'); };
     q('[data-apply]').onclick = async()=>{ const mode=root.querySelector(`input[name="${rootId}-mode"]:checked`)?.value||MODE_PLUGIN_ONLY; try{const job=await scopedStartConnectionConfigurationJob({mode,url:q('[data-url]').value,scope:initial.scope}); setMessage('설정 적용과 현재 스코프 초기 동기화를 시작했습니다.'); renderJob(job);}catch(error){setMessage(`설정 적용 시작 실패\n${error?.message||error}`,'error');} };
     q('[data-sync]').onclick = async()=>{ try{const job=await scopedStartSynchronizationJob({scope:initial.scope});setMessage('현재 스코프 동기화를 시작했습니다.');renderJob(job);}catch(error){setMessage(`동기화 시작 실패\n${error?.userMessage||error?.message||error}`,'error');} };
@@ -4929,11 +4975,12 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     const response = await managerRequest('POST', '/v1/manager/scope-delete/plan', payload || {});
     return response?.result || null;
   };
-  const managerExecuteScopeDeletion = async (planId, mutationFingerprint) => {
+  const managerExecuteScopeDeletion = async (planId, mutationFingerprint, options = {}) => {
     const connection = await managerConnection();
     if (connection?.capabilities?.['scope-delete-commit.v1'] !== true) throw new Error('memory_suite_scope_delete_commit_capability_missing');
     const response = await managerRequest('POST', '/v1/manager/scope-delete/execute', {
       planId: String(planId || ''),
+      statusOnly: options.statusOnly === true,
       mutationFingerprint: String(mutationFingerprint || '')
     });
     return response?.result || null;
@@ -5144,6 +5191,13 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     getCachedDiagnostics,
     decorateDebugExport,
     decorateDebugExportSync,
+    managerControl: async (action, body = {}) => {
+      const allowed=['status','backups','history','backup-create','backup-check','restore-plan','restore-execute'];
+      if(!allowed.includes(action))throw new Error('control_action_not_supported');
+      const connection=await managerConnection();
+      if(connection.capabilities?.['manager-control.v1']!==true)throw new Error('manager_control_server_upgrade_required');
+      return (await managerRequest(['status','backups','history'].includes(action)?'GET':'POST','/v1/manager/control/'+action,['status','backups','history'].includes(action)?null:body)).result;
+    },
     managerGetDiagnostics,
     managerConnection,
     managerServerGet,
@@ -5152,6 +5206,9 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
     managerServerIntegrity,
     managerReplaceScopeIndex,
     managerListScopes,
+    acceptServerReset,
+    managerPlanReset: async namespaces => (await managerRequest('POST','/v1/manager/reset/plan',{namespaces})).result,
+    managerExecuteReset: async body => (await managerRequest('POST','/v1/manager/reset/execute',body)).result,
     managerPlanScopeDeletion,
     managerExecuteScopeDeletion,
     managerSetScopePinned,
@@ -5179,7 +5236,7 @@ const createMemorySuiteStorageBridge = (rawOptions = {}) => {
 };
 
   const PLUGIN_NAME = 'RE:TRACE';
-const PLUGIN_VERSION = '1.9.68';
+const PLUGIN_VERSION = '1.9.77';
   const RETRACE_SETTING_UI_ID = 'retrace-main-setting';
   const RETRACE_HAMBURGER_UI_ID = 'retrace-main-hamburger';
   const HANDOFF_SCHEMA = 'memory-session-bridge-v2';
@@ -5232,6 +5289,7 @@ const PLUGIN_VERSION = '1.9.68';
     'inspect',
     'adopt_session_handoff',
     'memory_suite_prepare_server_scope_delete',
+    'memory_suite_prepare_handoff_target',
     'memory_suite_storage_status'
   ]);
   const LIBRA_IPC_ALLOWED_ACTIONS = new Set([
@@ -5241,12 +5299,14 @@ const PLUGIN_VERSION = '1.9.68';
     'adopt_session_handoff',
     'verify_session_handoff',
     'memory_suite_prepare_server_scope_delete',
+    'memory_suite_prepare_handoff_target',
     'memory_suite_storage_status'
   ]);
   const LIA_IPC_ALLOWED_ACTIONS = new Set([
     'capabilities',
     'adopt_chat_handoff',
     'memory_suite_prepare_server_scope_delete',
+    'memory_suite_prepare_handoff_target',
     'memory_suite_storage_status'
   ]);
   const HAYAKU_PLUGIN_ID = 'hayaku_locator_continuity';
@@ -5262,6 +5322,7 @@ const PLUGIN_VERSION = '1.9.68';
     'adopt_session_handoff',
     'forget',
     'memory_suite_prepare_server_scope_delete',
+    'memory_suite_prepare_handoff_target',
     'memory_suite_storage_status'
   ]);
   const FLASHBACK_REGISTRY_KEY = 'vector_rag_memory:scope_registry:v2';
@@ -5327,15 +5388,12 @@ const PLUGIN_VERSION = '1.9.68';
   const LIBRA_VIEWER_MAX_RENDERED_RECORDS = 240;
   const SERVER_SCOPE_MANAGER_PAGE_SIZE = 60;
   const RETRACE_GUI_TAB_IDS = Object.freeze([
-    'overview', 'session', 'libra', 'flashback', 'hayaku', 'serverdata', 'serverconnection', 'diagnostics'
+    'overview', 'session', 'serverdata', 'serverconnection', 'diagnostics'
   ]);
   const RETRACE_GUI_TAB_META = Object.freeze({
     overview: Object.freeze({ eyebrow: 'STATUS', title: '메모리 시스템 개요', description: '현재 채팅의 호환성, 저장 Gate, Owner 연결 상태를 실제 응답으로 요약합니다.' }),
     session: Object.freeze({ eyebrow: 'CONTINUITY', title: '다음 세션', description: '원본을 보존하면서 설치된 Owner의 승계 계약과 내구성을 검증합니다.' }),
-    libra: Object.freeze({ eyebrow: 'CANONICAL MEMORY', title: 'LIBRA 정본 기억', description: 'LIBRA Owner IPC가 제공하는 현재 스코프 정본을 읽기 전용으로 표시합니다.' }),
-    flashback: Object.freeze({ eyebrow: 'RECALL MEMORY', title: 'Flashback 기억', description: '활성 manifest와 최신 shard의 기억을 읽기 전용으로 표시합니다.' }),
-    hayaku: Object.freeze({ eyebrow: 'WORLDLINE LEDGER', title: 'HAYAKU 원장', description: '패킷, 월드라인, 연속성 데이터를 Owner 경계 안에서 확인합니다.' }),
-    serverdata: Object.freeze({ eyebrow: 'SERVER DATA', title: '서버 데이터 관리', description: '서버 스코프를 현재 채팅 목록과 대조하고 보호·삭제 증명을 관리합니다.' }),
+    serverdata: Object.freeze({ eyebrow: 'SERVER CONTROL', title: '서버 관제', description: '서버 상태·데이터·백업·복원·작업 이력을 관리합니다.' }),
     serverconnection: Object.freeze({ eyebrow: 'OWNER STORAGE', title: '저장 상태', description: '설치되어 응답하는 Owner의 저장 모드와 서버 내구성을 읽기 전용으로 확인합니다.' }),
     diagnostics: Object.freeze({ eyebrow: 'DIAGNOSTICS', title: '연결 진단', description: '민감 원문 없이 IPC, 호환성, 최근 경고와 런타임 상태를 확인합니다.' })
   });
@@ -11101,6 +11159,25 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
   const ensurePendingHandoffStorageConfiguration = async loaded => {
     const bridge = loaded?.bridge || {};
     const journal = loaded?.journal || {};
+    const targetPolicy = bridge.targetStoragePolicy || journal.storagePolicy;
+    const targetMode = bridge.targetStorageMode || journal.storageDestination;
+    if (targetPolicy?.participants?.length && ['plugin_only','mirror','server_only'].includes(targetMode)) {
+      const requesters = {flashback:requestFlashbackIpc, hayaku:requestHayakuIpc, libra:requestLibraIpc, lia:requestLiaIpc};
+      for (const participant of targetPolicy.participants) {
+        const request = requesters[participant.owner];
+        if (!request || participant.mode !== targetMode) throw Error('HANDOFF_TARGET_STORAGE_POLICY_INVALID');
+        let receipt;
+        try {
+          receipt = await request('memory_suite_prepare_handoff_target', {targetChatId:loaded.targetChatId, transferId:journal.transferId, mode:targetMode}, {timeoutMs:120000,ignoreCooldown:true,suppressCooldown:true});
+        } catch (cause) {
+          const error = new Error('대상 저장 모드 준비 실패 (' + participant.owner + '): ' + text(cause?.message || cause));
+          error.code = 'RETRACE_HANDOFF_STORAGE_CONFIGURATION_PENDING';
+          error.cause = cause;
+          throw error;
+        }
+        if (receipt?.schema !== 'memory-suite.target-storage-preparation.v1' || receipt.verified !== true || receipt.owner !== participant.owner || receipt.targetChatId !== loaded.targetChatId || receipt.transferId !== journal.transferId || receipt.mode !== targetMode) throw Error('HANDOFF_TARGET_STORAGE_RECEIPT_INVALID');
+      }
+    }
     const liveGate = await inspectMemorySuiteOwnerStorageGate();
     if (!liveGate.ready) {
       const error = new Error(`다음 세션 저장 Gate를 통과하지 못했습니다: ${liveGate.reason}`);
@@ -12438,7 +12515,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     if (namespace === 'retrace') return MEMORY_SUITE_RETRACE_SCOPE_PREFIXES.some(prefix => key.startsWith(prefix));
     return false;
   };
-  const scopeManagerNamespaceSnapshot = async namespace => {
+  const scopeManagerNamespaceListing = async namespace => {
     const [integrity, pluginListing, localListing] = await Promise.all([
       MemorySuiteStorageBridge.managerServerIntegrity(namespace),
       MemorySuiteStorageBridge.managerServerKeys(namespace, 'plugin', ''),
@@ -12448,6 +12525,10 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
       ...scopeManagerArray(pluginListing?.records),
       ...scopeManagerArray(localListing?.records)
     ];
+    return {integrity, records};
+  };
+  const scopeManagerNamespaceSnapshot = async (namespace, listing = null) => {
+    const {integrity, records} = listing || await scopeManagerNamespaceListing(namespace);
     const recordMap = scopeManagerRecordMap(records);
     const cache = new Map();
     let batchRequests = 0;
@@ -13149,7 +13230,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     }
     return connection;
   };
-  const refreshServerScopeManagement = async () => {
+  const refreshServerScopeManagement = async (options = {}) => {
     if (Runtime.serverScopeManagerLoading) return Runtime.serverScopeCatalog;
     Runtime.serverScopeManagerLoading = true;
     Runtime.serverScopeManagerPage = 0;
@@ -13157,13 +13238,17 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     Runtime.serverScopeManagerProgress = { total: MEMORY_SUITE_SCOPE_NAMESPACES.length, completed: 0, current: ['서버 기능 확인'], batchRequests: 0, batchLoaded: 0, fallbackReads: 0, updatedAt: Date.now() };
     renderServerScopeManagement();
     try {
-      await assertServerScopeManagerCapabilities();
+      const connection=await assertServerScopeManagerCapabilities();
       setServerScopeManagerProgress({ current: ['RisuAI 채팅 목록 확인'] });
       const inventory = await scopeManagerStableHostInventory();
       const priorCatalog = await MemorySuiteStorageBridge.managerListScopes().catch(() => ({ scopes: [] }));
       const priorMap = scopeManagerPriorMap(priorCatalog);
       const recipes = new Map();
       const scanErrors = {};
+      const previousCache=Runtime.serverScopeScanCache || {};
+      const nextCache={};
+      const context=JSON.stringify({url:connection?.requestedUrl||connection?.url,inventory:inventory.fingerprint,character:inventory.characterId,chat:inventory.currentChatId,persona:inventory.currentPersonaId,epochs:connection?.resetEpochs,stable:inventory.stable,complete:inventory.complete});
+      const catalogFingerprint=(catalog,ns)=>JSON.stringify(scopeManagerArray(catalog?.scopes).filter(row=>row.namespace===ns));
       const queue = MEMORY_SUITE_SCOPE_NAMESPACES.slice();
       let cursor = 0;
       let completed = 0;
@@ -13172,10 +13257,19 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
         active.add(namespace);
         setServerScopeManagerProgress({ completed, current: Array.from(active) });
         try {
-          const snapshot = await scopeManagerNamespaceSnapshot(namespace);
+          const listing=await scopeManagerNamespaceListing(namespace);
+          const fingerprint=JSON.stringify(listing.records);
+          const cached=previousCache[namespace];
+          if(options.reuseUnchanged===true && inventory.stable===true && inventory.complete===true && listing.integrity?.ok===true && cached?.context===context && cached.fingerprint===fingerprint && cached.catalog===catalogFingerprint(priorCatalog,namespace)){
+            for(const [key,value] of cached.recipes)recipes.set(key,value);
+            nextCache[namespace]={...cached};
+            return;
+          }
+          const snapshot = await scopeManagerNamespaceSnapshot(namespace,listing);
           const scopes = await scopeManagerScanNamespace(namespace, snapshot, inventory, priorMap);
           for (const scope of scopes) recipes.set(scopeManagerRecipeKey(namespace, scope.scopeId), scope._mutations || []);
           await MemorySuiteStorageBridge.managerReplaceScopeIndex(namespace, scopes.map(({ _mutations, ...scope }) => scope));
+          nextCache[namespace]={context,fingerprint,recipes:Array.from(recipes).filter(([key])=>key.startsWith(namespace+'\n'))};
           const progress = Runtime.serverScopeManagerProgress || {};
           setServerScopeManagerProgress({
             batchRequests: Number(progress.batchRequests || 0) + Number(snapshot.batch?.requests || 0),
@@ -13214,6 +13308,8 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
         },
         scanErrors
       };
+      for(const [ns,cached] of Object.entries(nextCache))cached.catalog=catalogFingerprint(catalog,ns);
+      Runtime.serverScopeScanCache=nextCache;
       Runtime.serverScopeHostInventory = inventory;
       Runtime.serverScopeRecipes = recipes;
       Runtime.serverScopePlans = new Map();
@@ -13292,7 +13388,17 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     }).join('');
     return `<div class="server-scope-pairing"><div><strong>복구 페어링 · ${escapeHtml(source.displayName || source.scopeId)}</strong><span>대상 채팅을 실제 RisuAI 목록에서 고릅니다. 최종 적용은 해당 채팅이 현재 열려 있고, 두 번 읽은 채팅 목록·캐릭터·채팅 ID·대화 지문이 모두 안정적일 때만 허용됩니다.</span></div><select id="serverScopePairTarget" ${rows.length ? '' : 'disabled'}>${options}</select><div class="actions"><button class="btn" data-server-scope-pair-cancel>취소</button><button class="btn primary" data-server-scope-pair-apply ${rows.length ? '' : 'disabled'}>현재 채팅으로 검증·연결</button></div></div>`;
   };
+  const syncServerDeleteControls = () => {
+    const job=Runtime.serverScopeDeleteJob;
+    const running=Runtime.serverScopeDeletionRunning===true;
+    const remaining=scopeManagerArray(job?.targets).some(target=>!scopeManagerArray(job?.rows).some(row=>row.key===scopeManagerSelectionKey(target)&&(row.status==='삭제 완료'||row.committed===true)));
+    const cancel=Runtime.root?.querySelector?.('#serverScopeDeleteCancel');
+    if(cancel){cancel.hidden=!running;cancel.disabled=!running||job?.cancelRequested===true;cancel.textContent=job?.cancelRequested?'중단 요청됨':'진행 중 작업 중단';}
+    const retry=Runtime.root?.querySelector?.('[data-server-delete-retry]');
+    if(retry){retry.hidden=!remaining||running;retry.disabled=Runtime.busy===true||running||!remaining;}
+  };
   const renderServerScopeManagement = () => {
+    syncServerDeleteControls();
     const body = Runtime.root?.querySelector?.('#serverDataBody');
     if (!body) return;
     if (Runtime.serverScopeManagerLoading) {
@@ -13318,7 +13424,8 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     const selected = Runtime.serverScopeSelection || new Set();
     const selectedScopes = scopes.filter(scope => selected.has(scopeManagerSelectionKey(scope)) && !scopeManagerDeleteBlockedReason(scope));
     const statusOrder = new Map(MEMORY_SUITE_SCOPE_STATUS_ORDER.map((status, index) => [status, index]));
-    const orderedScopes = scopes.toSorted((left, right) => {
+    const search=scopeManagerText(Runtime.serverScopeSearch).toLowerCase(),filter=scopeManagerText(Runtime.serverScopeFilter);
+    const orderedScopes = scopes.filter(scope=>(!filter||scope.classification===filter)&&(!search||[scope.displayName,scope.scopeId,scope.namespace,MEMORY_SUITE_NAMESPACE_LABELS[scope.namespace]].some(value=>scopeManagerText(value).toLowerCase().includes(search)))).toSorted((left, right) => {
       const statusDelta = (statusOrder.get(left?.classification) ?? Number.MAX_SAFE_INTEGER)
         - (statusOrder.get(right?.classification) ?? Number.MAX_SAFE_INTEGER);
       if (statusDelta) return statusDelta;
@@ -13338,7 +13445,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
       rows: pageScopes.filter(scope => scope.classification === status)
     }));
     const inventoryHtml = `<div class="server-data-summary ${inventory.stable ? 'ok' : 'warn'}"><div><strong>${inventory.stable ? '채팅 목록 안정 확인' : '채팅 목록 확인 불완전'}</strong><span>${inventory.stable ? `현재 캐릭터의 채팅 ${formatNumber(inventory.chatCount || 0)}개와 비교했습니다.` : '고아 판정과 삭제가 보수적으로 차단됩니다.'}</span></div><em>${scopeManagerFormatTime(catalog.at)}</em></div>`;
-    const toolbarHtml = `<div class="server-scope-toolbar"><div><strong>다중 작업</strong><span>삭제 가능 ${formatNumber(eligible.length)}개 · 선택 ${formatNumber(selectedScopes.length)}개</span></div><div class="actions"><button class="btn" data-server-scope-select-all ${eligible.length ? '' : 'disabled'}>삭제 가능 전체 선택</button><button class="btn" data-server-scope-select-clear ${selected.size ? '' : 'disabled'}>선택 해제</button><button class="btn danger" data-server-scope-delete-selected ${selectedScopes.length ? '' : 'disabled'}>${selectedScopes.length && selectedScopes.every(scope => Runtime.serverScopePlans?.has(scopeManagerSelectionKey(scope))) ? '검증된 선택 삭제' : '선택 삭제 검증'}</button></div></div>`;
+    const toolbarHtml = `<div class="server-scope-toolbar"><div><strong>다중 작업</strong><span>삭제 가능 ${formatNumber(eligible.length)}개 · 선택 ${formatNumber(selectedScopes.length)}개</span></div><div class="actions"><button class="btn" data-server-scope-select-all ${eligible.length ? '' : 'disabled'}>삭제 가능 전체 선택</button><button class="btn" data-server-scope-select-clear ${selected.size ? '' : 'disabled'}>선택 해제</button><button class="btn danger" data-server-scope-delete-selected ${selectedScopes.length ? '' : 'disabled'}>선택한 서버 사본 삭제</button></div></div>`;
     const paginationHtml = orderedScopes.length > SERVER_SCOPE_MANAGER_PAGE_SIZE
       ? `<div class="server-scope-pagination"><button class="btn" data-server-scope-page="prev" ${page <= 0 ? 'disabled' : ''}>이전</button><span>${formatNumber(pageStart + 1)}–${formatNumber(pageEnd)} / ${formatNumber(orderedScopes.length)} · ${formatNumber(page + 1)} / ${formatNumber(totalPages)} 페이지</span><button class="btn" data-server-scope-page="next" ${page + 1 >= totalPages ? 'disabled' : ''}>다음</button></div>`
       : '';
@@ -13370,10 +13477,10 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
             ? `두 번 연속 내용 데이터가 없음을 확인한 ${shellLabel}입니다. 복구 페어링 대상이 아니며 해당 metadata만 조건부 정리합니다.`
             : `${shellLabel} 후보입니다. 안전한 정리를 위해 동일 상태를 한 번 더 확인해야 합니다. (${formatNumber(shellObservations || 0)}/2)`}</div>`
           : '';
-        return `<article class="server-scope-card ${statusClass}"><label class="server-scope-select"><input type="checkbox" data-server-scope-select="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}" ${selected.has(selectionKey) ? 'checked' : ''} ${blocked ? 'disabled' : ''}><span>선택</span></label><div class="server-scope-main"><div class="server-scope-title"><span class="server-plugin-badge ${escapeHtml(scope.namespace)}">${escapeHtml(MEMORY_SUITE_NAMESPACE_LABELS[scope.namespace] || scope.namespace)}</span><div><strong>${escapeHtml(scope.displayName || scope.scopeId)}</strong><small>${escapeHtml(scope.kind || 'unknown')} · ${escapeHtml(compact(scope.scopeKey || scope.scopeId, 110))}</small></div></div><div class="server-scope-stats"><span>레코드 <b>${formatNumber(scope.liveRecords || 0)}</b></span><span>tombstone <b>${formatNumber(scope.tombstones || 0)}</b></span><span>크기 <b>${scopeManagerFormatBytes(scope.bytes || 0)}</b></span><span>마지막 저장 <b>${scopeManagerFormatTime(scope.latestStoredAt)}</b></span></div>${emptyShellNotice}${scope.recoveryPairing ? `<div class="server-scope-ready">연결 대상: ${escapeHtml(scope.recoveryPairing.targetTitle || scope.recoveryPairing.targetChatId)} · 메시지 ${formatNumber(scope.recoveryPairing.targetMessageCount || 0)}개 · 원본 서버 데이터 보존</div>` : ''}${refs.length ? `<div class="server-scope-refs"><strong>참조 중</strong>${refs.slice(0, 8).map(ref => `<span>${escapeHtml(ref.sourceDisplayName || ref.sourceScopeId)} · ${escapeHtml(ref.kind || 'reference')}</span>`).join('')}</div>` : ''}${blocked ? `<div class="server-scope-blocked">${escapeHtml(blocked)}</div>` : plan ? `<div class="server-scope-ready">서버 백업과 삭제 조건 검증 완료 · 다시 눌러 실제 삭제</div>` : ''}</div><div class="server-scope-actions"><button class="btn" data-server-scope-detail="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}">내용 확인</button>${pairButton}<button class="btn" data-server-scope-pin="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}">${scope.pinned === true ? '보존 해제' : '보존'}</button><button class="btn danger" data-server-scope-delete="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}" ${blocked ? 'disabled' : ''}>${plan ? '검증 완료 · 삭제 실행' : '서버 스코프 삭제'}</button></div></article>`;
+        return `<article class="server-scope-card ${statusClass}"><label class="server-scope-select"><input type="checkbox" data-server-scope-select="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}" ${selected.has(selectionKey) ? 'checked' : ''} ${blocked ? 'disabled' : ''}><span>선택</span></label><div class="server-scope-main"><div class="server-scope-title"><span class="server-plugin-badge ${escapeHtml(scope.namespace)}">${escapeHtml(MEMORY_SUITE_NAMESPACE_LABELS[scope.namespace] || scope.namespace)}</span><div><strong>${escapeHtml(scope.displayName || scope.scopeId)}</strong><small>${escapeHtml(scope.kind || 'unknown')} · ${escapeHtml(compact(scope.scopeKey || scope.scopeId, 110))}</small></div></div><div class="server-scope-stats"><span>레코드 <b>${formatNumber(scope.liveRecords || 0)}</b></span><span>tombstone <b>${formatNumber(scope.tombstones || 0)}</b></span><span>크기 <b>${scopeManagerFormatBytes(scope.bytes || 0)}</b></span><span>마지막 저장 <b>${scopeManagerFormatTime(scope.latestStoredAt)}</b></span></div>${emptyShellNotice}${scope.recoveryPairing ? `<div class="server-scope-ready">연결 대상: ${escapeHtml(scope.recoveryPairing.targetTitle || scope.recoveryPairing.targetChatId)} · 메시지 ${formatNumber(scope.recoveryPairing.targetMessageCount || 0)}개 · 원본 서버 데이터 보존</div>` : ''}${refs.length ? `<div class="server-scope-refs"><strong>참조 중</strong>${refs.slice(0, 8).map(ref => `<span>${escapeHtml(ref.sourceDisplayName || ref.sourceScopeId)} · ${escapeHtml(ref.kind || 'reference')}</span>`).join('')}</div>` : ''}${blocked ? `<div class="server-scope-blocked">${escapeHtml(blocked)}</div>` : plan ? `<div class="server-scope-ready">서버 백업과 삭제 조건 검증 완료 · 자동 실행 중</div>` : ''}</div><div class="server-scope-actions"><button class="btn" data-server-scope-detail="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}">저장 정보·참조 확인</button>${pairButton}<button class="btn" data-server-scope-pin="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}">${scope.pinned === true ? '보존 해제' : '보존'}</button><button class="btn danger" data-server-scope-delete="${escapeHtml(scope.namespace)}|${escapeHtml(scope.scopeId)}" ${blocked ? 'disabled' : ''}>서버 사본 삭제</button></div></article>`;
       }).join('')}</section>`;
     }).join('');
-    body.innerHTML = `${inventoryHtml}${toolbarHtml}${pairingHtml}${errorHtml}${paginationHtml}${groupHtml || '<div class="empty"><strong>서버 스코프 없음</strong><span>서버에 관리할 스코프별 데이터가 없습니다.</span></div>'}${paginationHtml}`;
+    body.innerHTML = `${inventoryHtml}${toolbarHtml}${pairingHtml}${errorHtml}${paginationHtml}${groupHtml || '<div class="empty"><strong>표시할 서버 사본 없음</strong><span>검색 조건과 서버 조회 결과를 확인하세요.</span></div>'}${paginationHtml}`;
   };
 
   const scopeManagerFindCatalogScope = (namespace, scopeId) => scopeManagerArray(Runtime.serverScopeCatalog?.scopes)
@@ -13423,7 +13530,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     }
     return receipt;
   };
-  const scopeManagerBuildPlanAfterProof = async (refreshedScope, modeProof) => {
+  const scopeManagerBuildPlanAfterProof = async (refreshedScope, modeProof, jobId = '') => {
     const namespace = refreshedScope.namespace;
     const scopeId = refreshedScope.scopeId;
     const recipeKey = scopeManagerRecipeKey(namespace, scopeId);
@@ -13443,6 +13550,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
       scopeId,
       modeProof,
       inventoryProof,
+      jobId,
       mutations,
       metadata: { requestedBy: PLUGIN_NAME, requestedAt: Date.now(), classification: refreshedScope.classification }
     });
@@ -13478,7 +13586,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
   const scopeManagerExecutePlan = async scope => {
     const recipeKey = scopeManagerRecipeKey(scope.namespace, scope.scopeId);
     const plan = Runtime.serverScopePlans?.get(recipeKey);
-    if (!plan || Date.now() - Number(plan.preparedAt || 0) > MEMORY_SUITE_SCOPE_PLAN_TTL_MS) {
+    if (!plan || Date.now() >= Number(plan.expiresAt || 0)) {
       Runtime.serverScopePlans?.delete(recipeKey);
       renderServerScopeManagement();
       throw new Error('삭제 계획이 만료되었습니다. 다시 검증하세요.');
@@ -13622,59 +13730,76 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
   };
   const scopeManagerSelectedScopes = () => scopeManagerArray(Runtime.serverScopeCatalog?.scopes)
     .filter(scope => Runtime.serverScopeSelection?.has(scopeManagerSelectionKey(scope)) && !scopeManagerDeleteBlockedReason(scope));
-  const scopeManagerHandleSelectedDeletion = async () => {
-    const scopes = scopeManagerSelectedScopes();
-    if (!scopes.length) return await retraceAlert('삭제 가능한 선택 스코프가 없습니다.');
-    const plansReady = scopes.every(scope => Runtime.serverScopePlans?.has(scopeManagerSelectionKey(scope)));
-    if (!plansReady) {
-      if (!(await retraceConfirm(
-        `선택한 ${scopes.length}개 스코프의 Owner 보존·플러그인 단독 모드·서버 백업·조건부 삭제 계획을 차례로 검증합니다.\n\n아직 실제 삭제는 하지 않습니다.`,
-        { title: '다중 서버 스코프 삭제 검증', confirmLabel: '전체 검증 시작', danger: true }
-      ))) return;
-      setBusy(true);
-      try {
-        const plans = await scopeManagerCreatePlans(scopes);
-        await retraceAlert(`${plans.length}개 스코프의 삭제 전 검증을 완료했습니다.\n실제 삭제하려면 '검증된 선택 삭제'를 누르세요.`);
-      } catch (error) {
-        Runtime.serverScopePlans = new Map();
-        await retraceAlert(`다중 삭제 검증 실패\n${error?.message || error}\n\n실제 삭제는 시작하지 않았습니다.`);
-      } finally { setBusy(false); }
-      return;
-    }
-    const expired = scopes.filter(scope => {
-      const plan = Runtime.serverScopePlans?.get(scopeManagerSelectionKey(scope));
-      return !plan || Date.now() - Number(plan.preparedAt || 0) > MEMORY_SUITE_SCOPE_PLAN_TTL_MS;
-    });
-    if (expired.length) {
-      for (const scope of expired) Runtime.serverScopePlans?.delete(scopeManagerSelectionKey(scope));
-      renderServerScopeManagement();
-      return await retraceAlert('일부 삭제 계획이 만료되었습니다. 선택 삭제 검증을 다시 실행하세요.');
-    }
-    if (!(await retraceConfirm(
-      `검증과 개별 서버 백업이 완료된 ${scopes.length}개 스코프를 삭제합니다.\n\n각 스코프는 조건부 mutation과 readback으로 처리되며, 중간 실패가 나면 성공·실패 목록을 정확히 표시합니다. 계속할까요?`,
-      { title: '다중 서버 스코프 영구 삭제', confirmLabel: `${scopes.length}개 삭제`, danger: true }
-    ))) return;
+  const scopeManagerRunDeletion = async (requested, resumed = null) => {
+    if (Runtime.busy || !requested.length) return;
+    if(resumed)requested=requested.filter(row=>!resumed.rows?.some(r=>r.key===scopeManagerSelectionKey(row)&&(r.status==='삭제 완료'||r.committed===true)));
+    if(!requested.length){const node=Runtime.root?.querySelector?.('#serverScopeDeleteStatus');if(node)node.textContent='이전 작업의 모든 삭제 결과가 확인됐습니다.';return;}
+    const names = requested.map(row => (MEMORY_SUITE_NAMESPACE_LABELS[row.namespace] || row.namespace) + ' · ' + (row.displayName || row.scopeId));
+    if (!(await retraceConfirm(names.join('\n') + '\n\n선택한 서버 사본을 삭제합니다. 로컬 원본을 보존하며 필요한 경우 플러그인 단독 모드로 전환합니다. 백업과 검증 후 자동으로 삭제합니다.', {title:'서버 사본 삭제',confirmLabel:requested.length+'개 삭제',danger:true}))) return;
     setBusy(true);
-    const succeeded = [];
-    const failed = [];
+    const job = resumed || { id: 'retrace-delete-' + Date.now() + '-' + Math.random().toString(36).slice(2), rows:[], phase:'로컬 보존 확인', total:requested.length, targets:requested.map(row=>({namespace:row.namespace,scopeId:row.scopeId,displayName:row.displayName})), pending:{} };
+    Runtime.serverScopeDeleteJob=job;
+    Runtime.serverScopeDeletionRunning=true;
+    job.cancelRequested=false;
+    job.rows=job.rows.filter(row=>row.status==='삭제 완료'||row.committed===true);
+    const persist=async()=>{if(!(await legacyStorageSet('retrace_server_delete_job_v1',job)))throw new Error('삭제 작업 기록을 저장하지 못했습니다.');};
+    const status=()=>{syncServerDeleteControls();const node=Runtime.root?.querySelector?.('#serverScopeDeleteStatus');if(node)node.textContent=job.phase+' · '+job.rows.length+'/'+job.total+'\n'+job.rows.map(r=>r.name+': '+r.status+(r.error?' · '+r.error:'')).join('\n');};
+    const proofs = new Map();
     try {
-      for (const scope of scopes) {
-        try {
-          await scopeManagerExecutePlan(scope);
-          succeeded.push(scope);
-          Runtime.serverScopeSelection?.delete(scopeManagerSelectionKey(scope));
-        } catch (error) {
-          failed.push({ scope, error: compact(error?.message || error, 300) });
-          Runtime.serverScopePlans?.delete(scopeManagerSelectionKey(scope));
+      const connection=await MemorySuiteStorageBridge.bootstrap(true,true);
+      const serverUrl=connection?.requestedUrl||connection?.url;
+      if(!serverUrl)throw new Error('서버 연결을 확인하지 못했습니다.');
+      if(connection.capabilities?.['scope-delete-job.v1']!==true)throw new Error('자동 삭제 작업을 사용하려면 Librarian System 서버를 업데이트하세요.');
+      if(job.serverUrl && job.serverUrl!==serverUrl)throw new Error('이전 작업과 서버 주소가 다릅니다.');
+      job.serverUrl=serverUrl;
+      await persist();status();
+      for (const row of requested) {
+        if(job.cancelRequested)break;
+        const key=scopeManagerSelectionKey(row);
+        if(job.rows.some(r=>r.key===key && (r.status==='삭제 완료'||r.committed===true)))continue;
+        if(job.pending?.[key]){
+          try{const p=job.pending[key];const state=await MemorySuiteStorageBridge.managerExecuteScopeDeletion(p.planId,p.mutationFingerprint,{statusOnly:true});if(state.state==='expired')throw new Error('scope_delete_plan_expired');if(state.state!=='committed')await scopeManagerOwnerProof(scopeManagerFindCatalogScope(row.namespace,row.scopeId)||row);const receipt=await MemorySuiteStorageBridge.managerExecuteScopeDeletion(p.planId,p.mutationFingerprint);job.rows.push({key,committed:true,name:row.displayName||row.scopeId,status:receipt.catalogChanged?'삭제 반영됨 · 목록 변경 확인 필요':'삭제 완료',backupId:receipt.backupId});delete job.pending[key];await persist();continue;}
+          catch(error){if(String(error?.message||error).includes('scope_delete_plan_expired')){delete job.pending[key];await persist();}else{job.rows.push({key,name:row.displayName||row.scopeId,status:'결과 확인 보류',error:compact(error?.message||error,300)});continue;}}
         }
+        try { proofs.set(scopeManagerSelectionKey(row),await scopeManagerOwnerProof(row)); }
+        catch(error){job.rows.push({key:scopeManagerSelectionKey(row),name:row.displayName||row.scopeId,status:'보존 확인 실패',error:compact(error?.message||error,300)});}
+        status();
       }
-      await refreshServerScopeManagement().catch(() => {});
-      const lines = [`삭제 성공 ${succeeded.length}개`, `삭제 실패 ${failed.length}개`];
-      for (const row of failed.slice(0, 12)) lines.push(`- ${row.scope.displayName || row.scope.scopeId}: ${row.error}`);
-      await retraceAlert(lines.join('\n'));
-    } finally { setBusy(false); }
+      await refreshServerScopeManagement({reuseUnchanged:true});
+      for (const row of requested) {
+        if(job.cancelRequested)break;
+        if(!proofs.has(scopeManagerSelectionKey(row)))continue;
+        try {
+          const fresh=scopeManagerFindCatalogScope(row.namespace,row.scopeId);
+          if(!fresh)throw new Error('현재 목록에서 대상을 찾을 수 없습니다.');
+          const blocked=scopeManagerDeleteBlockedReason(fresh);if(blocked)throw new Error(blocked);
+          job.phase='백업 및 삭제 조건 확인';status();
+          const plan=await scopeManagerBuildPlanAfterProof(fresh,proofs.get(scopeManagerSelectionKey(row)),job.id);
+          job.pending[scopeManagerSelectionKey(row)]={planId:plan.planId,mutationFingerprint:plan.mutationFingerprint};
+          await persist();
+          job.phase='서버 사본 삭제';status();
+          const receipt=await scopeManagerExecutePlan(fresh);
+          job.rows.push({key:scopeManagerSelectionKey(row),name:row.displayName||row.scopeId,status:'삭제 완료',backupId:receipt.backupId});
+          delete job.pending[scopeManagerSelectionKey(row)];await persist();
+          Runtime.serverScopeSelection?.delete(scopeManagerSelectionKey(row));
+          // Rebuild shared registry mutations from the remaining live state. Never
+          // apply a second precomputed rewrite over the first deletion.
+          await refreshServerScopeManagement({reuseUnchanged:true});
+        }catch(error){if(!job.rows.some(r=>r.key===scopeManagerSelectionKey(row)&&r.status==='삭제 완료'))job.rows.push({key:scopeManagerSelectionKey(row),name:row.displayName||row.scopeId,status:'중단 · 재조회 필요',error:compact(error?.message||error,300)});}
+        status();
+      }
+      job.phase=job.cancelRequested?'중단됨 · 완료된 삭제는 유지됩니다':'처리 완료';await persist();status();
+    }catch(error){job.phase='작업 중단: '+compact(error?.message||error,300);status();}
+    finally{Runtime.serverScopeDeletionRunning=false;setBusy(false);status();}
   };
+  const scopeManagerHandleSelectedDeletion = async () => await scopeManagerRunDeletion(scopeManagerSelectedScopes());
   const handleServerScopeManagementClick = async event => {
+    if(event.target?.closest?.('[data-server-delete-retry]')) {
+      const job=Runtime.serverScopeDeleteJob||await legacyStorageGet('retrace_server_delete_job_v1');
+      if(job?.targets)return await scopeManagerRunDeletion(job.targets,job);
+      const node=Runtime.root?.querySelector?.('#serverScopeDeleteStatus');if(node)node.textContent='이전 삭제 작업이 없습니다.';
+      syncServerDeleteControls();return;
+    }
     const pageButton = event.target?.closest?.('[data-server-scope-page]');
     if (pageButton && !pageButton.disabled) {
       const direction = scopeManagerText(pageButton.getAttribute('data-server-scope-page'));
@@ -13782,36 +13907,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     }
     const blocked = scopeManagerDeleteBlockedReason(scope);
     if (blocked) return await retraceAlert(`서버 스코프를 삭제할 수 없습니다.\n${blocked}`);
-    const recipeKey = scopeManagerRecipeKey(namespace, scopeId);
-    const existingPlan = Runtime.serverScopePlans?.get(recipeKey);
-    if (!existingPlan) {
-      const message = scope.classification === 'orphan_candidate'
-        ? `원본 RisuAI 채팅을 찾을 수 없는 고아 메모리 후보입니다.\n\n${MEMORY_SUITE_NAMESPACE_LABELS[namespace] || namespace} owner가 서버 자료를 pluginStorage/로컬 저장소에 복원·검증하고 플러그인 단독 모드로 전환합니다. 그 뒤 서버는 참조 관계를 다시 검사하고 삭제 직전 namespace DB 백업을 만듭니다. 아직 실제 삭제는 하지 않습니다. 검증을 시작할까요?`
-        : `활성 채팅의 서버 데이터를 삭제하려면 ${MEMORY_SUITE_NAMESPACE_LABELS[namespace] || namespace} owner가 해당 데이터를 pluginStorage/로컬 저장소에 복원하고 검증한 뒤 플러그인 단독 모드로 전환해야 합니다.\n\n검증을 시작할까요?`;
-      if (!(await retraceConfirm(message, { title: '서버 스코프 삭제 검증', confirmLabel: '검증 시작', danger: true }))) return;
-      setBusy(true);
-      try {
-        const plan = await scopeManagerCreatePlan(scope);
-        await retraceAlert(`삭제 전 검증을 완료했습니다.\n백업 ID: ${plan.backupId || '(unknown)'}\n\n실제 삭제하려면 같은 버튼을 다시 누르세요.`);
-      } catch (error) {
-        await retraceAlert(`서버 스코프 삭제 검증 실패\n${error?.message || error}`);
-      } finally { setBusy(false); }
-      return;
-    }
-    if (!(await retraceConfirm(
-      `검증과 서버 백업이 완료된 스코프를 실제 삭제합니다.\n\n${scope.displayName || scope.scopeId}\n레코드 ${scope.liveRecords || 0}개 · ${scopeManagerFormatBytes(scope.bytes || 0)}\n\n삭제 후에는 자동으로 되살리지 않습니다. 계속할까요?`,
-      { title: '서버 스코프 영구 삭제', confirmLabel: '삭제 실행', danger: true }
-    ))) return;
-    setBusy(true);
-    try {
-      const receipt = await scopeManagerExecutePlan(scope);
-      await retraceAlert(`서버 스코프를 삭제했습니다.\n백업 ID: ${receipt.backupId || '(unknown)'}\n삭제 mutation: ${receipt.counts?.total || 0}개`);
-      await refreshServerScopeManagement();
-    } catch (error) {
-      Runtime.serverScopePlans?.delete(recipeKey);
-      await retraceAlert(`서버 스코프 삭제 실패\n${error?.message || error}\n\n데이터가 바뀌었을 수 있으므로 새로고침 후 다시 검증하세요.`);
-      await refreshServerScopeManagement().catch(() => {});
-    } finally { setBusy(false); }
+    return await scopeManagerRunDeletion([scope]);
   };
 
   const MEMORY_SUITE_OWNER_STATUS_ORDER = Object.freeze(['flashback', 'hayaku', 'libra', 'lia']);
@@ -13827,7 +13923,13 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
       lia: () => requestLiaIpc('memory_suite_storage_status', {}, { timeoutMs: 2400 })
     };
     try {
-      const payload = await requesters[owner]();
+      let payload;
+      try { payload = await requesters[owner](); }
+      catch (error) {
+        if (!/IPC_(TIMEOUT|UNAVAILABLE)$/.test(text(error?.code || ''))) throw error;
+        await delay(500);
+        payload = await requesters[owner]();
+      }
       const status = payload?.status && typeof payload.status === 'object' ? payload.status : {};
       const mode = text(payload?.mode || status.mode || '').trim();
       const scope = status.scope && typeof status.scope === 'object'
@@ -13854,10 +13956,23 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
       const code = text(error?.code || '').trim();
       const remoteReachable = error?.remoteReachable === true || /(?:FLASHBACK|HAYAKU|LIBRA|LIA)_IPC_REJECTED/.test(code);
       const unsupported = remoteReachable || /unsupported|지원하지|unknown.*action|not.*support/i.test(reason);
+      const previouslySeen = Runtime.memorySuiteOwnerStorage?.rows?.some(row => row.owner === owner && row.installed === true)
+        || Runtime.compatibilitySuite?.peers?.some(peer => peer.key === owner && peer.installed === true);
+      let present = null;
+      try {
+        const api = liveApi(['getDatabase']);
+        const db = await api?.getDatabase?.(['plugins']);
+        if (Array.isArray(db?.plugins)) {
+          const ids = { flashback: FLASHBACK_PLUGIN_ID, hayaku: HAYAKU_PLUGIN_ID, libra: LIBRA_PLUGIN_ID, lia: LIA_PLUGIN_ID };
+          present = db.plugins.some(plugin => plugin?.name === ids[owner] && plugin.enabled !== false);
+        }
+      } catch (_) {}
+      const installed = remoteReachable || present === true || (present === null && previouslySeen === true);
+      const discoveryPending = !remoteReachable && present === null && !installed;
       return {
-        owner, installed: remoteReachable, connected: remoteReachable, supported: false,
+        owner, installed, discoveryPending, connected: remoteReachable, supported: false,
         mode: '', url: '', scope: null, syncJob: null, recoveryGuard: null,
-        state: unsupported ? 'unsupported' : 'absent', reason
+        state: unsupported ? 'unsupported' : present === false ? 'absent' : /TIMEOUT/.test(code) ? 'timeout' : 'initializing', reason
       };
     }
   };
@@ -13866,7 +13981,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
       const source = (Array.isArray(rowsValue) ? rowsValue : []).find(item => item?.owner === owner) || { owner };
       return { ...source, owner };
     });
-    const installedRows = rows.filter(row => row.installed === true || row.connected === true || row.supported === true);
+    const installedRows = rows.filter(row => row.installed === true || row.connected === true || row.supported === true || row.discoveryPending === true);
     const participants = installedRows.filter(row => row.connected === true && row.supported === true && HANDOFF_STORAGE_MODES.includes(text(row.mode || '').trim()));
     const invalidOwners = installedRows.filter(row => !participants.includes(row));
     const absentOwners = rows.filter(row => !installedRows.includes(row)).map(row => row.owner);
@@ -13992,7 +14107,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
       : '';
     const effectiveSummary = pendingMismatch ? '승계 시작 후 participant 또는 저장 모드 변경 감지' : summary;
     host.className = `handoff-storage-gate ${effectiveReady ? 'ok' : 'bad'}`;
-    host.innerHTML = `<div><strong>${escapeHtml(effectiveSummary)}</strong><span>참여: ${escapeHtml(names.join(' · ') || '없음')}</span>${missing.length ? `<small>미설치/미응답 제외: ${escapeHtml(missing.join(' · '))}</small>` : ''}${invalid.length ? `<small>모드 확인 실패: ${escapeHtml(invalid.join(' · '))}</small>` : ''}${pending}</div><em>${effectiveReady ? 'READY' : 'BLOCKED'}</em>`;
+    host.innerHTML = `<div><strong>${escapeHtml(effectiveSummary)}</strong><span>참여: ${escapeHtml(names.join(' · ') || '없음')}</span>${missing.length ? `<small>미설치/비활성 제외: ${escapeHtml(missing.join(' · '))}</small>` : ''}${invalid.length ? `<small>모드 확인 실패: ${escapeHtml(invalid.join(' · '))}</small>` : ''}${pending}</div><em>${effectiveReady ? 'READY' : 'BLOCKED'}</em>`;
   };
   const refreshMemorySuiteOwnerStorageDashboard = async () => {
     if (Runtime.memorySuiteOwnerStorageLoading) return Runtime.memorySuiteOwnerStorage;
@@ -14023,11 +14138,11 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
       const row = rows.find(item => item.owner === owner);
       const label = MEMORY_SUITE_NAMESPACE_LABELS[owner] || owner;
       if (!row) return `<article class="owner-storage-card checking"><div><strong>${escapeHtml(label)}</strong><span>현재 스코프 저장 상태 확인 중</span></div><em>CHECKING</em></article>`;
-      if (row.installed !== true && row.connected !== true && row.supported !== true) {
-        return `<article class="owner-storage-card absent"><div class="owner-storage-title"><strong>${escapeHtml(label)}</strong><span>미설치 / 미응답</span></div><p>현재 활성 owner가 아니므로 저장 모드 일치 검사에서 제외됩니다.</p><em>EXCLUDED</em></article>`;
+      if (row.installed !== true && row.connected !== true && row.supported !== true && !row.discoveryPending) {
+        return `<article class="owner-storage-card absent"><div class="owner-storage-title"><strong>${escapeHtml(label)}</strong><span>미설치 / 비활성</span></div><p>활성 플러그인 목록에 없어 저장 모드 일치 검사에서 제외됩니다.</p><em>EXCLUDED</em></article>`;
       }
       const stateClass = row.connected && row.supported ? 'ok' : 'unsupported';
-      const stateLabel = row.connected && row.supported ? memorySuiteModeLabel(row.mode) : '저장 상태 확인 실패';
+      const stateLabel = row.connected && row.supported ? memorySuiteModeLabel(row.mode) : row.state === 'timeout' ? '응답 시간 초과' : row.state === 'initializing' ? '통신 준비 / 설치 확인 필요' : '저장 상태 계약 확인 실패';
       const scope = row.scope?.label || row.scope?.scopeLabel || row.scope?.scopeId || '';
       const job = row.syncJob?.state ? `${row.syncJob.state}${row.syncJob.phase ? ` · ${row.syncJob.phase}` : ''}` : '';
       const guard = row.recoveryGuard && typeof row.recoveryGuard === 'object'
@@ -14040,7 +14155,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     }).join('');
     const gateSummary = !gate
       ? '<div class="owner-storage-gate checking"><strong>공통 저장 모드 확인 중</strong><span>활성 owner 1~4종을 자동으로 판별합니다.</span></div>'
-      : `<div class="owner-storage-gate ${gate.ready ? 'ok' : 'bad'}"><div><strong>${escapeHtml(gate.ready ? `${memorySuiteModeLabel(gate.commonMode)} · ${gate.participantCount}/${gate.participantCount} 일치` : '다음 세션 승계 차단')}</strong><span>참여 owner ${formatNumber(gate.participantCount)}종 · ${escapeHtml((gate.participantOwners || []).map(owner => MEMORY_SUITE_NAMESPACE_LABELS[owner] || owner).join(' · ') || '없음')}</span><small>${escapeHtml(gate.ready ? '미설치·미응답 owner는 자동 제외됩니다.' : `사유: ${gate.reason}`)}</small></div><em>${gate.ready ? 'READY' : 'BLOCKED'}</em></div>`;
+      : `<div class="owner-storage-gate ${gate.ready ? 'ok' : 'bad'}"><div><strong>${escapeHtml(gate.ready ? `${memorySuiteModeLabel(gate.commonMode)} · ${gate.participantCount}/${gate.participantCount} 일치` : '다음 세션 승계 차단')}</strong><span>참여 owner ${formatNumber(gate.participantCount)}종 · ${escapeHtml((gate.participantOwners || []).map(owner => MEMORY_SUITE_NAMESPACE_LABELS[owner] || owner).join(' · ') || '없음')}</span><small>${escapeHtml(gate.ready ? '미설치·비활성으로 확인된 owner만 제외됩니다.' : `사유: ${gate.reason}`)}</small></div><em>${gate.ready ? 'READY' : 'BLOCKED'}</em></div>`;
     host.innerHTML = `<div class="panel-heading"><div><h2>Librarian System 저장 상태</h2><p>RE:TRACE는 저장 모드를 소유하거나 변경하지 않습니다. 설치되어 실제 응답하는 LIBRA·HAYAKU·Flashback·LIA 1~4종의 현재 모드와 서버 내구성만 읽기 전용으로 검사합니다.</p></div><div class="actions"><button id="refreshOwnerStorageStatus" class="btn primary" ${loading ? 'disabled' : ''}>${loading ? '확인 중…' : '새로고침'}</button></div></div>
       ${error ? `<div class="settings-callout viewer-warning">${escapeHtml(error)}</div>` : ''}
       ${gateSummary}
@@ -14128,7 +14243,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     host.innerHTML = `${errorHtml}
       ${MemorySuiteHostLineage.render(preview?.context?.hostLineage, { owner: 'retrace', chatId: preview?.context?.chat?.id || preview?.identity?.chatId, inheritance: '현재 경로의 Owner별 저장·승계 검증 결과는 아래 Gate에서 확인합니다.' })}
       <div class="overview-hero ${state.status}"><div><span class="overview-kicker">CURRENT SCOPE</span><h2>${escapeHtml(scopeLabel)}</h2><p>정본을 옮기지 않고 Owner 응답, 호환 계약, 저장 내구성을 한곳에서 확인합니다.</p></div><div class="overview-health"><span class="status-dot"></span><strong>${escapeHtml(retraceStatusLabel(state.status))}</strong><small>${state.loading ? '실제 Owner 응답을 기다리는 중입니다.' : state.checked ? '마지막 검사 결과' : '새로고침을 눌러 검사하세요.'}</small></div></div>
-      <div class="overview-metrics"><article><span>호환 플러그인</span><strong>${suite ? `${formatNumber(compatiblePeers)} / ${formatNumber((suite.peers || []).length)}` : '—'}</strong><small>RE:TRACE 포함 공통 계약</small></article><article><span>참여 Owner</span><strong>${gate ? formatNumber(participantCount) : '—'}</strong><small>미설치·미응답 자동 제외</small></article><article><span>LIBRA 정본</span><strong>${preview ? formatNumber(libraCount) : '—'}</strong><small>Owner IPC 요약</small></article><article><span>Flashback · HAYAKU</span><strong>${preview ? `${formatNumber(flashbackCount)} · ${formatNumber(hayakuCount)}` : '—'}</strong><small>기억 · 패킷</small></article></div>
+      <div class="overview-metrics"><article><span>호환 플러그인</span><strong>${suite ? `${formatNumber(compatiblePeers)} / ${formatNumber((suite.peers || []).length)}` : '—'}</strong><small>RE:TRACE 포함 공통 계약</small></article><article><span>참여 Owner</span><strong>${gate ? formatNumber(participantCount) : '—'}</strong><small>미설치·비활성 확인 후 제외</small></article><article><span>LIBRA 정본</span><strong>${preview ? formatNumber(libraCount) : '—'}</strong><small>Owner IPC 요약</small></article><article><span>Flashback · HAYAKU</span><strong>${preview ? `${formatNumber(flashbackCount)} · ${formatNumber(hayakuCount)}` : '—'}</strong><small>기억 · 패킷</small></article></div>
       <section class="overview-section"><div class="overview-section-head"><div><span>OWNER STATUS</span><h3>메모리 Owner 연결</h3></div><button id="refreshOverview" class="btn primary" type="button" ${state.loading ? 'disabled' : ''}>${state.loading ? '확인 중…' : '전체 상태 새로고침'}</button></div><div class="overview-owner-grid">${ownerCards}</div></section>
       <section class="overview-gate ${gateClass}"><div><span>HANDOFF STORAGE GATE</span><strong>${escapeHtml(gateTitle)}</strong><p>${escapeHtml(gateDescription)}</p></div><em>${!gate ? 'CHECKING' : gate.ready ? 'READY' : 'BLOCKED'}</em></section>
       <section class="overview-actions"><button class="overview-action" type="button" data-retrace-goto="session"><span>↪</span><div><strong>다음 세션 준비</strong><small>호환성과 내구성 상세 검사</small></div></button><button class="overview-action" type="button" data-retrace-goto="serverconnection"><span>⇄</span><div><strong>저장 상태 보기</strong><small>Owner별 모드와 서버 내구성</small></div></button><button class="overview-action" type="button" data-retrace-goto="diagnostics"><span>⋯</span><div><strong>연결 진단 열기</strong><small>IPC와 최근 런타임 상태</small></div></button></section>`;
@@ -14248,7 +14363,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     if (title) title.textContent = meta.title;
     if (description) description.textContent = meta.description;
     const pageStatus = root.querySelector('#pageStatusText');
-    if (pageStatus) pageStatus.textContent = tab === 'overview' ? retraceStatusLabel(retraceOverviewState().status) : '읽기 전용';
+    if (pageStatus) pageStatus.textContent = tab === 'overview' ? retraceStatusLabel(retraceOverviewState().status) : tab === 'serverdata' ? '서버 관리' : '읽기 전용';
     const menu = root.querySelector('#retraceMoreMenu');
     if (menu) menu.open = false;
     if (tab === 'overview') renderOverviewPanel();
@@ -14262,13 +14377,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     const tab = normalizeRetraceGuiTab(tabValue);
     if (tab === 'overview') return refreshOverview();
     if (tab === 'session') return refreshTransition();
-    if (tab === 'libra') return refreshLibra();
-    if (tab === 'flashback') return refreshFlashback();
-    if (tab === 'hayaku') return refreshHayaku();
-    if (tab === 'serverdata') return refreshServerScopeManagement().catch(error => {
-      warn('server scope manager refresh failed', error);
-      return null;
-    });
+    if (tab === 'serverdata') return Promise.allSettled([refreshServerScopeManagement(),refreshServerControl()]).then(results=>{for(const result of results)if(result.status==='rejected'){const node=Runtime.root?.querySelector?.('#serverControlResult');if(node)node.textContent=String(result.reason?.message||result.reason);}});
     if (tab === 'serverconnection') return refreshMemorySuiteOwnerStorageDashboard().catch(error => {
       warn('Librarian System owner storage dashboard failed', error);
       return null;
@@ -14277,6 +14386,92 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     return null;
   };
 
+  const renderServerControl = () => {
+    const state=Runtime.serverControl||{},root=Runtime.root;
+    const summary=root?.querySelector?.('#serverControlSummary');if(!summary)return;
+    const status=state.status, list=scopeManagerArray(state.backups), catalog=Runtime.serverScopeCatalog;
+    const e=escapeHtml, time=scopeManagerFormatTime;
+    const pill=(label,kind='')=>'<span class="control-pill '+kind+'">'+e(label)+'</span>';
+    const currentCatalog=catalog&&!Runtime.serverScopeManagerLoading&&!Runtime.serverScopeManagerError;
+    const scopes=currentCatalog?scopeManagerArray(catalog.scopes):[];
+    const incomplete=Object.keys(catalog?.scanErrors||{}).length>0;
+    const partial=state.errors?.length>0;
+    summary.innerHTML=status ? '<div class="control-heading"><div><h3>'+(state.loading?'상태 갱신 중 · 이전 조회 결과':status.maintenanceMode?'서버에서 관리 작업을 진행 중입니다':partial?'일부 조회 결과를 확인하지 못했어요':'서버 응답을 확인했어요')+'</h3><small>마지막 조회 · '+e(time(status.checkedAt))+'</small></div>'+pill(status.maintenanceMode?'관리 작업 중':'응답 확인','ok')+'</div><div class="control-stats"><div><span>조회된 서버 사본'+(incomplete?' · 일부':'')+'</span><strong>'+(currentCatalog?scopes.length:'—')+'</strong></div><div><span>조회된 사본 데이터</span><strong>'+(currentCatalog?e(scopeManagerFormatBytes(scopes.reduce((n,x)=>n+Number(x.bytes||0),0))):'—')+'</strong></div><div><span>최근 백업</span><strong>'+e(status.lastBackup?time(status.lastBackup):'없음')+'</strong></div></div><small>사본 목록 기준 합계 · 서버 전체 디스크 사용량과 다릅니다.'+(currentCatalog?' 목록 조회 '+e(time(catalog.at)):' 목록 조회 후 집계합니다.')+'</small><details><summary>서버 상세 정보</summary><dl><dt>서버 버전</dt><dd>'+e(status.version)+'</dd><dt>DATA 식별자</dt><dd>'+e(status.dataInstanceId)+'</dd><dt>저장 위치</dt><dd>'+e(status.dataPath)+'</dd></dl></details>' : '<div class="empty"><strong>'+(state.loading?'서버 상태를 조회하고 있습니다':'서버 상태 미확인')+'</strong><span>'+(state.loading?'응답을 기다리는 중입니다.':state.errors?.length?'조회하지 못했습니다. 연결 진단을 확인하세요.':'새로고침을 누르면 서버 상태를 확인합니다.')+'</span></div>';
+    const plugins=root.querySelector('#serverControlPlugins');
+    if(plugins)plugins.innerHTML=Object.entries(MEMORY_SUITE_NAMESPACE_LABELS).filter(([ns])=>['libra','hayaku','flashback','lia','retrace'].includes(ns)).map(([ns,label])=>{
+      const info=status?.stores?.stores?.[ns];
+      return '<div class="control-item"><span class="control-icon">'+e(label.slice(0,1))+'</span><div class="control-grow"><strong>'+e(label)+'</strong><p><small>'+(currentCatalog?scopes.filter(x=>x.namespace===ns).length+'개 사본':'사본 수 미조회')+'</small></p></div>'+pill(info?.ok===true?'저장소 정상':info?.ok===false?'점검 필요':'미확인',info?.ok===true?'ok':info?.ok===false?'warn':'')+'</div>';
+    }).join('')+'<details><summary>플러그인 마지막 접촉</summary>'+scopeManagerArray(status?.clients).map(c=>'<p>'+e(c.plugin)+' · '+e(c.version||'버전 미확인')+' · '+e(time(c.lastSeenAt))+'</p>').join('')+'</details>';
+    const backups=root.querySelector('#serverControlBackups'),selected=backups?.value;
+    if(backups){backups.innerHTML='<option value="">백업 선택</option>'+list.map(b=>'<option value="'+e(b.id)+'">'+e(b.createdAt||b.id)+' · '+e(b.label||b.kind||'백업')+'</option>').join('');if(selected&&list.some(b=>b.id===selected))backups.value=selected;}
+    const cards=root.querySelector('#serverControlBackupCards');if(cards)cards.innerHTML=list.map(b=>'<button class="btn control-backup" data-control-backup="'+e(b.id)+'" aria-pressed="'+(b.id===backups?.value)+'" '+(Runtime.busy?'disabled':'')+'><span><strong>'+e(time(b.createdAt))+'</strong><small>'+e(b.label||b.kind||'백업')+' · '+e(scopeManagerFormatBytes(Object.values(b.stores||{}).reduce((n,x)=>n+Number(x.bytes||0),0)))+'</small></span>'+pill(b.lastCheckAt?(b.verifiedAtLastCheck?'검사 완료':'검사 실패'):'미검사',b.lastCheckAt?(b.verifiedAtLastCheck?'ok':'warn'):'')+'</button>').join('')||'<div class="empty"><strong>'+('backups' in state?'저장된 백업이 없습니다':'백업 목록 미확인')+'</strong><span>현재 자료의 백업을 만들거나 상태를 다시 조회하세요.</span></div>';
+    const backup=list.find(b=>b.id===backups?.value),info=root.querySelector('#serverControlBackupInfo');
+    if(info)info.textContent=backup?(backup.lastCheckAt?'마지막 검사 '+time(backup.lastCheckAt)+' · '+(backup.verifiedAtLastCheck?'정상':'실패 · 다른 백업을 선택하세요.'):'검사 기록 없음'):'검사하거나 복원할 백업을 선택하세요.';
+    const actionNames={'backup-create':'서버 백업','backup-check':'백업 검사','restore-execute':'서버 복원','scope-delete':'서버 사본 삭제',restore:'복원',reset:'초기화'};
+    const statusNames={complete:'완료',failed:'실패',running:'진행 중',interrupted:'중단 · 결과 확인 필요'};
+    const historyRows=scopeManagerArray(state.history),filter=root.querySelector('#serverControlHistoryFilter')?.value;
+    const rowHtml=row=>'<li><div class="control-heading"><strong>'+e(actionNames[row.action]||row.action)+'</strong>'+pill(statusNames[row.status]||row.status,row.status==='complete'?'ok':row.status==='failed'?'warn':'')+'</div><small>'+e(time(row.finishedAt||row.startedAt))+'</small><details><summary>작업 상세</summary>'+(row.backupId?'<p>백업 '+e(row.backupId)+'</p>':'')+(row.namespaces?'<p>'+e(row.namespaces.join(' · '))+'</p>':'')+(row.error?'<p>'+e(row.error)+'</p>':'')+(row.status==='interrupted'?'<p>자동으로 다시 실행하지 않습니다. 서버 상태와 원래 작업의 결과를 확인하세요.</p>':'')+'</details></li>';
+    const history=root.querySelector('#serverControlHistory');if(history)history.innerHTML=historyRows.filter(r=>!filter||r.status===filter).map(rowHtml).join('')||'<li>조회된 작업 이력이 없습니다.</li>';
+    const recent=root.querySelector('#serverControlRecent');if(recent)recent.innerHTML=historyRows.slice(0,3).map(rowHtml).join('')||'<li>조회된 작업 이력이 없습니다.</li>';
+    const preview=root.querySelector('#serverControlPreview');if(preview)preview.innerHTML=state.plan?'<div class="settings-callout"><strong>미리본 복원 범위</strong><p>'+e(state.plan.namespaces.join(' · '))+'</p><p>백업 '+e(state.plan.backupId)+'<br>작업 예상 공간 '+e(scopeManagerFormatBytes(state.plan.estimated?.workingBytes))+'<br>유효 시각 '+e(time(state.plan.expiresAt))+'</p><small>현재 데이터나 백업이 바뀌면 다시 확인해야 합니다.</small></div>':'';
+    const reconnect=root.querySelector('#serverControlReconnect');if(reconnect){reconnect.hidden=!state.reconnect?.length;reconnect.textContent=state.reconnect?.length?'재연결 확인 필요 · '+state.reconnect.join(' · ')+' — 각 플러그인에서 서버 자료 사용 · 로컬 업로드 안 함을 선택한 뒤 RisuAI를 새로고침하세요. 응답이 끊겼다면 작업 이력에서 결과부터 확인하세요.':'';}
+    const diagnosis=root.querySelector('#serverControlDiagnosis');if(diagnosis)diagnosis.innerHTML=state.diagnosis?'<div class="control-item"><strong>서버 응답 · 프로토콜 · 저장소 연결</strong>'+pill(state.diagnosis.connection)+'</div><div class="control-item"><strong>관제 API 조회</strong>'+pill(state.diagnosis.management)+'</div>':'<p>진단을 시작하면 확인된 단계별 결과를 표시합니다.</p>';
+    const restore=root.querySelector('[data-server-control="restore-execute"]');if(restore)restore.disabled=!state.plan||Runtime.busy===true;
+  };
+
+  const refreshServerControl = async () => {
+    const state=Runtime.serverControl||(Runtime.serverControl={});
+    state.loading=true;renderServerControl();
+    const actions=['status','backups','history'];
+    const results=await Promise.allSettled(actions.map(action=>MemorySuiteStorageBridge.managerControl(action)));
+    const errors=[];results.forEach((r,i)=>{if(r.status==='fulfilled')state[actions[i]]=r.value;else {delete state[actions[i]];errors.push(actions[i]+': '+String(r.reason?.message||r.reason));}});
+    state.loading=false;state.errors=errors;renderServerControl();
+    if(errors.length)throw new Error(errors.join('\n'));
+  };
+  const handleServerControl = async event => {
+    const button=event.target?.closest?.('[data-server-control]');if(!button||button.disabled||Runtime.busy)return;
+    const action=button.getAttribute('data-server-control'),root=Runtime.root,state=Runtime.serverControl||(Runtime.serverControl={});
+    const output=root.querySelector('#serverControlResult');
+    const say=value=>{if(output){output.textContent=value;if(output.dataset)output.dataset.hasResult='true';}const card=root.querySelector('.control-result');if(card)card.hidden=Runtime.serverControlPage==='data';};
+    const backupId=root.querySelector('#serverControlBackups')?.value;
+    const namespaces=Array.from(root.querySelectorAll('[data-control-namespace]:checked')).map(node=>node.value);
+    let plan;
+    if(action==='restore-execute'){
+      plan=state.plan;if(!plan)return;
+      if(plan.expiresAt&&Date.now()>=new Date(plan.expiresAt).getTime()){state.plan=null;say('복원 미리보기가 만료되었습니다. 다시 확인하세요.');renderServerControl();return;}
+      if(!(await retraceConfirm('백업: '+plan.backupId+'\n대상: '+plan.namespaces.join(', ')+'\n해당 서버 자료를 백업 시점으로 교체합니다. 현재 서버의 사전 백업을 만들며, 완료 후 각 플러그인 재연결과 RisuAI 새로고침이 필요합니다.',{title:'서버 백업 복원',confirmLabel:'복원 실행',danger:true})))return;
+    }
+    setBusy(true);say('처리 중…');
+    const operationId='control-'+Date.now()+'-'+Math.random().toString(36).slice(2);
+    try{
+      if(action==='refresh'){await refreshServerControl();say('서버 상태·백업·작업 이력을 갱신했습니다. 마지막 접속 시각은 현재 연결 유지 여부를 보장하지 않습니다.');}
+      else if(action==='diagnose'){
+        say('서버 응답과 저장소 연결을 검사하고 있습니다…');
+        state.diagnosis={connection:'검사 중',management:'대기'};renderServerControl();
+        const probe=await MemorySuiteStorageBridge.testConnection();
+        state.diagnosis.connection=probe.ok?'확인 완료':'실패 · 후속 검사 미실행';renderServerControl();
+        if(!probe.ok)throw new Error('연결 검사 실패: '+probe.error+'\n주소·백엔드 실행 여부·PocketRisu 요청 출발 위치를 확인하세요. 응답만으로 원인을 구분하지 못할 수 있습니다.');
+        say('서버 응답·프로토콜·저장소 연결 확인 완료. 관리 권한을 확인하고 있습니다…');
+        state.diagnosis.management='조회 중';await refreshServerControl();state.diagnosis.management='확인 완료';say('연결 및 관리 API 확인 완료. 조회 작업으로 서버 데이터를 쓰거나 저장 모드를 변경하지 않았습니다.');
+      }else if(action==='backup-create'){
+        const result=await MemorySuiteStorageBridge.managerControl(action,{operationId});await refreshServerControl();const select=root.querySelector('#serverControlBackups');if(select)select.value=result.backupId;state.plan=null;say('백업 생성 완료: '+result.backupId);
+      }else if(action==='backup-check'){
+        if(!backupId)throw new Error('검사할 백업을 선택하세요.');
+        const result=await MemorySuiteStorageBridge.managerControl(action,{operationId,backupId});
+        say(result.verification?.ok===true?'백업 검증 완료: '+backupId:'백업에서 문제를 발견했습니다. 이 백업으로 복원을 진행하지 마세요.');await refreshServerControl();
+      }else if(action==='restore-plan'){
+        state.plan=null;if(!backupId||!namespaces.length)throw new Error('백업과 복원할 플러그인을 선택하세요.');
+        const preview=await MemorySuiteStorageBridge.managerControl(action,{backupId,namespaces});state.plan=preview;
+        say('복원 미리보기\n백업: '+preview.backupId+'\n대상: '+preview.namespaces.join(', ')+'\n필요 예상 공간: '+scopeManagerFormatBytes(preview.estimated?.workingBytes)+'\n현재 데이터나 백업이 바뀌면 실행을 중단합니다. 아직 복원하지 않았습니다.');
+      }else if(action==='restore-execute'){
+        state.plan=null;state.reconnect=plan.namespaces.slice();
+        const result=await MemorySuiteStorageBridge.managerControl(action,{operationId,planId:plan.planId,confirmation:'RESTORE '+plan.planId});
+        Runtime.serverScopeScanCache={};Runtime.serverScopeCatalog=null;
+        await refreshServerControl();say('복원 완료: '+result.namespaces.join(', ')+'\n각 플러그인의 서버 연결 설정에서 ‘서버 자료 사용 · 로컬 업로드 안 함’을 선택하고 RisuAI를 새로고침하세요. 복원한 서버에 기존 로컬 자료를 자동 업로드하지 마세요.');
+      }
+    }catch(error){if(action==='diagnose'&&state.diagnosis?.management==='조회 중')state.diagnosis.management='실패 · 권한/서버 기록 확인';say('작업 확인 필요: '+String(error?.message||error)+'\n응답이 끊겼다면 상태·이력을 먼저 조회하세요. 복원 실행을 시작한 경우 실패하더라도 재연결 확인이 필요할 수 있습니다.');}
+    finally{setBusy(false);renderServerControl();}
+  };
   const renderShell = () => {
     const root = Runtime.root;
     if (!root) return;
@@ -14321,13 +14516,43 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
       @media(max-width:980px){.bridge{width:100%;height:100dvh;border-radius:0;grid-template-columns:1fr;grid-template-rows:54px auto minmax(0,1fr)}.top{grid-column:1;grid-row:1}.side{grid-row:2;display:flex;flex-direction:row;align-items:center;gap:5px;padding:7px 10px;border-right:0;border-bottom:1px solid var(--lra-line);overflow-x:auto;overflow-y:hidden}.nav-group{display:contents}.nav-group-label,.scope-card,.version{display:none}.nav{width:auto;flex:0 0 auto;justify-content:flex-start;padding:4px 8px}.nav>span:not(.ic){display:inline}.main{grid-row:3}.panel{padding:16px 18px 64px}.overview-owner-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.overview-metrics,.diagnostic-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
       @media(max-width:680px){.top{padding:0 9px}.brand span,.top-scope,.global-status{display:none}.page-head{align-items:flex-start;padding:14px 14px 11px}.page-head p{max-width:34ch}.panel{padding:14px 14px 58px}.panel-heading{align-items:flex-start;flex-direction:column}.overview-hero{align-items:flex-start;flex-direction:column}.overview-health{width:100%}.overview-owner-grid,.diagnostic-list,.overview-actions{grid-template-columns:1fr}.overview-metrics,.diagnostic-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.overview-gate,.diagnostic-privacy{align-items:flex-start;flex-direction:column}.overview-gate>em{align-self:flex-start}.diagnostic-privacy .btn{width:100%}.session-handoff-flow,.flow,.metrics,.packet-sections{grid-template-columns:1fr}.owner-storage-grid{grid-template-columns:1fr}}
       @media(prefers-reduced-motion:reduce){.status-dot{animation:none!important}}
-    </style>
+    #panel-serverdata{font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;padding:28px 32px 48px;container-type:inline-size}
+#panel-serverdata>*{flex-shrink:0}#panel-serverdata .control-workspace{min-width:0;overflow-wrap:anywhere}
+.main:has(#panel-serverdata.active)>.page-head{display:none}
+#panel-serverdata [data-server-view][hidden],#panel-serverdata [hidden]{display:none!important}
+#panel-serverdata .panel-heading{align-items:center;margin:0 0 18px}#panel-serverdata .panel-heading h2{font-size:28px;letter-spacing:-1px}#panel-serverdata .panel-heading p{font-size:14px;color:var(--lra-text-2)}
+#panel-serverdata .control-nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 24px;padding-bottom:18px;border-bottom:1px solid var(--lra-line)}
+#panel-serverdata .control-nav [aria-current=page]{background:var(--lra-primary-soft);border-color:var(--lra-primary);color:var(--lra-primary)}
+#panel-serverdata .btn{min-height:44px;padding:9px 15px;font:600 13px/1.4 system-ui;border-radius:10px;white-space:normal;background:var(--lra-surface-3)}
+#panel-serverdata .btn.primary{background:var(--lra-primary);color:#171027}#panel-serverdata .btn.danger{color:var(--lra-red);border-color:color-mix(in srgb,var(--lra-red) 45%,var(--lra-line))}
+#panel-serverdata .card{padding:22px;border-radius:16px;margin:0 0 18px;box-shadow:none;background:var(--lra-surface);min-width:0}
+#panel-serverdata h3{margin:0 0 8px;font-size:17px}#panel-serverdata p{color:var(--lra-text-2);margin:6px 0 16px}#panel-serverdata small{font-size:12px;color:var(--lra-text-2)}
+#panel-serverdata .control-hero{background:linear-gradient(115deg,var(--lra-primary-soft),var(--lra-green-soft));border-color:color-mix(in srgb,var(--lra-primary) 25%,var(--lra-line))}
+#panel-serverdata .control-grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:18px;align-items:start}
+#panel-serverdata .control-heading,#panel-serverdata .control-item{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+#panel-serverdata .control-heading{margin-bottom:14px}#panel-serverdata .control-item{padding:16px 0;border-bottom:1px solid var(--lra-line)}#panel-serverdata .control-item:last-child{border-bottom:0}#panel-serverdata .control-item p{margin:3px 0 0}
+#panel-serverdata .control-grow{flex:1;min-width:0}#panel-serverdata .control-icon{width:36px;height:36px;display:grid;place-items:center;border-radius:10px;background:var(--lra-primary-soft);color:var(--lra-primary);font-weight:700}
+#panel-serverdata .control-pill{border:1px solid var(--lra-line);border-radius:20px;padding:3px 9px;font-size:11px;color:var(--lra-text-2)}#panel-serverdata .control-pill.ok{color:var(--lra-green)}#panel-serverdata .control-pill.warn{color:var(--lra-red)}
+#panel-serverdata .control-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin:24px 0 12px}#panel-serverdata .control-stats>div{border-left:1px solid var(--lra-line);padding-left:18px}#panel-serverdata .control-stats>div:first-child{border:0;padding:0}#panel-serverdata .control-stats span{display:block;color:var(--lra-text-2);font-size:12px}#panel-serverdata .control-stats strong{display:block;font-size:23px;overflow-wrap:anywhere}
+#panel-serverdata .empty{min-height:0;padding:22px;align-items:flex-start;text-align:left;gap:8px;border:0;background:var(--lra-surface-2)}
+#panel-serverdata summary{cursor:pointer;min-height:44px;padding:10px 0}#panel-serverdata details{overflow-wrap:anywhere}#panel-serverdata dd{margin:0 0 8px}
+#panel-serverdata .control-history{list-style:none;margin:0;padding:0}#panel-serverdata .control-history li{padding:14px 0;border-bottom:1px solid var(--lra-line);overflow-wrap:anywhere}#panel-serverdata .control-history li:last-child{border:0}
+#panel-serverdata select,#panel-serverdata input[type=search]{max-width:100%;min-width:0;min-height:44px;background:var(--lra-surface-3);color:var(--lra-text);border:1px solid var(--lra-line);border-radius:10px;padding:10px;font:inherit}#panel-serverdata select{width:100%;margin:8px 0 16px}
+#panel-serverdata .control-backup-list{display:grid;gap:10px;margin:14px 0}#panel-serverdata .control-backup{width:100%;text-align:left;display:flex;justify-content:space-between;gap:12px;align-items:center;min-height:76px!important}#panel-serverdata .control-backup[aria-pressed=true]{background:var(--lra-primary-soft);border-color:var(--lra-primary)}#panel-serverdata .control-backup small{display:block;font-weight:400}
+#panel-serverdata .control-detail{margin:12px 0;color:var(--lra-text-2)}#panel-serverdata .control-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;border:0;padding:12px 0;margin:0 0 14px}#panel-serverdata .control-checks label{display:flex;align-items:center;gap:10px;min-height:48px;border:1px solid var(--lra-line);border-radius:10px;padding:12px}#panel-serverdata input[type=checkbox]{width:18px;height:18px;accent-color:var(--lra-primary);flex-shrink:0}
+#panel-serverdata .settings-callout{font-size:13px;padding:16px 18px;border-radius:12px;margin:12px 0 18px;background:var(--lra-primary-soft)}#panel-serverdata .actions{flex-wrap:wrap;justify-content:flex-start}
+#panel-serverdata .control-result{border-left:3px solid var(--lra-primary);margin-top:18px}#panel-serverdata pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;margin:0}
+#panel-serverdata .control-tools{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:18px}#panel-serverdata .control-tools select{width:auto;margin:0}#panel-serverdata .control-tools input{flex:1;min-width:140px}
+#panel-serverdata .server-scope-card{padding:20px;border-radius:14px;gap:14px}#panel-serverdata .server-scope-title strong{font-size:15px}#panel-serverdata .server-scope-actions{gap:8px;flex-wrap:wrap}#panel-serverdata .server-scope-stats,#panel-serverdata .server-scope-blocked,#panel-serverdata .server-scope-ready{font-size:12px}#panel-serverdata .server-scope-toolbar{gap:12px;flex-wrap:wrap}
+@container(max-width:760px){#panel-serverdata .control-grid{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:680px){#panel-serverdata{padding:20px 16px 48px}#panel-serverdata .panel-heading h2{font-size:25px}#panel-serverdata .card{padding:18px}#panel-serverdata .control-nav{gap:6px}#panel-serverdata .control-nav .btn{flex:1 1 30%;padding:8px}#panel-serverdata .control-grid{grid-template-columns:minmax(0,1fr)}#panel-serverdata .control-stats{grid-template-columns:1fr 1fr;gap:12px}#panel-serverdata .control-stats>div:last-child{grid-column:1/-1;border:0;padding:0}#panel-serverdata .actions .btn{flex:1 1 140px}#panel-serverdata .server-scope-card{display:flex;flex-direction:column}#panel-serverdata .server-scope-actions .btn{flex:1 1 140px}#panel-serverdata .control-checks{grid-template-columns:1fr 1fr}}
+
+</style>
     <div class="bridge${Runtime.busy ? ' busy' : ''}">
       <header class="top"><span class="mark" aria-label="RE:TRACE">${bridgeIconSvg}</span><div class="brand"><strong>${PLUGIN_NAME}</strong><span>MEMORY CONTINUITY WORKSPACE</span></div><div class="top-actions"><div class="top-scope"><span>◉</span><span id="topScope">현재 채팅 확인 중</span></div><div class="global-status" data-state="idle"><span class="status-dot"></span><span id="globalStatusText">검증 대기</span></div><button id="refreshActiveTab" class="btn icon-btn" type="button" aria-label="현재 화면 새로고침" title="현재 화면 새로고침">↻</button><details id="retraceMoreMenu" class="top-more"><summary class="btn icon-btn" aria-label="더 보기" title="더 보기">⋯</summary><div class="top-menu"><button id="exportRetraceDebug" class="btn" type="button">정제된 디버그 로그 내보내기</button></div></details><button id="closeBridge" class="btn icon-btn" type="button" aria-label="닫기" title="닫기">×</button></div></header>
       <aside class="side" role="tablist" aria-label="RE:TRACE 화면">
         <div class="nav-group"><div class="nav-group-label">상태</div><button id="tab-overview" class="nav" type="button" role="tab" aria-controls="panel-overview" data-tab="overview"><span class="ic">⌂</span><span>개요</span></button></div>
         <div class="nav-group"><div class="nav-group-label">연속성</div><button id="tab-session" class="nav" type="button" role="tab" aria-controls="panel-session" data-tab="session"><span class="ic">↪</span><span>다음 세션</span></button></div>
-        <div class="nav-group"><div class="nav-group-label">데이터</div><button id="tab-libra" class="nav" type="button" role="tab" aria-controls="panel-libra" data-tab="libra"><span class="ic">L</span><span>LIBRA</span></button><button id="tab-flashback" class="nav" type="button" role="tab" aria-controls="panel-flashback" data-tab="flashback"><span class="ic">F</span><span>Flashback</span></button><button id="tab-hayaku" class="nav" type="button" role="tab" aria-controls="panel-hayaku" data-tab="hayaku"><span class="ic">H</span><span>HAYAKU</span></button></div>
         <div class="nav-group"><div class="nav-group-label">서버</div><button id="tab-serverdata" class="nav" type="button" role="tab" aria-controls="panel-serverdata" data-tab="serverdata"><span class="ic">DB</span><span>서버 데이터</span></button><button id="tab-serverconnection" class="nav" type="button" role="tab" aria-controls="panel-serverconnection" data-tab="serverconnection"><span class="ic">⇄</span><span>저장 상태</span></button></div>
         <div class="nav-group"><div class="nav-group-label">진단</div><button id="tab-diagnostics" class="nav" type="button" role="tab" aria-controls="panel-diagnostics" data-tab="diagnostics"><span class="ic">⋯</span><span>연결 진단</span></button></div>
         <div class="scope-card"><b>현재 스코프</b><span id="sidebarScope">확인 중</span></div><div class="version">RE:TRACE v${PLUGIN_VERSION}</div>
@@ -14340,27 +14565,34 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
           <div class="card"><div class="heading"><div><strong>대화 이어가기</strong><span>설치되어 실제 응답하는 기억 owner 1~4종의 저장 모드가 일치할 때만 새 세션 승계를 허용합니다.</span></div><em class="badge">원본 보존</em></div>
             <div class="flow session-handoff-flow"><div><b>1 · 참여 owner 탐지</b><small>LIBRA · Flashback · HAYAKU · LIA 중 실제 설치·응답 owner만 포함</small></div><div><b>2 · 저장 모드 Gate</b><small>참여 owner 전원이 plugin-only / mirror / server-only 중 같은 모드인지 확인</small></div><div><b>3 · 내구성 검증</b><small>mirror/server-only이면 참여 namespace의 서버 integrity까지 확인</small></div><div><b>4 · owner 승계</b><small>실제 데이터가 있는 owner만 비파괴 prepare/adopt/verify</small></div><div><b>5 · 새 채팅</b><small>원본은 그대로 두고 새 라이브 계보로 시작</small></div></div>
             <div id="handoffStorageGate" class="handoff-storage-gate checking"><strong>저장 모드 확인 중</strong><span>활성 owner를 자동으로 판별합니다.</span></div>
-            <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">미설치·미응답 플러그인은 승계를 막지 않습니다. 단, 설치되어 응답하는 owner의 저장 모드는 서로 같아야 하며, 승계 시작 후 participant 또는 mode가 바뀌면 fail-closed로 완료 처리를 중단합니다. 원본 세션의 정본/원장/벡터/바인딩은 삭제·비우기·compact·이동하지 않습니다.</p>
+            <div id="transitionStatus" class="status">전환 대상을 확인하는 중입니다.</div><p class="note">미설치·비활성으로 확인된 플러그인은 승계를 막지 않습니다. 설치 확인 불가 또는 활성 플러그인의 미응답은 완료를 차단합니다. 단, 설치되어 응답하는 owner의 저장 모드는 서로 같아야 하며, 승계 시작 후 participant 또는 mode가 바뀌면 fail-closed로 완료 처리를 중단합니다. 원본 세션의 정본/원장/벡터/바인딩은 삭제·비우기·compact·이동하지 않습니다.</p>
             <div class="actions"><button id="refreshTransition" class="btn">다시 확인</button><button id="createSession" class="btn primary">다음 세션 만들기</button></div>
           </div>
         </section>
-        <section id="panel-libra" class="panel" role="tabpanel" aria-labelledby="tab-libra" data-panel="libra">
-          <div class="panel-heading"><div><h2>LIBRA 정본 기억</h2><p>현재 채팅의 LIBRA pluginStorage 정본과 이전 세션 승계 기억을 공식 IPC로 읽기 전용 표시합니다.</p></div><div class="actions"><button id="exportLibra" class="btn">JSON 내보내기</button><button id="refreshLibra" class="btn primary">새로고침</button></div></div>
-          <div id="libraBody"><div class="empty"><strong>LIBRA 조회 대기</strong><span>새로고침을 누르면 LIBRA IPC로 정본 기억을 읽습니다.</span></div></div>
-        </section>
-        <section id="panel-flashback" class="panel" role="tabpanel" aria-labelledby="tab-flashback" data-panel="flashback">
-          <div class="panel-heading"><div><h2>Flashback 기억</h2><p>현재 채팅의 manifest와 활성 shard를 읽기 전용으로 표시합니다.</p></div><div class="actions"><button id="exportFlashback" class="btn">JSON 내보내기</button><button id="refreshFlashback" class="btn primary">새로고침</button></div></div>
-          <div id="flashbackBody"><div class="empty"><strong>Flashback 조회 대기</strong><span>새로고침을 누르면 pluginStorage를 읽습니다.</span></div></div>
-        </section>
-        <section id="panel-hayaku" class="panel" role="tabpanel" aria-labelledby="tab-hayaku" data-panel="hayaku">
-          <div class="panel-heading"><div><h2>HAYAKU 원장</h2><p>현재 채팅의 패킷·월드라인·연속성 데이터를 읽기 전용 카드로 표시합니다.</p></div><div class="actions"><button id="backupHayaku" class="btn">미러 원장 백업</button><button id="exportHayaku" class="btn">JSON 내보내기</button><button id="refreshHayaku" class="btn primary">새로고침</button></div></div>
-          <div class="turn-jump"><strong>빠른 턴 이동</strong><span id="hayakuTurnMax">최대 턴 확인 중</span><div><input id="hayakuTurnInput" type="number" min="1" step="1" inputmode="numeric" aria-label="이동할 턴 번호" placeholder="턴 번호"><button id="jumpHayakuTurn" type="button" class="btn primary">턴 이동</button></div></div>
-          <div id="hayakuBody" style="display:flex;flex-direction:column;gap:10px;min-height:0"><div class="empty"><strong>조회 대기</strong><span>현재 채팅의 HAYAKU 원장을 읽습니다.</span></div></div>
-        </section>
         <section id="panel-serverdata" class="panel" role="tabpanel" aria-labelledby="tab-serverdata" data-panel="serverdata">
+          <div class="panel-heading"><div><h2>서버 관제</h2><p>서버 상태부터 백업과 복원까지, 필요한 작업을 한곳에서 관리합니다.</p></div></div>
+          <nav class="control-nav" aria-label="서버 관제 메뉴">
+            <button class="btn" data-server-page="overview">한눈에 보기</button><button class="btn" data-server-page="data">서버 데이터</button><button class="btn" data-server-page="backups">백업 · 복원</button><button class="btn" data-server-page="connection">연결 진단</button><button class="btn" data-server-page="history">작업 이력</button>
+          </nav>
+          <div id="serverControl" class="control-workspace"><div id="serverControlReconnect" class="settings-callout" hidden></div>
+            <section data-server-view="overview">
+              <div class="card control-hero"><div class="control-heading"><h3>내 라이브러리 서버</h3><button class="btn" data-server-control="refresh">새로고침</button></div><div id="serverControlSummary"></div></div>
+              <div class="control-grid"><div class="card"><h3>플러그인별 저장 상태</h3><p>마지막 접촉은 현재 접속 여부를 뜻하지 않습니다.</p><div id="serverControlPlugins"></div></div><div><div class="card"><h3>필요한 작업으로 바로 이동</h3><div class="control-item"><div class="control-grow"><strong>현재 자료를 안전하게 보관</strong><p>서버에 새 백업을 만듭니다.</p></div><button class="btn primary" data-server-control="backup-create">백업 만들기</button></div><div class="control-item"><strong class="control-grow">이전 상태로 되돌리기</strong><button class="btn" data-server-page="backups">백업 보기</button></div><div class="control-item"><strong class="control-grow">불필요한 서버 사본 정리</strong><button class="btn" data-server-page="data">데이터 관리</button></div><div class="control-item"><strong class="control-grow">연결 문제 확인</strong><button class="btn" data-server-page="connection">진단하기</button></div></div><div class="card"><div class="control-heading"><h3>최근 작업</h3><button class="btn" data-server-page="history">전체 보기</button></div><ul id="serverControlRecent" class="control-history"></ul></div></div></div>
+            </section>
+            <section data-server-view="backups" hidden>
+              <div class="control-grid"><div class="card"><div class="control-heading"><h3>저장된 백업</h3><button class="btn primary" data-server-control="backup-create">백업 만들기</button></div><p>검사하거나 복원할 백업을 선택하세요.</p><label for="serverControlBackups">백업 선택</label><select id="serverControlBackups"><option value="">먼저 상태 조회</option></select><div id="serverControlBackupCards" class="control-backup-list"></div><div id="serverControlBackupInfo" class="control-detail"></div><button class="btn" data-server-control="backup-check">선택 백업 검사</button><p>검사 표시는 마지막 검사 결과입니다. 복원 전 서버가 다시 검증합니다.</p></div>
+              <div class="card"><h3>복원 범위</h3><p>선택한 플러그인의 서버 자료를 백업 시점으로 되돌립니다.</p><fieldset class="control-checks"><legend>복원할 플러그인 선택</legend><label><input type="checkbox" data-control-namespace value="libra">LIBRA</label><label><input type="checkbox" data-control-namespace value="hayaku">HAYAKU</label><label><input type="checkbox" data-control-namespace value="flashback">Flashback</label><label><input type="checkbox" data-control-namespace value="lia">LIA</label><label><input type="checkbox" data-control-namespace value="retrace">RE:TRACE</label></fieldset><div class="settings-callout">미리보기는 자료를 변경하지 않습니다. 복원을 실행하기 전 현재 서버 자료를 백업합니다.</div><div class="actions"><button class="btn primary" data-server-control="restore-plan">복원 미리보기</button><button class="btn danger" data-server-control="restore-execute" disabled>미리본 내용으로 복원</button></div><div id="serverControlPreview"></div><p>복원 후 각 플러그인에서 ‘서버 자료 사용 · 로컬 업로드 안 함’으로 다시 연결하고 RisuAI를 새로고침하세요.</p></div></div>
+            </section>
+            <section data-server-view="connection" hidden><div class="card"><h3>연결 상태 확인</h3><p>서버 응답과 프로토콜·저장소 연결을 확인한 뒤 관제 API를 조회합니다.</p><div class="actions"><button class="btn primary" data-server-control="diagnose">진단 시작</button><button class="btn" id="serverControlOpenConnection">서버 연결 설정 · 저장 상태</button><button class="btn" id="serverControlExportDebug">진단 요약 내보내기</button></div><div id="serverControlDiagnosis" aria-live="polite"></div><p>서버 실행과 Docker 네트워크 설정은 사용하는 실행 환경에서 진행합니다. 진단만으로 원인을 구분하지 못할 수도 있습니다.</p></div></section>
+            <section data-server-view="history" hidden><div class="card"><div class="control-heading"><h3>관리 작업 이력</h3><button class="btn" data-server-control="refresh">이력 새로고침</button></div><p>중단된 작업은 자동으로 다시 실행하지 않습니다. 결과를 확인한 뒤 진행하세요.</p><label>작업 결과 <select id="serverControlHistoryFilter"><option value="">전체</option><option value="complete">완료</option><option value="failed">실패</option><option value="running">진행 중</option><option value="interrupted">중단 · 결과 확인 필요</option></select></label><ul id="serverControlHistory" class="control-history"></ul></div></section>
+            <div class="card control-result" hidden><h3>작업 결과</h3><pre id="serverControlResult" role="status" aria-live="polite">작업을 선택하면 진행 상황과 결과를 표시합니다.</pre></div>
+          </div>
+          <div data-server-view="data" hidden>
           <div class="panel-heading"><div><h2>서버 데이터 관리</h2><p>Librarian System 서버의 스코프를 현재 RisuAI 채팅 목록과 대조합니다. 채팅이 보이지 않아도 자동 삭제하지 않으며 승계 조상과 확인 불가 데이터는 보호합니다.</p></div><div class="actions"><button id="refreshServerData" class="btn primary">새로고침</button></div></div>
-          <div class="settings-callout">상태는 활성 · 승계 조상 · 고아 메모리 후보 · 확인 불가로 구분됩니다. 활성 스코프는 owner 플러그인이 서버 데이터를 pluginStorage/로컬 저장소에 복원하고 플러그인 단독 모드 전환을 증명한 뒤에만 서버에서 삭제됩니다. 고아 후보는 안정적인 채팅 목록 확인, 참조 관계 재검사, 삭제 직전 서버 백업과 두 단계 확인을 모두 통과해야 합니다.</div>
-          <div id="serverDataBody"><div class="empty"><strong>서버 스코프 조회 대기</strong><span>새로고침을 누르면 5개 namespace의 서버 데이터와 현재 캐릭터의 채팅 목록을 대조합니다.</span></div></div>
+          <div class="settings-callout">상태는 활성 · 승계 조상 · 고아 메모리 후보 · 확인 불가로 구분됩니다. 활성 스코프는 owner 플러그인이 서버 데이터를 pluginStorage/로컬 저장소에 복원하고 플러그인 단독 모드 전환을 증명한 뒤에만 서버에서 삭제됩니다. 확인 한 번으로 로컬 보존·참조 검사·백업·삭제를 자동 진행합니다. 실패한 항목은 결과에서 확인할 수 있습니다.</div>
+<pre id="serverScopeDeleteStatus" role="status" aria-live="polite" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre><button class="btn" id="serverScopeDeleteCancel" hidden disabled>진행 중 작업 중단</button><button class="btn" data-server-delete-retry hidden disabled>이전 작업 결과 확인·실패 항목 재시도</button><div class="control-tools"><input id="serverScopeSearch" type="search" aria-label="서버 사본 검색" placeholder="채팅 이름 · 플러그인 검색"><select id="serverScopeFilter" aria-label="서버 사본 상태"><option value="">전체 상태</option><option value="active">활성</option><option value="referenced_ancestor">승계 조상</option><option value="orphan_candidate">정리 후보</option><option value="unverified">확인 불가</option><option value="paired_recovery">복구 연결</option></select></div><div id="serverDataBody"><div class="empty"><strong>서버 스코프 조회 대기</strong><span>새로고침을 누르면 5개 namespace의 서버 데이터와 현재 캐릭터의 채팅 목록을 대조합니다.</span></div></div>
+          <details class="card"><summary>서버 기억 초기화 · 검증 실패 자료도 비우기</summary><p>선택한 플러그인의 서버 기억을 모두 비웁니다. 로컬 기억과 기존 백업은 보존합니다. 각 플러그인은 초기화 후 서버 연결 설정에서 재연결 방식을 선택하고 RisuAI를 새로고침해야 합니다.</p><select id="serverResetTarget"><option value="">대상 선택</option><option value="all">전체 5개 플러그인</option><option value="hayaku">HAYAKU</option><option value="libra">LIBRA</option><option value="flashback">Flashback</option><option value="lia">LIA</option><option value="retrace">RE:TRACE</option></select><label><input id="serverResetNoBackup" type="checkbox">백업 없이 진행 (복구용 새 백업을 만들지 않음)</label><button class="btn danger" id="serverResetBegin">선택한 서버 기억 초기화</button><p id="serverResetStatus"></p></details>
+          </div>
         </section>
         <section id="panel-serverconnection" class="panel" role="tabpanel" aria-labelledby="tab-serverconnection" data-panel="serverconnection"><div id="retraceMemorySuiteServerConnectionPanel"></div></section>
         <section id="panel-diagnostics" class="panel" role="tabpanel" aria-labelledby="tab-diagnostics" data-panel="diagnostics"><div id="diagnosticsBody"></div></section>
@@ -14383,7 +14615,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
   const setBusy = value => {
     Runtime.busy = Boolean(value);
     Runtime.root?.querySelector?.('.bridge')?.classList?.toggle('busy', Runtime.busy);
-    Runtime.root?.querySelectorAll?.('button:not(#closeBridge):not(.nav):not(#analysisReturnToRisu):not(#retraceDialogConfirm):not(#retraceDialogCancel)').forEach(button => {
+    Runtime.root?.querySelectorAll?.('button:not(#closeBridge):not(#serverScopeDeleteCancel):not(.nav):not([data-server-page]):not(#analysisReturnToRisu):not(#retraceDialogConfirm):not(#retraceDialogCancel)').forEach(button => {
       if (Runtime.busy) {
         if (!button.disabled) button.dataset.bridgeBusyDisabled = 'true';
         button.disabled = true;
@@ -14392,6 +14624,7 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
         button.disabled = false;
       }
     });
+    syncServerDeleteControls();
   };
 
   const refreshTransition = async () => {
@@ -14833,11 +15066,55 @@ async function memorySuiteRetraceValidateRestore(context = {}) {
     root.querySelector('#refreshLibra')?.addEventListener('click', () => refreshLibra());
     root.querySelector('#refreshFlashback')?.addEventListener('click', () => refreshFlashback());
     root.querySelector('#refreshHayaku')?.addEventListener('click', () => refreshHayaku());
+    const setServerPage = value => {
+      const page=['overview','data','backups','connection','history'].includes(value)?value:'overview';
+      Runtime.serverControlPage=page;
+      const result=root.querySelector('.control-result');if(result)result.hidden=page==='data'||!root.querySelector('#serverControlResult')?.dataset.hasResult;
+      root.querySelectorAll('[data-server-view]').forEach(node=>{node.hidden=node.getAttribute('data-server-view')!==page;});
+      root.querySelectorAll('[data-server-page]').forEach(node=>{if(node.getAttribute('data-server-page')===page)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
+    };
+    root.querySelectorAll('[data-server-page]').forEach(button=>button.addEventListener('click',()=>{setServerPage(button.getAttribute('data-server-page'));renderServerControl();}));
+    root.querySelector('#serverControlOpenConnection')?.addEventListener('click',()=>{setActiveRetraceTab('serverconnection');void refreshRetraceTab('serverconnection');});
+    bindDebugExportButton(root.querySelector('#serverControlExportDebug'));
+    setServerPage(Runtime.serverControlPage);
+    root.querySelector('#serverControl')?.addEventListener('click',event=>{void handleServerControl(event);});
+    root.querySelector('#serverControlBackupCards')?.addEventListener('click',event=>{
+      const button=event.target?.closest?.('[data-control-backup]');if(!button||Runtime.busy)return;
+      const select=root.querySelector('#serverControlBackups');if(select){select.value=button.getAttribute('data-control-backup');select.dispatchEvent(new Event('change',{bubbles:true}));}
+    });
+    for(const [id,key] of [['serverScopeSearch','serverScopeSearch'],['serverScopeFilter','serverScopeFilter']]){
+      const node=root.querySelector('#'+id);if(node){node.value=Runtime[key]||'';node.addEventListener('input',()=>{Runtime[key]=node.value;Runtime.serverScopeManagerPage=0;renderServerScopeManagement();});}
+    }
+
+    root.querySelector('#serverControl')?.addEventListener('change',event=>{if(event.target?.id==='serverControlHistoryFilter'){renderServerControl();return;}if(Runtime.serverControl?.plan){Runtime.serverControl.plan=null;const output=root.querySelector('#serverControlResult');if(output)output.textContent='복원 대상이 변경되었습니다. 복원 미리보기를 다시 실행하세요.';}renderServerControl();});
+    renderServerControl();
     root.querySelector('#refreshServerData')?.addEventListener('click', () => refreshServerScopeManagement().catch(async error => {
       warn('server scope manager refresh failed', error);
       await retraceAlert(`서버 데이터 관리 새로고침 실패
 ${error?.message || error}`);
     }));
+    root.querySelector('#serverResetBegin')?.addEventListener('click',async()=>{
+      const button=root.querySelector('#serverResetBegin'),status=root.querySelector('#serverResetStatus');
+      const target=root.querySelector('#serverResetTarget').value;
+      if(!target){status.textContent='초기화할 대상을 선택하세요.';return;}
+      const namespaces=target==='all'?['flashback','hayaku','libra','lia','retrace']:[target];
+      const withoutBackup=root.querySelector('#serverResetNoBackup').checked;
+      button.disabled=true;
+      try{
+        const plan=await MemorySuiteStorageBridge.managerPlanReset(namespaces);
+        const accepted=await showRetraceDialog('대상: '+namespaces.join(', ')+'\n서버 기억을 모두 비웁니다. 로컬 데이터와 기존 백업은 지우지 않습니다.\n'+(withoutBackup?'새 백업 없이 진행합니다.':'초기화 전에 서버 백업을 생성합니다.'),{confirm:true,title:'서버 기억 초기화 최종 확인'});
+        if(!accepted){status.textContent='취소했습니다.';return;}
+        status.textContent='백업 및 초기화를 진행하고 있습니다…';
+        const control=Runtime.serverControl||(Runtime.serverControl={});control.reconnect=namespaces.slice();renderServerControl();
+        const result=await MemorySuiteStorageBridge.managerExecuteReset({planId:plan.id,confirmation:plan.confirmation,withoutBackup});
+        status.textContent='초기화 및 빈 상태 확인 완료. '+(result.backupId?'백업: '+result.backupId:'새 백업 없음')+' · 각 플러그인의 서버 연결 설정에서 재연결 방식을 선택하세요.';
+        Runtime.serverScopeCatalog=null;renderServerScopeManagement();
+      }catch(error){status.textContent='초기화 중단: '+error.message+' · 백업 실패 시 내용을 확인하고 백업 없이 진행을 별도로 선택할 수 있습니다.';}
+      finally{button.disabled=false;}
+    });
+    void legacyStorageGet('retrace_server_delete_job_v1').then(job=>{if(Runtime.root!==root||Runtime.serverScopeDeletionRunning)return;if(!Runtime.serverScopeDeleteJob&&job?.targets)Runtime.serverScopeDeleteJob=job;syncServerDeleteControls();});
+    root.querySelector('#serverScopeDeleteCancel')?.addEventListener('click',()=>{if(Runtime.serverScopeDeleteJob)Runtime.serverScopeDeleteJob.cancelRequested=true;syncServerDeleteControls();});
+    root.querySelector('[data-server-delete-retry]')?.addEventListener('click', event => { void handleServerScopeManagementClick(event).catch(error=>{const node=root.querySelector('#serverScopeDeleteStatus');if(node)node.textContent=String(error?.message||error);}); });
     root.querySelector('#serverDataBody')?.addEventListener('click', event => {
       void handleServerScopeManagementClick(event).catch(async error => {
         warn('server scope management action failed', error);
